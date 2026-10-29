@@ -1,0 +1,6544 @@
+/* BAZINGA — built from src/ by build.py. Edit src/, then run: python3 build.py */
+(() => {
+"use strict";
+// ---------- db.js ----------
+const __m_db = (() => {
+// BAZINGA — on-device storage (IndexedDB). Nothing ever leaves the device.
+const DB_NAME = 'bazinga';
+const DB_VERSION = 2;
+const STORES = ['kv', 'tracks', 'albums', 'playlists', 'files', 'backups', 'ytcache', 'metacache'];
+let dbp = null;
+
+function open() {
+  if (dbp) return dbp;
+  dbp = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      for (const s of STORES) {
+        if (!db.objectStoreNames.contains(s)) {
+          db.createObjectStore(s, s === 'kv' || s === 'ytcache' || s === 'metacache' ? undefined : { keyPath: 'id' });
+        }
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('Storage is blocked in this browser (private mode?)'));
+    req.onblocked = () => reject(new Error('Close other BAZINGA tabs and reload.'));
+  });
+  return dbp;
+}
+
+function tx(store, mode, fn) {
+  return open().then(db => new Promise((resolve, reject) => {
+    const t = db.transaction(store, mode);
+    const s = t.objectStore(store);
+    let out;
+    Promise.resolve(fn(s)).then(v => { out = v; });
+    t.oncomplete = () => resolve(out instanceof IDBRequest ? out.result : out);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  }));
+}
+
+const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+
+const db = {
+  get: (store, key) => open().then(d => reqP(d.transaction(store).objectStore(store).get(key))),
+  all: (store) => open().then(d => reqP(d.transaction(store).objectStore(store).getAll())),
+  keys: (store) => open().then(d => reqP(d.transaction(store).objectStore(store).getAllKeys())),
+  put: (store, val, key) => tx(store, 'readwrite', s => { key === undefined ? s.put(val) : s.put(val, key); }),
+  putMany: (store, vals) => tx(store, 'readwrite', s => { for (const v of vals) s.put(v); }),
+  del: (store, key) => tx(store, 'readwrite', s => { s.delete(key); }),
+  clear: (store) => tx(store, 'readwrite', s => { s.clear(); }),
+  async destroy() {
+    if (dbp) { (await dbp).close(); dbp = null; }
+    await new Promise(res => { const r = indexedDB.deleteDatabase(DB_NAME); r.onsuccess = r.onerror = r.onblocked = () => res(); });
+  }
+};
+
+// Simple key/value helpers
+const kv = {
+  get: (k, dflt = null) => db.get('kv', k).then(v => v === undefined ? dflt : v),
+  set: (k, v) => db.put('kv', v, k),
+  del: (k) => db.del('kv', k)
+};
+
+return { STORES, db, kv };
+})();
+// ---------- util.js ----------
+const __m_util = (() => {
+// Shared helpers
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+const uid = (p = 'id') => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Normalise a title/artist for matching ("Song (feat. X) - Remastered 2011" -> "song")
+function norm(s) {
+  return String(s ?? '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .replace(/\s*[\(\[][^\)\]]*(feat|ft\.|with|remaster|version|edit|mono|stereo|live|deluxe)[^\)\]]*[\)\]]/g, '')
+    .replace(/\s+-\s+.*(remaster|version|edit|mono|stereo|live).*$/g, '')
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+const mainArtist = a => String(a || '').split(/;|,|&| feat\.? | ft\.? | x /i)[0].trim();
+// "A;B;C" or "A, B, C" -> ["A","B","C"]
+const splitArtists = s => String(s || '').split(String(s).includes(';') ? ';' : /\s*,\s*/).map(x => x.trim()).filter(Boolean);
+// Show only the main artist; featured artists go into the title: "Tapout (feat. Lil Wayne, Birdman & Future)"
+function displayTitle(t) {
+  if (!t) return '';
+  const others = (t.artists || []).slice(1).filter(a => a && norm(a) !== norm(t.artist));
+  if (!others.length || /\((feat|ft|with)\b|\bfeat\.|\bft\./i.test(t.title)) return t.title;
+  const list = others.length === 1 ? others[0] : others.slice(0, -1).join(', ') + ' & ' + others[others.length - 1];
+  return `${t.title} (feat. ${list})`;
+}
+const trackKey = (artist, title) => 't_' + norm(mainArtist(artist)) + '|' + norm(title);
+const albumKey = (artist, title) => 'a_' + norm(mainArtist(artist)) + '|' + norm(title);
+
+function fmtTime(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}
+const fmtDur = ms => ms ? fmtTime(ms / 1000) : '';
+const yearOf = d => { const m = String(d || '').match(/\d{4}/); return m ? +m[0] : null; };
+
+function debounce(fn, ms = 300) {
+  let t; const d = (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+  d.cancel = () => clearTimeout(t);
+  return d;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Event bus
+const bus = new EventTarget();
+const on = (ev, fn) => bus.addEventListener(ev, e => fn(e.detail));
+const emit = (ev, detail) => bus.dispatchEvent(new CustomEvent(ev, { detail }));
+const toast = (msg, kind = 'info') => emit('toast', { msg, kind });
+
+// JSONP (used for Apple's free iTunes Search API, which doesn't always send CORS headers)
+let jsonpN = 0;
+function jsonp(url, timeout = 12000) {
+  return new Promise((resolve, reject) => {
+    const cb = '__bz_jsonp_' + (++jsonpN);
+    const s = document.createElement('script');
+    const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, timeout);
+    function cleanup() { clearTimeout(timer); delete window[cb]; s.remove(); }
+    window[cb] = data => { cleanup(); resolve(data); };
+    s.onerror = () => { cleanup(); reject(new Error('network')); };
+    s.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb;
+    document.head.appendChild(s);
+  });
+}
+
+// Resize an image file to a square-ish data URL (for profile pictures)
+function imageToDataURL(file, size = 256) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const s = Math.min(img.width, img.height);
+      c.getContext('2d').drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, size, size);
+      URL.revokeObjectURL(img.src);
+      resolve(c.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function downloadBlob(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+
+// base64url + deflate for compact share links
+async function packToString(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  let out = bytes;
+  if ('CompressionStream' in window) {
+    const cs = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    out = new Uint8Array(await new Response(cs).arrayBuffer());
+  }
+  let bin = ''; out.forEach(b => bin += String.fromCharCode(b));
+  return ('CompressionStream' in window ? 'z' : 'j') + btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function unpackString(str) {
+  const mode = str[0];
+  const b64 = str.slice(1).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64);
+  let bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  if (mode === 'z') {
+    const ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    bytes = new Uint8Array(await new Response(ds).arrayBuffer());
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function hashColor(s) {
+  let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) | 0;
+  return `hsl(${Math.abs(h) % 360} 55% 38%)`;
+}
+
+// ---------- Broad genres ----------
+// Store/Spotify genres are very specific ("Southern Hip Hop", "Alternative R&B", "Afro-fusion"…).
+// Everything in BAZINGA! is grouped into a short list of everyday genres instead.
+// Songs whose genre doesn't fit any of them simply have no genre (there is no "Unknown").
+const GENRE_RULES = [
+  ['Afrobeats', /afro|amapiano|highlife|naija|nigeria|ghana|african|bongo|gqom|azonto|kizomba|afrikaans/],
+  ['Gospel', /gospel|christian|worship|praise|inspirational|ccm/],
+  ['K-Pop', /k-?pop|korean/],
+  ['Latin', /latin|reggaet|urbano|salsa|bachata|merengue|cumbia|regional mexican|mexican|banda|corrido|tango|bossa|samba|sertanejo|brazil|mpb|flamenco|baile funk/],
+  ['Reggae', /reggae|dancehall|ska\b|dub\b|soca|calypso/],
+  ['Hip-Hop/Rap', /hip.?hop|\brap|trap|drill|grime|boom bap|crunk|bounce/],
+  ['R&B', /r ?& ?b|rnb|rhythm and blues|new jack|quiet storm/],
+  ['Soul', /soul|motown|funk|disco|doo.?wop/],
+  ['Country', /country|americana|bluegrass|honky|nashville/],
+  ['Jazz', /jazz|swing|bebop|big band|bop\b|smooth/],
+  ['Blues', /blues/],
+  ['Classical', /classical|orchestr|opera|baroque|symphon|chamber|piano|choral|romantic era|contemporary classical|minimalism/],
+  ['Electronic', /electr|edm|house|techno|trance|dubstep|drum ?(&|and) ?bass|dnb|dance|club|garage|ambient|downtempo|synth|idm|breakbeat|hardstyle|lo.?fi|chill/],
+  ['Metal', /metal|hardcore|grindcore|metalcore|djent/],
+  ['Rock', /rock|punk|grunge|emo\b|shoegaze|alternative|indie|new wave|post-|britpop|garage rock/],
+  ['Folk', /folk|singer.?songwriter|acoustic|celtic/],
+  ['Soundtrack', /soundtrack|score|film|movie|\btv\b|musical|anime|video game|show tunes/],
+  ['Pop', /pop|adult contemporary|teen|boy band|easy listening|vocal|cabaret|j-?pop|c-?pop|mandopop|cantopop/],
+  ['Kids', /child|kids|lullab|nursery/],
+  ['Holiday', /holiday|christmas|xmas/],
+  ['Comedy', /comedy|spoken word/],
+  ['World', /world|india|bollywood|punjabi|bhangra|desi|arab|turk|greek|french|chanson|german|schlager|ethio|habesha|amharic|zouk|mbalax|rai\b/]
+];
+const genreMemo = new Map();
+function broadGenre(raw) {
+  if (!raw) return '';
+  const k = String(raw);
+  if (genreMemo.has(k)) return genreMemo.get(k);
+  const s = k.toLowerCase().replace(/[_]+/g, ' ');
+  let out = '';
+  if (!/^(unknown|other|misc|none|—|-|\?|music|various)$/i.test(s.trim())) out = (GENRE_RULES.find(([, re]) => re.test(s)) || [''])[0];
+  genreMemo.set(k, out);
+  return out;
+}
+const genreOf = t => broadGenre(t?.genre);
+
+return { $, $$, uid, esc, norm, mainArtist, splitArtists, displayTitle, trackKey, albumKey, fmtTime, fmtDur, yearOf, debounce, sleep, on, emit, toast, jsonp, imageToDataURL, downloadBlob, packToString, unpackString, hashColor, broadGenre, genreOf };
+})();
+// ---------- ui.js ----------
+const __m_ui = (() => {
+// Reusable UI pieces: icons, rows, cards, menus, modals, toasts, filters.
+const { esc, fmtDur, hashColor, $, on, mainArtist, yearOf, displayTitle, genreOf, emit } = __m_util;
+
+const I = {
+  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
+  library: '<path d="M4 4v16M9 4v16M14 5l5 15"/>',
+  import: '<path d="M12 3v12M7 10l5 5 5-5M4 20h16"/>',
+  offline: '<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>',
+  minus: '<path d="M5 12h14"/>',
+  google: '<circle cx="12" cy="12" r="10" fill="#fff" stroke="none"/><text x="12" y="16.6" text-anchor="middle" font-size="13.5" font-weight="800" font-family="Arial, Helvetica, sans-serif" fill="#4285F4" stroke="none">G</text>',
+  discord: '<path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7a2.5 2.5 0 0 1-2.5 2.5H11l-4.5 4v-4h0A2.5 2.5 0 0 1 4 13.5z" fill="currentColor" stroke="none"/><circle cx="9.5" cy="10" r="1.4" fill="#5865F2" stroke="none"/><circle cx="14.5" cy="10" r="1.4" fill="#5865F2" stroke="none"/>',
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  coffee: '<path d="M10 5c0-1.3.7-2 2-2h2.2c1.2 0 1.8-.6 1.8-1.8"/><path d="M6.4 8.4h11.4a1.9 1.9 0 0 1 1.9 1.9v3.5a7.6 7.4 0 0 1-15.2 0v-3.5a1.9 1.9 0 0 1 1.9-1.9z"/><path d="M19.7 10.4h1a1.7 1.7 0 0 1 1.7 1.7v.4c0 1.9-1.4 3.5-3.3 3.8"/><path d="M1.4 21.6h21.2"/>',
+  instagram: '<path d="M4 8.5A2.5 2.5 0 0 1 6.5 6H8l1.3-2h5.4L16 6h1.5A2.5 2.5 0 0 1 20 8.5v8a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5z"/><circle cx="12" cy="12.5" r="3.5"/>',
+  xsocial: '<path d="M5 4l14 16M19 4L5 20" stroke-width="2.6"/>',
+  upload: '<path d="M12 16V4M7 9l5-5 5 5M4 20h16"/>',
+  cloud: '<path d="M7 18a5 5 0 0 1-.6-9.96A6 6 0 0 1 18 9a4.5 4.5 0 0 1-.5 9z"/>',
+  up: '<path d="M6 15l6-6 6 6"/>',
+  apple: '<path d="M16.4 12.6c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9-.7 0-1.8-.8-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.3 0 2.1-1.1 2.8-2.3.9-1.3 1.3-2.6 1.3-2.6s-2.5-1-2.5-3.8zM14.2 5.8c.6-.8 1.1-1.9 1-3-.9 0-2.1.6-2.7 1.4-.6.7-1.1 1.8-1 2.9 1 .1 2.1-.5 2.7-1.3z" fill="currentColor" stroke="none"/>',
+  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  play: '<path d="M7 4.5v15l13-7.5z" fill="currentColor" stroke="none"/>',
+  pause: '<rect x="6" y="4.5" width="4" height="15" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="4.5" width="4" height="15" rx="1" fill="currentColor" stroke="none"/>',
+  next: '<path d="M5 5l10 7-10 7z" fill="currentColor"/><path d="M19 5v14"/>',
+  prev: '<path d="M19 5L9 12l10 7z" fill="currentColor"/><path d="M5 5v14"/>',
+  shuffle: '<path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/>',
+  repeat: '<path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>',
+  heart: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
+  heartFill: '<path fill="currentColor" d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
+  more: '<circle cx="5" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="19" cy="12" r="1.6" fill="currentColor"/>',
+  queue: '<path d="M3 6h13M3 12h13M3 18h8"/><path d="M17 15v6l5-3z" fill="currentColor"/>',
+  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  video: '<rect x="2" y="5" width="15" height="14" rx="2"/><path d="M17 10l5-3v10l-5-3"/>',
+  audio: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3z"/>',
+  close: '<path d="M6 6l12 12M18 6L6 18"/>',
+  down: '<path d="M6 9l6 6 6-6"/>',
+  back: '<path d="M15 18l-6-6 6-6"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+  mic: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/>',
+  disc: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5"/>',
+  trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
+  check: '<path d="M4 12l5 5L20 6"/>',
+  filter: '<path d="M3 5h18l-7 8v6l-4 2v-8z"/>',
+  volume: '<path d="M4 9v6h4l5 4V5L8 9z" fill="currentColor"/><path d="M16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"/>',
+  mute: '<path d="M4 9v6h4l5 4V5L8 9z" fill="currentColor"/><path d="M17 9l5 6M22 9l-5 6"/>',
+  yt: '<rect x="2" y="5" width="20" height="14" rx="4"/><path d="M10 9v6l5-3z" fill="currentColor"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+  folder: '<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  file: '<path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5"/>',
+  edit: '<path d="M4 20h4L19 9l-4-4L4 16z"/>',
+  sparkle: '<path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"/>',
+  cloudOff: '<path d="M3 3l18 18M8 8a5 5 0 0 0-2 9.6h10M18 17.3A4 4 0 0 0 16.5 10a6 6 0 0 0-6.4-4.6"/>',
+  restore: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/>',
+  spotify: '<circle cx="12" cy="12" r="10"/><path d="M7 9.5c3.5-1 7-.7 10 1M7.5 12.8c3-.8 5.6-.5 8 .9M8 16c2.3-.5 4.3-.3 6 .7"/>',
+  grip: '<circle cx="9" cy="7" r="1.2" fill="currentColor"/><circle cx="15" cy="7" r="1.2" fill="currentColor"/><circle cx="9" cy="12" r="1.2" fill="currentColor"/><circle cx="15" cy="12" r="1.2" fill="currentColor"/><circle cx="9" cy="17" r="1.2" fill="currentColor"/><circle cx="15" cy="17" r="1.2" fill="currentColor"/>',
+  expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
+  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>'
+};
+const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n] || ''}</svg>`;
+
+// Ask image servers for the size we actually show (a 42px row thumbnail doesn't need a 1000px image)
+function sized(src, px) {
+  if (!src || src.startsWith('data:')) return src;
+  const d = px <= 64 ? 120 : px <= 220 ? 300 : 600;
+  return src
+    .replace(/\/(\d+)x\1bb\./, `/${d}x${d}bb.`)                                   // Apple
+    .replace(/\/(\d+)x\1-000000-80-0-0\.jpg$/, `/${Math.max(d, 250)}x${Math.max(d, 250)}-000000-80-0-0.jpg`) // Deezer
+    .replace(/\/vi\/([\w-]{11})\/(hq|maxres|sd)default\.jpg$/, (m, id) => `/vi/${id}/${d <= 120 ? 'mqdefault' : 'hqdefault'}.jpg`); // YouTube
+}
+function cover(src, label, cls = '') {
+  const px = /\bsm\b|qt-art|pb-art/.test(cls) ? 64 : /np-art|hero/.test(cls) ? 600 : 200;
+  const eager = /hero|np-art|pb-art/.test(cls);
+  if (src) return `<div class="cover ${cls}"><img src="${esc(sized(src, px))}" alt="" ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" onerror="this.parentNode.classList.add('noimg');this.remove()"><span>${esc((label || '?')[0])}</span></div>`;
+  return `<div class="cover noimg ${cls}" style="--c:${hashColor(label)}"><span>${esc((label || '?')[0].toUpperCase())}</span></div>`;
+}
+
+// One song row. `ctx` = {list, index, playlistId}
+function trackRow(t, i, ctx = {}, playingId) {
+  const isNow = false; // highlighting is done by markNow() so only ONE row lights up
+  const main = t.artist || '';
+  const artists = `<a href="#/artist/${encodeURIComponent(main)}" class="lnk">${esc(main)}</a>`;
+  return `<div class="row ${isNow ? 'now' : ''} ${t.isVideo ? 'is-video' : ''}" data-act="play-row" data-list="${ctx.list}" data-i="${i}" data-id="${esc(t.id)}" role="button" tabindex="0">
+    <div class="row-num">${isNow ? '<span class="eq"><i></i><i></i><i></i></span>' : (ctx.numbered ? (t.trackNumber || i + 1) : '')}${cover(t.artwork, t.title, t.isVideo ? 'sm wide' : 'sm')}</div>
+    <div class="row-main">
+      <div class="row-title"><span class="tt">${esc(displayTitle(t))}</span>${t.explicit ? '<span class="e">E</span>' : ''}${t.localFileId ? `<span class="off" title="Available offline">${icon('offline')}</span>` : ''}</div>
+      <div class="row-sub">${artists}</div>
+    </div>
+    <div class="row-album hide-sm">${t.album ? `<a class="lnk" data-act="goto-album" data-id="${esc(t.id)}">${esc(t.album)}</a>` : ''}</div>
+    <div class="row-meta hide-sm">${genreOf(t) ? `<span class="pill">${esc(genreOf(t))}</span>` : ''}${t.year || yearOf(t.releaseDate) || ''}</div>
+    <button class="ib like ${t.liked ? 'on' : ''}" data-act="like" data-id="${esc(t.id)}" aria-label="Like">${icon(t.liked ? 'heartFill' : 'heart')}</button>
+    <div class="row-dur hide-xs">${fmtDur(t.durationMs)}</div>
+    <button class="ib" data-act="track-menu" data-id="${esc(t.id)}" data-pl="${ctx.playlistId || ''}" aria-label="More">${icon('more')}</button>
+  </div>`;
+}
+
+function card({ href, img, title, sub, round = false, act = '', id = '' }) {
+  return `<a class="card" href="${href}">
+    <div class="card-art ${round ? 'round' : ''}">${cover(img, title)}${act ? `<button class="fab-play" data-act="${act}" data-id="${esc(id)}" aria-label="Play">${icon('play')}</button>` : ''}</div>
+    <div class="card-t">${esc(title)}</div><div class="card-s">${esc(sub || '')}</div></a>`;
+}
+
+// ---------- Toasts ----------
+on('toast', ({ msg, kind, action, ms }) => {
+  const root = $('#toasts'); if (!root) return;
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind + (action ? ' has-act' : '');
+  const txt = document.createElement('span'); txt.textContent = msg; el.appendChild(txt);
+  const life = ms || (action ? 6500 : 3200);
+  let t1, t2;
+  const bye = () => { el.classList.add('out'); setTimeout(() => el.remove(), 350); };
+  if (action) {
+    const b = document.createElement('button');
+    b.className = 'toast-act'; b.type = 'button'; b.textContent = action.label || 'Undo';
+    b.onclick = () => { clearTimeout(t1); clearTimeout(t2); bye(); try { action.fn(); } catch (e) { console.warn(e); } };
+    el.appendChild(b);
+  }
+  root.appendChild(el);
+  t1 = setTimeout(bye, life);
+});
+// A toast with an "Undo" (or other) button
+const toastUndo = (msg, fn, label = 'Undo') => emit('toast', { msg, kind: 'info', action: { label, fn } });
+
+// ---------- Modal ----------
+function modal(html, { wide = false, onMount, locked = false, ownForms = false } = {}) {
+  return new Promise(resolve => {
+    const root = $('#modal-root');
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-wrap';
+    wrap.innerHTML = `<div class="modal ${wide ? 'wide' : ''}" role="dialog" aria-modal="true">${locked ? '' : `<button class="ib modal-x" data-close aria-label="Close">${icon('close')}</button>`}${html}</div>`;
+    root.appendChild(wrap);
+    const close = v => { wrap.classList.add('out'); setTimeout(() => wrap.remove(), 180); document.removeEventListener('keydown', key); resolve(v); };
+    const key = e => { if (e.key === 'Escape' && !locked) close(null); };
+    document.addEventListener('keydown', key);
+    wrap.addEventListener('click', e => {
+      if ((e.target === wrap && !locked) || e.target.closest('[data-close]')) close(null);
+      const r = e.target.closest('[data-resolve]');
+      if (r) close(r.dataset.resolve);
+    });
+    if (!ownForms) wrap.querySelector('form')?.addEventListener('submit', e => {
+      e.preventDefault();
+      const fd = new FormData(e.target), o = {};
+      for (const k of new Set(fd.keys())) { const v = fd.getAll(k); o[k] = v.length > 1 ? v : v[0]; }
+      close(o);
+    });
+    onMount?.(wrap.querySelector('.modal'), close);
+    setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
+  });
+}
+async function promptText(title, value = '', label = 'Name', okText = 'Save') {
+  const r = await modal(`<h3>${esc(title)}</h3><form><label class="fld"><span>${esc(label)}</span><input name="v" value="${esc(value)}" required maxlength="100"></label>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">${esc(okText)}</button></div></form>`);
+  return r ? r.v.trim() : null;
+}
+async function confirmBox(title, body, okText = 'Confirm', danger = false) {
+  const r = await modal(`<h3>${esc(title)}</h3><p class="muted">${body}</p>
+    <div class="modal-actions"><button class="btn ghost" data-close>Cancel</button><button class="btn ${danger ? 'danger' : 'primary'}" data-resolve="ok">${esc(okText)}</button></div>`);
+  return r === 'ok';
+}
+
+// ---------- Popup menu (bottom sheet on phones) ----------
+function menu(anchor, items) {
+  closeMenu();
+  const root = $('#menu-root');
+  const m = document.createElement('div');
+  m.className = 'menu';
+  m.innerHTML = items.filter(Boolean).map(it => it === '-' ? '<hr>' :
+    it.header ? `<div class="menu-h">${it.header}</div>` :
+    `<button data-k="${it.k}" class="${it.danger ? 'danger' : ''}">${icon(it.icon || 'plus')}<span>${esc(it.label)}</span></button>`).join('');
+  const back = document.createElement('div'); back.className = 'menu-back';
+  root.append(back, m);
+  const mobile = innerWidth < 700;
+  if (mobile) m.classList.add('sheet');
+  else {
+    const r = anchor.getBoundingClientRect();
+    const mw = 260, mh = Math.min(m.scrollHeight, innerHeight - 20);
+    m.style.left = Math.max(8, Math.min(r.right - mw, innerWidth - mw - 8)) + 'px';
+    m.style.top = (r.bottom + mh + 8 > innerHeight ? Math.max(8, r.top - mh - 4) : r.bottom + 4) + 'px';
+  }
+  return new Promise(resolve => {
+    m.addEventListener('click', e => { const b = e.target.closest('button[data-k]'); if (b) { closeMenu(); resolve(b.dataset.k); } });
+    back.addEventListener('click', () => { closeMenu(); resolve(null); });
+  });
+}
+function closeMenu() { const r = $('#menu-root'); if (r) r.innerHTML = ''; }
+
+// ---------- Filters (genre + release date + sort + text) ----------
+function applyFilters(list, f) {
+  let out = list;
+  if (f.q) {
+    const q = f.q.toLowerCase();
+    out = out.filter(t => (t.title + ' ' + t.artist + ' ' + (t.album || '')).toLowerCase().includes(q));
+  }
+  if (f.genres?.length) out = out.filter(t => f.genres.includes(genreOf(t)));
+  const y = t => t.year || yearOf(t.releaseDate);
+  if (f.years?.length) out = out.filter(t => f.years.includes(y(t)));
+  if (f.liked) out = out.filter(t => t.liked);
+  if (f.offline) out = out.filter(t => t.localFileId);
+  const by = {
+    added: (a, b) => (b.addedAt || 0) - (a.addedAt || 0),
+    liked: (a, b) => (b.likedAt || b.addedAt || 0) - (a.likedAt || a.addedAt || 0),
+    title: (a, b) => a.title.localeCompare(b.title),
+    artist: (a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
+    newest: (a, b) => (b.releaseDate || String(y(b) || '')).localeCompare(a.releaseDate || String(y(a) || '')),
+    oldest: (a, b) => (y(a) || 9999) - (y(b) || 9999) || (a.releaseDate || '').localeCompare(b.releaseDate || ''),
+    album: (a, b) => (a.album || '').localeCompare(b.album || '') || (a.trackNumber || 0) - (b.trackNumber || 0)
+  }[f.sort];
+  if (by) out = [...out].sort(by);
+  return out;
+}
+
+function filterBar(f, tracks, { showSort = true, keepOrder = false, likedSort = false } = {}) {
+  // Top 10 broad genres in this list (never "Unknown"), plus any you already picked
+  const gm = new Map();
+  for (const t of tracks) { const g = genreOf(t); if (g) gm.set(g, (gm.get(g) || 0) + 1); }
+  let genres = [...gm.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  for (const g of f.genres || []) if (!genres.some(x => x[0] === g)) genres.push([g, gm.get(g) || 0]);
+  // Every year in the list, newest first — tap as many as you like
+  const ym = new Map();
+  for (const t of tracks) { const y = t.year || yearOf(t.releaseDate); if (y) ym.set(y, (ym.get(y) || 0) + 1); }
+  const years = [...ym.entries()].sort((a, b) => b[0] - a[0]);
+  const active = (f.genres?.length || 0) + (f.years?.length || 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  return `<div class="filters">
+    <div class="filter-top">
+      <div class="fsearch"><label class="searchbox sm">${icon('search')}<input data-f="q" placeholder="Filter songs" value="${esc(f.q || '')}" enterkeyhint="search" aria-label="Filter songs"></label>
+        <button class="round-search" data-act="filter-go" aria-label="Search these songs" title="Search">${icon('search')}</button></div>
+      <div class="fctl"><button class="chip ${f.open ? 'on' : ''}" data-act="toggle-filters">${icon('filter')}Filters${active ? ` <b>${active}</b>` : ''}</button>
+      ${showSort ? `<select data-f="sort" class="select" aria-label="Sort">
+        ${keepOrder ? `<option value="" ${!f.sort ? 'selected' : ''}>Custom order</option>` : ''}
+        ${likedSort ? `<option value="liked" ${f.sort === 'liked' ? 'selected' : ''}>Recently liked</option>` : ''}
+        ${[['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']]
+          .map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>` : ''}</div>
+    </div>
+    ${f.open ? `<div class="filter-panel">
+      <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
+        ${genres.length ? genres.map(([g, n]) => `<button class="chip ${f.genres?.includes(g) ? 'on' : ''}" data-act="f-genre" data-g="${esc(g)}">${esc(g)} <small>${n}</small></button>`).join('') : '<span class="muted">Genres appear as songs get matched.</span>'}
+      </div></div>
+      ${years.length ? `<div class="fp-sec"><div class="fp-h">Year <span class="fp-note">pick one or more</span></div>
+        <div class="chips years-chips">${years.map(([y, n]) => `<button class="chip ${f.years?.includes(y) ? 'on' : ''}" data-act="f-year" data-y="${y}" aria-pressed="${!!f.years?.includes(y)}">${y} <small>${n}</small></button>`).join('')}</div>
+      </div>` : ''}
+      <div class="fp-sec"><div class="chips">
+        <button class="chip ${f.liked ? 'on' : ''}" data-act="f-flag" data-k="liked">${icon('heart')}Liked only</button>
+        <button class="chip ${f.offline ? 'on' : ''}" data-act="f-flag" data-k="offline">${icon('offline')}Offline only</button>
+        ${active ? '<button class="chip ghost" data-act="f-clear">Clear all</button>' : ''}
+      </div></div>
+    </div>` : ''}
+  </div>`;
+}
+
+function empty(title, body, cta = '') {
+  return `<div class="empty"><img src="icons/icon-192.png" alt="" class="empty-bolt"><h3>${title}</h3><p class="muted">${body}</p>${cta}</div>`;
+}
+
+// Liked Songs cover: a proper, full-size heart
+const likedCover = (cls = '') => `<div class="cover liked-cover heart-cover ${cls}">${icon('heartFill')}</div>`;
+
+// Big, centered, animated loader
+function loader(text = '', cls = '') {
+  return `<div class="bz-loader ${cls}" role="status" aria-live="polite"><div class="bz-orb"><span></span><span></span><span></span><img src="icons/icon-192.png" alt=""></div>${text ? `<p>${esc(text)}</p>` : ''}</div>`;
+}
+
+return { icon, sized, cover, trackRow, card, toastUndo, modal, promptText, confirmBox, menu, closeMenu, applyFilters, filterBar, empty, likedCover, loader };
+})();
+// ---------- meta.js ----------
+const __m_meta = (() => {
+// Music metadata (genre, release date, artwork, albums, artists) from Apple's free
+// iTunes Search API, plus Deezer's free API as a fallback for cover art and
+// artist photos. No keys, no accounts.
+//
+// Speed + safety:
+//  • Every answer is cached on the device (memory + IndexedDB), so repeat visits cost 0 requests.
+//  • A token bucket keeps us under Apple's ~20 requests/minute guideline, so the user's IP never
+//    gets blocked. Things the user is waiting for (search, opening an album) always jump ahead of
+//    background work (filling in genres), and background work leaves headroom for them.
+//  • Identical requests in flight are shared, never sent twice.
+const { jsonp, norm, mainArtist, albumKey, trackKey, yearOf, sleep } = __m_util;
+const { db } = __m_db;
+
+const BASE = 'https://itunes.apple.com';
+let country = 'US';
+const setCountry = c => { country = (c || 'US').toUpperCase(); };
+
+// ---------- persistent cache ----------
+const mem = new Map();
+const DAY = 864e5;
+async function cached(key, ttl, fn) {
+  const m = mem.get(key);
+  if (m && (m.p || Date.now() - m.t < ttl)) return m.p || m.v;
+  try {
+    const hit = await db.get('metacache', key);
+    if (hit && Date.now() - hit.t < ttl) { mem.set(key, { v: hit.v, t: hit.t }); return hit.v; }
+  } catch { }
+  const p = fn().then(v => {
+    mem.set(key, { v, t: Date.now() });
+    db.put('metacache', { v, t: Date.now() }, key).catch(() => { });
+    return v;
+  }, e => { mem.delete(key); throw e; });
+  mem.set(key, { p });
+  return p;
+}
+// Drop cache entries older than 30 days, once per start, when idle
+setTimeout(async () => {
+  try {
+    const keys = await db.keys('metacache'), vals = await db.all('metacache');
+    keys.forEach((k, i) => { if (Date.now() - (vals[i]?.t || 0) > 30 * DAY) db.del('metacache', k); });
+  } catch { }
+}, 20000);
+
+// ---------- iTunes rate limiter (token bucket with priorities) ----------
+const CAP = 9, REFILL_MS = 3000, BG_RESERVE = 4;
+let tokens = CAP, lastRefill = Date.now(), pausedUntil = 0, fgPausedUntil = 0; // background back-off never blocks what you're waiting for for long
+const waiting = [[], []]; // [foreground, background]
+let pumping = false;
+function refill() {
+  const n = Math.floor((Date.now() - lastRefill) / REFILL_MS);
+  if (n > 0) { tokens = Math.min(CAP, tokens + n); lastRefill += n * REFILL_MS; }
+}
+async function pump() {
+  if (pumping) return; pumping = true;
+  while (waiting[0].length || waiting[1].length) {
+    refill();
+    const now = Date.now();
+    if (waiting[0].length) {
+      if (now < fgPausedUntil) { await sleep(Math.min(fgPausedUntil - now, 1500)); continue; }
+      if (tokens >= 1 || now - lastRefill > REFILL_MS) { tokens = Math.max(0, tokens - 1); waiting[0].shift()(); continue; }
+    }
+    if (now < pausedUntil) { await sleep(Math.min(pausedUntil - now, 1000)); continue; }
+    if (!waiting[0].length && waiting[1].length && tokens > BG_RESERVE) { tokens--; waiting[1].shift()(); continue; }
+    await sleep(Math.max(80, lastRefill + REFILL_MS - Date.now()));
+  }
+  pumping = false;
+}
+const slot = (bg) => new Promise(r => { waiting[bg ? 1 : 0].push(r); pump(); });
+const backgroundBusy = () => waiting[1].length;
+
+async function call(path, params, { bg = false, ttl = DAY } = {}) {
+  const q = new URLSearchParams({ ...params, country }).toString();
+  const url = `${BASE}/${path}?${q}`;
+  return cached('it:' + url, ttl, async () => {
+    // Things you're waiting for: 2 quick tries. Background work: 3 patient tries.
+    const tries = bg ? 3 : 2;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      await slot(bg);
+      try { return (await jsonp(url, bg ? 10000 : 7000)).results || []; }
+      catch (e) {
+        // Apple answers rate-limited requests with an error page: back off (background much longer)
+        pausedUntil = Math.max(pausedUntil, Date.now() + 15000 * (attempt + 1));
+        if (!bg) fgPausedUntil = Date.now() + 2500;
+        tokens = 0;
+        if (attempt === tries - 1 || !navigator.onLine) throw e;
+      }
+    }
+  });
+}
+
+// ---------- Deezer (covers + artist photos; generous limits, still spaced politely) ----------
+let dzLast = 0;
+async function deezer(path, params, ttl = 7 * DAY, urgent = false) {
+  const url = `https://api.deezer.com/${path}?${new URLSearchParams({ ...params, output: 'jsonp' })}`;
+  return cached('dz:' + url, ttl, async () => {
+    // Background lookups are paced; something you're looking at right now skips the line.
+    if (!urgent) {
+      const wait = dzLast + 150 - Date.now(); dzLast = Math.max(Date.now(), dzLast + 150);
+      if (wait > 0) await sleep(wait);
+    }
+    const d = await jsonp(url, 8000);
+    if (d?.error) throw new Error(d.error.message || 'Deezer error');
+    return d?.data || [];
+  });
+}
+// Deezer as a fast second source for search and artist top songs
+function songFromDeezer(r) {
+  const title = r.title_short || r.title || '', artist = r.artist?.name || '';
+  return {
+    id: trackKey(artist, title), title, artist, artists: [artist],
+    album: r.album?.title || '', albumId: r.album?.title ? albumKey(artist, r.album.title) : '',
+    durationMs: (r.duration || 0) * 1000, artwork: r.album?.cover_xl || r.album?.cover_big || '',
+    explicit: !!r.explicit_lyrics, deezerId: r.id || null
+  };
+}
+async function deezerSearchSongs(q, limit = 20) { return (await deezer('search', { q, limit }, DAY)).filter(r => r.type === 'track' || r.title).map(songFromDeezer); }
+async function deezerSearchArtists(q, limit = 8) { return (await deezer('search/artist', { q, limit }, DAY)).map(a => ({ name: a.name, itunesArtistId: null, genre: '', picture: a.picture_xl || a.picture_big || '' })); }
+async function deezerArtistTop(name, limit = 10) {
+  const res = await deezer('search/artist', { q: mainArtist(name), limit: 5 }, 14 * DAY, true);
+  const k = norm(mainArtist(name));
+  const a = res.find(r => norm(r.name) === k) || res[0];
+  if (!a) return [];
+  return (await deezer(`artist/${a.id}/top`, { limit }, DAY, true)).map(songFromDeezer);
+}
+async function deezerCover(t) {
+  const q = `artist:"${mainArtist(t.artist)}" track:"${String(t.title).replace(/\s*[\(\[].*?[\)\]]/g, '')}"`;
+  let res = await deezer('search', { q, limit: 5 });
+  if (!res.length) res = await deezer('search', { q: `${mainArtist(t.artist)} ${t.title}`, limit: 5 });
+  const na = norm(mainArtist(t.artist));
+  const hit = res.find(r => norm(r.artist?.name).includes(na) || na.includes(norm(r.artist?.name))) || null;
+  return hit ? { artwork: hit.album?.cover_xl || hit.album?.cover_big || '', album: hit.album?.title || '', durationMs: (hit.duration || 0) * 1000 } : null;
+}
+// Artist photos: remembered on the device (instant on every later visit), looked up from Deezer once.
+const picMem = new Map();
+let picStore = {};
+try { picStore = JSON.parse(localStorage.getItem('bz_apic') || '{}') || {}; } catch { }
+const savePics = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => { try { localStorage.setItem('bz_apic', JSON.stringify(picStore)); } catch { } }, 800); }; })();
+// Known photo for this artist right now (no waiting), or '' / undefined if not looked up yet
+function artistPictureNow(name) { const k = norm(name); return k ? picStore[k] : ''; }
+async function artistPicture(name, urgent = false) {
+  const k = norm(name); if (!k) return '';
+  if (typeof picStore[k] === 'string' && picStore[k]) return picStore[k];
+  if (picMem.has(k)) return picMem.get(k);
+  const p = deezer('search/artist', { q: mainArtist(name), limit: 3 }, 14 * DAY, urgent).then(res => {
+    const a = res.find(r => norm(r.name) === k) || res[0];
+    let pic = a?.picture_xl || a?.picture_big || '';
+    if (/\/artist\/\/|images\/artist\/?$/.test(pic)) pic = ''; // Deezer's blank placeholder
+    if (pic) { picStore[k] = pic; savePics(); }
+    return pic;
+  }).catch(() => { picMem.delete(k); return ''; });
+  picMem.set(k, p);
+  return p;
+}
+
+// ---------- iTunes helpers ----------
+const art = (u, size = 600) => u ? u.replace(/\/\d+x\d+(bb)?\./, `/${size}x${size}bb.`) : '';
+
+function songFromItunes(r) {
+  return {
+    id: trackKey(r.artistName, r.trackName),
+    title: r.trackName,
+    artist: r.artistName,
+    album: r.collectionName || '',
+    albumId: r.collectionName ? albumKey(r.collectionArtistName || r.artistName, r.collectionName) : '',
+    itunesAlbumId: r.collectionId || null,
+    itunesArtistId: r.artistId || null,
+    itunesId: r.trackId || null,
+    trackNumber: r.trackNumber || 0,
+    discNumber: r.discNumber || 1,
+    genre: r.primaryGenreName || '',
+    releaseDate: r.releaseDate ? r.releaseDate.slice(0, 10) : '',
+    year: yearOf(r.releaseDate),
+    durationMs: r.trackTimeMillis || 0,
+    artwork: art(r.artworkUrl100),
+    explicit: r.trackExplicitness === 'explicit',
+    enriched: true
+  };
+}
+function albumFromItunes(r) {
+  return {
+    id: albumKey(r.artistName, r.collectionName),
+    title: r.collectionName,
+    artist: r.artistName,
+    itunesAlbumId: r.collectionId,
+    itunesArtistId: r.artistId || null,
+    genre: r.primaryGenreName || '',
+    releaseDate: r.releaseDate ? r.releaseDate.slice(0, 10) : '',
+    year: yearOf(r.releaseDate),
+    trackCount: r.trackCount || 0,
+    artwork: art(r.artworkUrl100)
+  };
+}
+
+async function searchSongs(term, limit = 25, o) {
+  return (await call('search', { term, media: 'music', entity: 'song', limit }, o)).filter(r => r.kind === 'song').map(songFromItunes);
+}
+async function searchAlbums(term, limit = 25, o) {
+  return (await call('search', { term, media: 'music', entity: 'album', limit }, o)).filter(r => r.collectionType === 'Album').map(albumFromItunes);
+}
+async function searchArtists(term, limit = 10, o) {
+  return (await call('search', { term, media: 'music', entity: 'musicArtist', limit }, o))
+    .map(r => ({ name: r.artistName, itunesArtistId: r.artistId, genre: r.primaryGenreName || '' }));
+}
+
+async function albumTracks(itunesAlbumId) {
+  const res = await call('lookup', { id: itunesAlbumId, entity: 'song', limit: 200 }, { ttl: 14 * DAY });
+  const album = res.find(r => r.wrapperType === 'collection');
+  const songs = res.filter(r => r.wrapperType === 'track' && r.kind === 'song').map(songFromItunes)
+    .sort((a, b) => (a.discNumber - b.discNumber) || (a.trackNumber - b.trackNumber));
+  return { album: album ? albumFromItunes(album) : null, tracks: songs };
+}
+
+async function artistAlbums(itunesArtistId, o) {
+  const res = await call('lookup', { id: itunesArtistId, entity: 'album', limit: 200 }, { ttl: 3 * DAY, ...o });
+  const seen = new Set();
+  return res.filter(r => r.wrapperType === 'collection' && r.collectionType === 'Album').map(albumFromItunes)
+    .filter(a => { const k = norm(a.title); if (seen.has(k)) return false; seen.add(k); return true; })
+    .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
+}
+async function artistTopSongs(itunesArtistId) {
+  const res = await call('lookup', { id: itunesArtistId, entity: 'song', limit: 25 }, { ttl: 3 * DAY });
+  return res.filter(r => r.wrapperType === 'track').map(songFromItunes);
+}
+// Newest releases (albums, EPs and singles) for an artist
+async function artistLatest(itunesArtistId, o) {
+  const res = await call('lookup', { id: itunesArtistId, entity: 'album', sort: 'recent', limit: 6 }, { ttl: DAY / 2, ...o });
+  return res.filter(r => r.wrapperType === 'collection').map(albumFromItunes);
+}
+async function findArtistId(name, o) {
+  const res = await searchArtists(mainArtist(name), 5, { ttl: 30 * DAY, ...o });
+  const n = norm(mainArtist(name));
+  return (res.find(a => norm(a.name) === n) || res[0])?.itunesArtistId || null;
+}
+
+// Best iTunes match for a song we only know by name (fills genre/date/artwork/album)
+async function matchTrack(t, o = { bg: true }) {
+  const res = await searchSongs(`${mainArtist(t.artist)} ${t.title}`, 10, { ttl: 30 * DAY, ...o });
+  const nt = norm(t.title), na = norm(mainArtist(t.artist));
+  let best = null, bestScore = 0;
+  for (const r of res) {
+    let s = 0;
+    if (norm(r.title) === nt) s += 5; else if (norm(r.title).includes(nt) || nt.includes(norm(r.title))) s += 2;
+    if (norm(mainArtist(r.artist)) === na) s += 4; else if (norm(r.artist).includes(na)) s += 2;
+    if (t.album && norm(r.album) === norm(t.album)) s += 2;
+    if (t.durationMs && r.durationMs && Math.abs(t.durationMs - r.durationMs) < 4000) s += 1;
+    if (s > bestScore) { bestScore = s; best = r; }
+  }
+  return bestScore >= 6 ? best : null;
+}
+
+async function findAlbum(artist, title) {
+  const res = await searchAlbums(`${mainArtist(artist)} ${title}`, 10, { ttl: 14 * DAY });
+  const nt = norm(title), na = norm(mainArtist(artist));
+  return res.find(a => norm(a.title) === nt && norm(a.artist).includes(na))
+      || res.find(a => norm(a.title).includes(nt) && norm(a.artist).includes(na))
+      || null;
+}
+
+// Helpers: give up after a while; take the first source that comes back with something
+const withTimeout = (p, ms, fallback) => Promise.race([p, new Promise(r => setTimeout(() => r(fallback), ms))]);
+function firstFull(list) {
+  return new Promise(resolve => {
+    let left = list.length, best = [];
+    for (const p of list) Promise.resolve(p).then(v => { if (v?.length) resolve(v); else if (!--left) resolve(best); }, () => { if (!--left) resolve(best); });
+  });
+}
+
+return { setCountry, backgroundBusy, deezerSearchSongs, deezerSearchArtists, deezerArtistTop, deezerCover, artistPictureNow, artistPicture, art, songFromItunes, albumFromItunes, searchSongs, searchAlbums, searchArtists, albumTracks, artistAlbums, artistTopSongs, artistLatest, findArtistId, matchTrack, findAlbum, withTimeout, firstFull };
+})();
+// ---------- store.js ----------
+const __m_store = (() => {
+// The user's library, kept in memory and mirrored to IndexedDB.
+const { db, kv } = __m_db;
+const { uid, emit, debounce, norm, mainArtist, albumKey, trackKey, splitArtists, genreOf } = __m_util;
+const meta = __m_meta;
+
+const lib = {
+  tracks: new Map(),
+  albums: new Map(),
+  playlists: new Map()
+};
+
+const changed = debounce(() => emit('library'), 120);
+const notify = (why = 'change') => { changed(); emit('dirty', why); };
+
+// ---- deletion markers, used when syncing between devices ----
+let tomb = { t: {}, p: {}, a: {} };
+const tombstones = () => tomb;
+async function markDeleted(kind, id) { tomb[kind][id] = Date.now(); await kv.set('tombstones', tomb); }
+async function setTombstones(t) { tomb = t; await kv.set('tombstones', tomb); }
+
+async function load() {
+  tomb = (await kv.get('tombstones')) || { t: {}, p: {}, a: {} };
+  const old = Date.now() - 120 * 864e5;
+  for (const k of ['t', 'p', 'a']) for (const [id, ts] of Object.entries(tomb[k] || {})) if (ts < old) delete tomb[k][id];
+  const [t, a, p] = await Promise.all([db.all('tracks'), db.all('albums'), db.all('playlists')]);
+  lib.tracks = new Map(t.map(x => [x.id, x]));
+  lib.albums = new Map(a.map(x => [x.id, x]));
+  lib.playlists = new Map(p.map(x => [x.id, x]));
+  await migrateArtists();
+  // Liked songs from before "recently liked" ordering existed: use when they were added
+  const fix = [];
+  for (const t of lib.tracks.values()) if (t.liked && !t.likedAt) { t.likedAt = t.addedAt || 1; fix.push(t); }
+  if (fix.length) await db.putMany('tracks', fix);
+}
+
+// Older imports stored "Rich Gang;Lil Wayne;Birdman" as one artist. Split them:
+// main artist stays as the artist, the rest become featured artists.
+async function migrateArtists() {
+  const remap = new Map(), changed = [];
+  for (const t of [...lib.tracks.values()]) {
+    let artists;
+    if (t.artist?.includes(';')) artists = splitArtists(t.artist);                       // "A;B;C"
+    else if (t.artists?.length > 1 && t.artist !== t.artists[0]) artists = t.artists;  // "A, B" + [A, B]
+    else if (!t.artists?.length) artists = [t.artist];
+    else continue;
+    t.artists = artists; t.artist = artists[0] || t.artist;
+    const nid = trackKey(t.artist, t.title);
+    if (nid !== t.id) remap.set(t.id, nid);
+    changed.push(t);
+  }
+  if (!changed.length) return;
+  for (const [oldId, nid] of remap) {
+    const t = lib.tracks.get(oldId);
+    lib.tracks.delete(oldId); await db.del('tracks', oldId);
+    const ex = lib.tracks.get(nid);
+    if (ex) { if (t.liked) ex.liked = true; if (!ex.localFileId && t.localFileId) ex.localFileId = t.localFileId; await db.put('tracks', ex); }
+    else { t.id = nid; lib.tracks.set(nid, t); }
+    const c = await db.get('ytcache', oldId);
+    if (c) { if (!(await db.get('ytcache', nid))) await db.put('ytcache', c, nid); await db.del('ytcache', oldId); }
+  }
+  const fix = ids => [...new Set(ids.map(i => remap.get(i) || i))];
+  for (const p of lib.playlists.values()) if (p.trackIds.some(i => remap.has(i))) { p.trackIds = fix(p.trackIds); await db.put('playlists', p); }
+  for (const a of lib.albums.values()) if (a.trackIds?.some(i => remap.has(i))) { a.trackIds = fix(a.trackIds); await db.put('albums', a); }
+  await db.putMany('tracks', changed.filter(t => lib.tracks.get(t.id) === t));
+  emit('dirty', 'migrate');
+}
+
+// Merge incoming tracks into the library, never throwing away data we already have.
+async function upsertTracks(list, extra = {}) {
+  const out = [];
+  for (const n of list) {
+    const old = lib.tracks.get(n.id);
+    const merged = old ? { ...old } : { addedAt: Date.now() };
+    for (const [k, v] of Object.entries(n)) {
+      if (v !== undefined && v !== null && v !== '' && !(k === 'addedAt' && old)) merged[k] = v;
+    }
+    Object.assign(merged, extra);
+    if (old?.liked && !old.transient) { merged.liked = true; merged.likedAt = old.likedAt || merged.likedAt; merged.likeTs = old.likeTs; }
+    else if (extra.liked || (n.liked && !old?.liked)) merged.likeTs = Date.now();
+    merged.updatedAt = Date.now();
+    if (tomb.t[merged.id]) { delete tomb.t[merged.id]; kv.set('tombstones', tomb); }
+    if (merged.liked && !merged.likedAt) merged.likedAt = extra.liked && n.addedAt && !old ? n.addedAt : Date.now();
+    delete merged.transient;
+    lib.tracks.set(merged.id, merged);
+    out.push(merged);
+  }
+  await db.putMany('tracks', out);
+  notify('tracks');
+  queueEnrich(out);
+  return out;
+}
+
+// Keep a track in memory only (e.g. playing a search result) until the user saves it.
+function remember(t) {
+  if (!lib.tracks.has(t.id)) lib.tracks.set(t.id, { ...t, transient: true });
+  return lib.tracks.get(t.id);
+}
+const saved = () => [...lib.tracks.values()].filter(t => !t.transient);
+
+async function updateTrack(id, patch, { quiet = false } = {}) {
+  const t = lib.tracks.get(id); if (!t) return;
+  if (patch.liked && !t.liked) patch = { likedAt: Date.now(), ...patch };
+  if ('liked' in patch && !!patch.liked !== !!t.liked) patch.likeTs = Date.now();
+  patch.updatedAt = Date.now();
+  if (t.transient) { Object.assign(t, patch); await upsertTracks([t]); return; }
+  Object.assign(t, patch);
+  if (quiet) { emit('dirty', 'track'); await db.put('tracks', t); return; }
+  await db.put('tracks', t);
+  notify('track');
+}
+
+// Likes update the screen in place (no page re-render), so the heart reacts instantly
+async function setLiked(id, on) {
+  const t = lib.tracks.get(id); if (!t) return;
+  if (t.transient) { if (on) { await upsertTracks([{ ...t, liked: true, likedAt: Date.now() }], {}); emit('like', { id, liked: true }); } return !!on; }
+  if (!!t.liked === !!on) return !!on;
+  const p = updateTrack(id, on ? { liked: true, likedAt: Date.now() } : { liked: false, likedAt: null }, { quiet: true });
+  emit('like', { id, liked: !!on });
+  await p;
+  return !!on;
+}
+async function toggleLike(id) {
+  const t = lib.tracks.get(id); if (!t) return;
+  return setLiked(id, !(t.liked && !t.transient));
+}
+
+function isReferenced(id) {
+  const t = lib.tracks.get(id);
+  if (!t) return false;
+  if (t.liked || t.localFileId) return true;
+  for (const p of lib.playlists.values()) if (p.trackIds.includes(id)) return true;
+  for (const a of lib.albums.values()) if (a.trackIds?.includes(id)) return true;
+  return false;
+}
+async function gc(ids) {
+  for (const id of ids) if (!isReferenced(id)) { lib.tracks.delete(id); await db.del('tracks', id); await markDeleted('t', id); }
+}
+
+async function deleteTrack(id) {
+  const t = lib.tracks.get(id);
+  if (t?.localFileId) await db.del('files', t.localFileId);
+  for (const p of lib.playlists.values()) {
+    if (p.trackIds.includes(id)) { p.trackIds = p.trackIds.filter(x => x !== id); await db.put('playlists', p); }
+  }
+  for (const a of lib.albums.values()) {
+    if (a.trackIds?.includes(id)) { a.trackIds = a.trackIds.filter(x => x !== id); await db.put('albums', a); }
+  }
+  lib.tracks.delete(id); await db.del('tracks', id);
+  await markDeleted('t', id);
+  notify('delete');
+}
+
+// ---------- Playlists ----------
+async function createPlaylist(name, trackIds = [], extra = {}) {
+  const p = { id: uid('pl'), name: name || 'New playlist', trackIds: [...new Set(trackIds)], createdAt: Date.now(), updatedAt: Date.now(), ...extra };
+  lib.playlists.set(p.id, p);
+  await db.put('playlists', p);
+  notify('playlist');
+  return p;
+}
+async function savePlaylist(p) { p.updatedAt = Date.now(); lib.playlists.set(p.id, p); await db.put('playlists', p); notify('playlist'); }
+async function addToPlaylist(pid, ids) {
+  const p = lib.playlists.get(pid); if (!p) return 0;
+  const before = p.trackIds.length;
+  p.trackIds = [...new Set([...p.trackIds, ...ids])];
+  await savePlaylist(p);
+  return p.trackIds.length - before;
+}
+async function removeFromPlaylist(pid, id) {
+  const p = lib.playlists.get(pid); if (!p) return null;
+  const index = p.trackIds.indexOf(id);
+  const snapshot = lib.tracks.get(id) ? { ...lib.tracks.get(id) } : null;
+  p.trackIds = p.trackIds.filter(x => x !== id);
+  await savePlaylist(p); await gc([id]);
+  return { pid, id, index, snapshot };
+}
+// Undo for removeFromPlaylist: put the song back exactly where it was
+async function undoRemoveFromPlaylist(r) {
+  if (!r) return;
+  const p = lib.playlists.get(r.pid); if (!p) return;
+  if (!lib.tracks.has(r.id) && r.snapshot) await upsertTracks([r.snapshot]);
+  if (!p.trackIds.includes(r.id)) p.trackIds.splice(Math.max(0, Math.min(r.index, p.trackIds.length)), 0, r.id);
+  await savePlaylist(p);
+}
+async function deletePlaylist(pid) {
+  const p = lib.playlists.get(pid); if (!p) return;
+  lib.playlists.delete(pid); await db.del('playlists', pid); await markDeleted('p', pid);
+  await gc(p.trackIds); notify('playlist');
+}
+
+// ---------- Albums ----------
+async function saveAlbum(album, tracks) {
+  const saved = await upsertTracks(tracks.map(t => ({ ...t, album: album.title, albumId: album.id, itunesAlbumId: album.itunesAlbumId || t.itunesAlbumId })));
+  const a = { ...album, trackIds: saved.map(t => t.id), savedAt: Date.now(), updatedAt: Date.now() };
+  if (tomb.a[a.id]) { delete tomb.a[a.id]; kv.set('tombstones', tomb); }
+  lib.albums.set(a.id, a);
+  await db.put('albums', a);
+  notify('album');
+  return a;
+}
+async function removeAlbum(id) {
+  const a = lib.albums.get(id); if (!a) return;
+  lib.albums.delete(id); await db.del('albums', id); await markDeleted('a', id);
+  await gc(a.trackIds || []); notify('album');
+}
+
+// ---------- Derived views ----------
+function artists() {
+  const m = new Map();
+  for (const t of saved()) {
+    const names = t.artists?.length ? t.artists : [mainArtist(t.artist)];
+    for (const name of names) {
+      const k = norm(name); if (!k) continue;
+      const e = m.get(k) || { key: k, name, count: 0, artwork: '', genres: new Set(), itunesArtistId: null };
+      e.count++;
+      if (!e.artwork && t.artwork) e.artwork = t.artwork;
+      if (genreOf(t)) e.genres.add(genreOf(t));
+      if (!e.itunesArtistId && t.itunesArtistId && norm(mainArtist(t.artist)) === k) e.itunesArtistId = t.itunesArtistId;
+      m.set(k, e);
+    }
+  }
+  return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function genres() {
+  const m = new Map();
+  for (const t of saved()) { const g = genreOf(t); if (g) m.set(g, (m.get(g) || 0) + 1); }
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+// Albums the user has songs from but hasn't explicitly saved
+function implicitAlbums() {
+  const m = new Map();
+  for (const t of saved()) {
+    if (!t.album) continue;
+    const id = t.albumId || albumKey(t.artist, t.album);
+    if (lib.albums.has(id)) continue;
+    const e = m.get(id) || { id, title: t.album, artist: mainArtist(t.artist), artwork: t.artwork, year: t.year, itunesAlbumId: t.itunesAlbumId, trackIds: [], implicit: true };
+    e.trackIds.push(t.id);
+    if (!e.itunesAlbumId && t.itunesAlbumId) e.itunesAlbumId = t.itunesAlbumId;
+    m.set(id, e);
+  }
+  return [...m.values()];
+}
+
+// ---------- Background enrichment (genre, release date, artwork, album ids) ----------
+// Lane 1: Apple (genre, date, album, artwork) — paced by meta.js's rate limiter at background priority.
+// Lane 2: covers still missing → Deezer, then the song's YouTube thumbnail as a last resort.
+// Covers that arrive are swapped into what's on screen directly (no page re-render).
+const enrichQ = new Set(), coverQ = new Set();
+let enrichOn = true, lanes = 0;
+const setEnrich = v => { enrichOn = v; if (v) queueEnrich([...lib.tracks.values()]); };
+const enrichPending = () => enrichQ.size + coverQ.size;
+function queueEnrich(list) {
+  for (const t of list) {
+    if (t.transient) continue;
+    if (!t.enriched) enrichQ.add(t.id);
+    if (!t.artwork && !t.coverTried) coverQ.add(t.id);
+  }
+  runEnrich(); runCovers();
+}
+async function patchTrack(t, patch) {
+  Object.assign(t, patch);
+  await db.put('tracks', t);
+  if (patch.artwork) emit('track-art', { id: t.id, artwork: patch.artwork });
+  emit('dirty', 'enrich'); // backups only; no full re-render while browsing
+}
+function runEnrich() {
+  while (enrichOn && lanes < 2 && enrichQ.size) { lanes++; lane().finally(() => { lanes--; emit('enrich', enrichPending()); }); }
+}
+async function lane() {
+  while (enrichQ.size && enrichOn) {
+    if (!navigator.onLine) { await new Promise(r => setTimeout(r, 10000)); continue; }
+    const id = enrichQ.values().next().value; enrichQ.delete(id);
+    const t = lib.tracks.get(id);
+    if (!t || t.enriched || t.transient) continue;
+    try {
+      const m = await meta.matchTrack(t);
+      const patch = { enriched: true };
+      if (m) {
+        if (!t.genre && m.genre) patch.genre = m.genre;
+        if (!t.releaseDate && m.releaseDate) { patch.releaseDate = m.releaseDate; patch.year = m.year; }
+        if (!t.artwork && m.artwork) patch.artwork = m.artwork;
+        if (!t.album && m.album) { patch.album = m.album; patch.albumId = m.albumId; }
+        if (!t.durationMs && m.durationMs) patch.durationMs = m.durationMs;
+        patch.itunesAlbumId = m.itunesAlbumId; patch.itunesArtistId = m.itunesArtistId;
+      }
+      await patchTrack(t, patch);
+      emit('enrich', enrichPending());
+    } catch (e) {
+      enrichQ.add(id); // retry later; meta.js already backs off
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+let coverWorkers = 0;
+function runCovers() { while (enrichOn && coverWorkers < 2 && coverQ.size) { coverWorkers++; coverLane().finally(() => { coverWorkers--; emit('enrich', enrichPending()); }); } }
+async function coverLane() {
+  while (coverQ.size && enrichOn) {
+    if (!navigator.onLine) { await new Promise(r => setTimeout(r, 10000)); continue; }
+    const id = coverQ.values().next().value; coverQ.delete(id);
+    const t = lib.tracks.get(id);
+    if (!t || t.artwork || t.transient) continue;
+    let artwork = '';
+    try { artwork = (await meta.deezerCover(t))?.artwork || ''; } catch { }
+    if (!artwork) { const c = await db.get('ytcache', id); const vid = c?.audio || c?.video; if (vid) artwork = `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`; }
+    await patchTrack(t, artwork ? { artwork, coverTried: true } : { coverTried: true });
+  }
+}
+// Called by the player when a YouTube match is found for a song with no cover
+async function coverFromVideo(id, vid) {
+  const t = lib.tracks.get(id);
+  if (!t || t.artwork || !vid) return;
+  const artwork = `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
+  if (t.transient) { t.artwork = artwork; emit('track-art', { id, artwork }); return; }
+  await patchTrack(t, { artwork });
+}
+
+return { lib, notify, tombstones, setTombstones, load, upsertTracks, remember, saved, updateTrack, setLiked, toggleLike, deleteTrack, createPlaylist, savePlaylist, addToPlaylist, removeFromPlaylist, undoRemoveFromPlaylist, deletePlaylist, saveAlbum, removeAlbum, artists, genres, implicitAlbums, setEnrich, enrichPending, queueEnrich, coverFromVideo };
+})();
+// ---------- youtube.js ----------
+const __m_youtube = (() => {
+// Finding YouTube videos for each song — free and keyless by default.
+// Sources, in order:
+//   1. Your own YouTube Data API key (optional, Settings) — most reliable.
+//   2. Public Invidious instances (open-source YouTube front-ends with a free JSON API).
+//   3. Public Piped instances.
+//
+// Speed + safety:
+//  • ONE search per song (the results almost always contain both the music video and the
+//    "Topic"/official-audio upload). A second, targeted search only runs if one is missing.
+//  • Servers are ranked by how fast and reliable they've actually been; the fastest is used first,
+//    slow or failing ones are rested for 10 minutes.
+//  • Batch matching runs a few songs at once, each on a DIFFERENT server, with a minimum gap per
+//    server — fast for you, gentle on every server, so nobody rate-limits or blocks your IP.
+//  • Every match is cached on the device, so a song is only ever looked up once.
+const { db } = __m_db;
+const { norm, mainArtist, sleep } = __m_util;
+
+let settings = { ytKey: '', customInstance: '', ownerKey: '' }; // ownerKey: app-wide backup key from index.html
+const setYTSettings = s => { settings = { ...settings, ...s }; };
+
+const FALLBACK_INVIDIOUS = [
+  'https://inv.nadeko.net', 'https://invidious.nerdvpn.de', 'https://yewtu.be',
+  'https://invidious.f5.si', 'https://iv.melmac.space', 'https://invidious.privacyredirect.com'
+];
+const FALLBACK_PIPED = ['https://pipedapi.kavin.rocks', 'https://api.piped.private.coffee', 'https://pipedapi.adminforge.de'];
+
+// ---------- server pool ----------
+const pool = new Map(); // base -> {kind, ok, fail, ms, badUntil, last, busy}
+function addServer(kind, base) { if (!pool.has(base)) pool.set(base, { kind, ok: 0, fail: 0, ms: 2500, badUntil: 0, last: 0, busy: 0 }); }
+FALLBACK_INVIDIOUS.forEach(b => addServer('inv', b));
+FALLBACK_PIPED.forEach(b => addServer('piped', b));
+// Remember which servers were fast (and which were down) between visits, so the very first song
+// of a session goes straight to a server that works instead of waiting on dead ones.
+try {
+  const saved = JSON.parse(localStorage.getItem('bz_yt_pool') || '{}');
+  for (const [b, v] of Object.entries(saved)) { addServer(v.kind || 'inv', b); Object.assign(pool.get(b), { ok: v.ok || 0, fail: v.fail || 0, ms: v.ms || 2500, badUntil: v.badUntil || 0 }); }
+} catch { }
+let poolSaveT = 0;
+function savePool() {
+  clearTimeout(poolSaveT);
+  poolSaveT = setTimeout(() => {
+    const o = {}; for (const [b, v] of pool) if (v.ok || v.fail) o[b] = { kind: v.kind, ok: Math.min(v.ok, 50), fail: v.fail, ms: Math.round(v.ms), badUntil: v.badUntil };
+    try { localStorage.setItem('bz_yt_pool', JSON.stringify(o)); } catch { }
+  }, 1000);
+}
+
+async function fetchJSON(url, ms = 7000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (r.status === 429 || r.status === 403) { const e = new Error('rate'); e.rate = true; throw e; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+// Load the live list of healthy public servers in the background (never blocks a search)
+let listLoaded = null;
+function startInstances() {
+  if (listLoaded) return listLoaded;
+  listLoaded = (async () => {
+    try {
+      const list = await fetchJSON('https://api.invidious.io/instances.json?sort_by=health', 6000);
+      for (const [, info] of list) if (info?.type === 'https' && info.api && info.cors) addServer('inv', info.uri.replace(/\/$/, ''));
+    } catch { }
+    try {
+      const list = await fetchJSON('https://piped-instances.kavin.rocks/', 6000);
+      for (const i of list) if (i.api_url) addServer('piped', i.api_url.replace(/\/$/, ''));
+    } catch { }
+  })();
+  return listLoaded;
+}
+
+const MIN_GAP = 400; // ms between two requests to the same server
+function rankServers(exclude = new Set()) {
+  const now = Date.now();
+  const list = [...pool.entries()].filter(([b, s]) => s.badUntil < now && !exclude.has(b));
+  // Known-good servers by speed first, then untested ones (a little shuffled to spread load), then flaky ones
+  const score = s => (s.ok ? s.ms : 4000 + Math.random() * 1500) + s.fail * 3000 + s.busy * 1500;
+  return list.sort((a, b) => score(a[1]) - score(b[1])).map(([b]) => b);
+}
+function record(base, ok, ms, rate) {
+  const s = pool.get(base); if (!s) return;
+  if (ok) { s.ok++; s.fail = Math.max(0, s.fail - 1); s.ms = s.ms * 0.6 + ms * 0.4; }
+  else { s.fail++; if (rate || s.fail >= 2) s.badUntil = Date.now() + 10 * 60e3; }
+  savePool();
+}
+async function hit(base, q, ms = 7000) {
+  const s = pool.get(base);
+  const wait = s.last + MIN_GAP - Date.now();
+  s.last = Math.max(Date.now(), s.last + MIN_GAP);
+  if (wait > 0) await sleep(wait);
+  s.busy++;
+  const t0 = performance.now();
+  try {
+    const r = s.kind === 'inv' ? await searchInvidious(base, q, ms) : await searchPiped(base, q, ms);
+    record(base, true, performance.now() - t0);
+    return r;
+  } catch (e) { record(base, false, 0, e.rate); throw e; }
+  finally { s.busy--; }
+}
+
+// Normalised result: {id, title, author, seconds, views}
+async function searchViaKey(q, key = settings.ytKey) {
+  const u = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=12&q=${encodeURIComponent(q)}&key=${encodeURIComponent(key)}`;
+  const d = await fetchJSON(u);
+  return (d.items || []).map(i => ({ id: i.id.videoId, title: decodeEntities(i.snippet.title), author: i.snippet.channelTitle, seconds: 0 }));
+}
+async function searchInvidious(base, q, ms) {
+  const d = await fetchJSON(`${base}/api/v1/search?type=video&q=${encodeURIComponent(q)}&fields=type,videoId,title,author,lengthSeconds,viewCount`, ms);
+  return d.filter(v => v.type === 'video').map(v => ({ id: v.videoId, title: v.title, author: v.author, seconds: v.lengthSeconds || 0, views: v.viewCount || 0 }));
+}
+async function searchPiped(base, q, ms) {
+  const d = await fetchJSON(`${base}/search?filter=videos&q=${encodeURIComponent(q)}`, ms);
+  return (d.items || []).filter(v => v.url?.includes('watch')).map(v => ({
+    id: new URL(v.url, 'https://x.y').searchParams.get('v'), title: v.title, author: (v.uploaderName || '').replace(/\s*-\s*Topic$/, ' - Topic'), seconds: v.duration || 0, views: v.views || 0
+  }));
+}
+function decodeEntities(s) { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
+
+// Fast path for a song you just tapped: ask the best server, and if it hasn't answered within a
+// moment, ask the next one too (and so on) — the first good answer wins. A slow or dead server
+// never holds the music up. The app's backup key joins in only if the free servers are all slow.
+function raceSearch(q, order) {
+  return new Promise((resolve, reject) => {
+    let i = 0, pending = 0, done = false, timer = 0, keyTimer = 0;
+    const win = r => { done = true; clearTimeout(timer); clearTimeout(keyTimer); resolve(r); };
+    const launch = () => {
+      clearTimeout(timer);
+      if (done) return;
+      if (i >= order.length) { if (!pending) { done = true; clearTimeout(keyTimer); reject(new Error('none')); } return; }
+      const base = order[i++], st = pool.get(base); pending++;
+      hit(base, q, 5000).then(r => { pending--; if (done) return; if (r.length) win(r); else launch(); }, () => { pending--; if (!done) launch(); });
+      const known = st && st.ok && st.ms < 2500;
+      timer = setTimeout(launch, known ? Math.max(700, Math.min(1600, st.ms * 1.6)) : 650);
+    };
+    launch();
+    if (settings.ownerKey && settings.ownerKey !== settings.ytKey) {
+      keyTimer = setTimeout(() => { if (done) return; pending++; searchViaKey(q, settings.ownerKey).then(r => { pending--; if (!done && r.length) win(r); else if (!done) launch(); }, () => { pending--; if (!done) launch(); }); }, 3000);
+    }
+  });
+}
+
+const qCache = new Map();
+// preferFree: try free servers before spending API-key quota (used by the Search page while typing)
+async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
+  const key = q.toLowerCase();
+  if (qCache.has(key)) return qCache.get(key);
+  const p = (async () => {
+    startInstances();
+    const useKey = settings.ytKey && !preferFree;
+    if (useKey) { try { return await searchViaKey(q); } catch (e) { console.warn('YT key search failed', e); } }
+    const tried = new Set();
+    const order = [];
+    if (settings.customInstance) { const b = settings.customInstance.replace(/\/$/, ''); addServer('inv', b); order.push(b); }
+    if (prefer) order.push(prefer);
+    for (const b of rankServers()) if (!order.includes(b)) order.push(b);
+    if (!prefer) { try { return await raceSearch(q, order.slice(0, 12)); } catch { } }
+    else for (const base of order.slice(0, 7)) {
+      if (tried.has(base)) continue; tried.add(base);
+      try { const r = await hit(base, q); if (r.length) return r; } catch { }
+    }
+    // Free servers all failed: fall back to your key if we skipped it, then the app's backup key
+    if (settings.ytKey && preferFree) { try { return await searchViaKey(q); } catch { } }
+    if (settings.ownerKey && settings.ownerKey !== settings.ytKey) { try { return await searchViaKey(q, settings.ownerKey); } catch (e) { console.warn('backup key search failed', e); } }
+    throw new Error('Couldn\'t reach YouTube search right now — try again in a moment, or add a free YouTube API key in Settings → YouTube matching.');
+  })();
+  qCache.set(key, p);
+  p.catch(() => qCache.delete(key));
+  if (qCache.size > 300) qCache.delete(qCache.keys().next().value);
+  return p;
+}
+
+// Score a result for "video" (official music video) or "audio" (Topic channel / official audio)
+function score(r, t, mode) {
+  const title = norm(r.title), author = String(r.author || '').toLowerCase();
+  const nt = norm(t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')), na = norm(mainArtist(t.artist));
+  let s = 0;
+  if (title.includes(nt)) s += 6;
+  if (title.includes(na) || norm(author).includes(na)) s += 4;
+  const isTopic = author.endsWith(' - topic');
+  const vevo = author.includes('vevo');
+  const raw = String(r.title).toLowerCase();
+  if (mode === 'audio') {
+    if (isTopic) s += 8;
+    if (/official audio|\baudio\b/.test(raw)) s += 5;
+    if (/lyric/.test(raw)) s += 1;
+    if (/music video|official video/.test(raw)) s -= 2;
+  } else {
+    if (/official (music )?video|music video/.test(raw)) s += 7;
+    if (vevo || norm(author) === na) s += 3;
+    if (isTopic) s -= 4;
+    if (/lyric|audio/.test(raw)) s -= 2;
+  }
+  if (/\b(cover|karaoke|instrumental|reaction|8d|slowed|sped up|nightcore|remix|live)\b/.test(raw) && !/(remix|live)/.test(norm(t.title))) s -= 6;
+  if (t.durationMs && r.seconds) {
+    const diff = Math.abs(r.seconds - t.durationMs / 1000);
+    if (diff < 5) s += 3; else if (diff > 90 && mode === 'audio') s -= 3;
+  }
+  if (r.seconds > 1200) s -= 5;
+  if (r.views > 1e6) s += 1;
+  return s;
+}
+function pick(list, t, mode, notId) {
+  const b = list.filter(r => r.id !== notId).map(r => [score(r, t, mode), r]).sort((a, b) => b[0] - a[0])[0];
+  return b && b[0] >= 8 ? b[1] : null;
+}
+
+const inflight = new Map();
+const hot = new Map(); // matches already looked up this session (skips the database round-trip)
+function forget(id) { id ? hot.delete(id) : hot.clear(); }
+function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
+  if (!t) return Promise.reject(new Error('No song'));
+  if (!force && hot.has(t.id)) return Promise.resolve(hot.get(t.id));
+  if (!force && inflight.has(t.id)) return inflight.get(t.id);
+  const p = (async () => {
+    if (!force) {
+      const c = await db.get('ytcache', t.id);
+      if (c && (c.video || c.audio)) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
+    }
+    const base = `${mainArtist(t.artist)} ${t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')}`;
+    const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now() };
+    let list = await rawSearch(base, { prefer });
+    let v = pick(list, t, 'video'), a = pick(list, t, 'audio', v?.id);
+    const save = async () => {
+      if (v) { out.video = v.id; out.videoTitle = v.title; }
+      if (a) { out.audio = a.id; out.audioTitle = a.title; }
+      if (!out.video && !out.audio && list[0]) { out.audio = list[0].id; out.audioTitle = list[0].title; out.guess = true; }
+      await db.put('ytcache', { ...out }, t.id);
+      if (out.video || out.audio) hot.set(t.id, { ...out });
+      return { ...out };
+    };
+    // Only spend a second search on whatever is still missing
+    if (!a || !v) {
+      const second = rawSearch(`${base} ${!a ? 'official audio' : 'official music video'}`, { prefer }).then(more => {
+        const seen = new Set(list.map(r => r.id));
+        list = [...list, ...more.filter(r => !seen.has(r.id))];
+        v = v || pick(list, t, 'video', a?.id); a = a || pick(list, t, 'audio', v?.id);
+      }).catch(() => { });
+      // The version you're about to play is already known: start it now, finish the other quietly
+      if (need && (need === 'video' ? v : a)) { const first = await save(); second.then(save).catch(() => { }); return first; }
+      await Promise.race([second, sleep(need ? 2500 : 60000)]);
+    }
+    return save();
+  })();
+  inflight.set(t.id, p);
+  p.finally(() => inflight.delete(t.id));
+  return p;
+}
+
+// Match many songs quickly: a few parallel workers, each pinned to a different server.
+async function matchMany(tracks, { onProgress, isCancelled } = {}) {
+  startInstances();
+  await Promise.race([listLoaded, sleep(1500)]);
+  const workers = settings.ytKey ? 4 : Math.min(4, Math.max(2, rankServers().length >> 1));
+  const servers = rankServers();
+  let next = 0, done = 0, found = 0, failedInARow = 0, lastErr = null;
+  async function worker(w) {
+    while (next < tracks.length && !isCancelled?.()) {
+      const t = tracks[next++];
+      try {
+        const c = await findForTrack(t, { prefer: servers[w % Math.max(1, servers.length)] });
+        if (c.video || c.audio) found++;
+        failedInARow = 0;
+      } catch (e) { lastErr = e; if (++failedInARow >= 6) return; }
+      onProgress?.(++done, tracks.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(workers, tracks.length) }, (_, w) => worker(w)));
+  if (!found && lastErr) throw lastErr;
+  return { found, done };
+}
+
+async function setManual(trackId, mode, id, title = '') {
+  const c = (await db.get('ytcache', trackId)) || {};
+  c[mode] = id; c[mode + 'Title'] = title || 'Set manually'; c.manual = true; c.checkedAt = Date.now();
+  await db.put('ytcache', c, trackId);
+  hot.set(trackId, c);
+  return c;
+}
+
+const thumb = (id, q = 'hqdefault') => id ? `https://i.ytimg.com/vi/${id}/${q}.jpg` : '';
+
+function parseYouTubeId(input) {
+  const s = String(input || '').trim();
+  if (/^[\w-]{11}$/.test(s)) return s;
+  try {
+    const u = new URL(s);
+    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1, 12);
+    if (u.searchParams.get('v')) return u.searchParams.get('v');
+    const m = u.pathname.match(/\/(embed|shorts|live)\/([\w-]{11})/);
+    if (m) return m[2];
+  } catch { }
+  return null;
+}
+
+// Turn a YouTube result into a song: "Artist - Title (Official Video)" -> {artist, title}
+function videoToSong(r) {
+  let title = String(r.title || '').replace(/\s*[\(\[]\s*(official|music|lyric|lyrics|audio|video|visuali[sz]er|hd|4k|explicit)[^\)\]]*[\)\]]/gi, '').replace(/\s*\|.*$/, '').trim();
+  let artist = String(r.author || '').replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim();
+  const m = title.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  if (m) { artist = m[1].trim(); title = m[2].trim(); }
+  // "Essence ft. Tems" -> title "Essence", featured artist Tems
+  const artists = [artist];
+  const f = title.match(/\s*[\(\[]?\s*(?:ft\.?|feat\.?|featuring)\s+([^\)\]]+)[\)\]]?\s*$/i);
+  if (f) { title = title.slice(0, f.index).trim(); artists.push(...f[1].split(/\s*(?:,|&| and | x )\s*/i).filter(Boolean)); }
+  return { artist, title, artists };
+}
+
+// Build "untitled playlist" links that open straight on YouTube (50 videos per link)
+function youtubePlaylistLinks(ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 50) out.push('https://www.youtube.com/watch_videos?video_ids=' + ids.slice(i, i + 50).join(','));
+  return out;
+}
+
+// ---------- public playlists (no sign-in) ----------
+function parsePlaylistId(input) {
+  const s = String(input || '').trim();
+  if (/^(PL|UU|LL|FL|OLAK5uy_|RD)[\w-]{10,}$/.test(s)) return s;
+  try { return new URL(s).searchParams.get('list'); } catch { return null; }
+}
+async function publicPlaylist(listId) {
+  startInstances();
+  // 1) your own API key, if you added one
+  if (settings.ytKey) {
+    try {
+      const vids = []; let page = '', title = 'YouTube playlist';
+      try { const m = await fetchJSON(`https://www.googleapis.com/youtube/v3/playlists?part=snippet&id=${listId}&key=${encodeURIComponent(settings.ytKey)}`); title = m.items?.[0]?.snippet?.title || title; } catch { }
+      do {
+        const d = await fetchJSON(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&maxResults=50&playlistId=${listId}&key=${encodeURIComponent(settings.ytKey)}${page ? '&pageToken=' + page : ''}`);
+        for (const it of d.items || []) { const id = it.contentDetails?.videoId; if (id && !/^(Deleted|Private) video$/.test(it.snippet.title)) vids.push({ id, title: it.snippet.title, author: it.snippet.videoOwnerChannelTitle || '' }); }
+        page = d.nextPageToken || '';
+      } while (page && vids.length < 5000);
+      if (vids.length) return { title, videos: vids };
+    } catch { }
+  }
+  // 2) free servers
+  for (const base of rankServers().slice(0, 6)) {
+    const s = pool.get(base);
+    try {
+      if (s.kind === 'inv') {
+        const vids = []; let title = 'YouTube playlist';
+        for (let page = 1; page <= 40; page++) {
+          const d = await fetchJSON(`${base}/api/v1/playlists/${listId}?page=${page}`, 9000);
+          title = d.title || title;
+          const got = (d.videos || []).filter(v => v.videoId && v.lengthSeconds !== 0).map(v => ({ id: v.videoId, title: v.title, author: v.author, seconds: v.lengthSeconds || 0 }));
+          const before = vids.length;
+          for (const v of got) if (!vids.some(x => x.id === v.id)) vids.push(v);
+          if (vids.length === before || !got.length) break;
+        }
+        if (vids.length) { record(base, true, 1500); return { title, videos: vids }; }
+      } else {
+        const d = await fetchJSON(`${base}/playlists/${listId}`, 9000);
+        const vids = (d.relatedStreams || []).map(v => ({ id: new URL(v.url, 'https://x.y').searchParams.get('v'), title: v.title, author: v.uploaderName, seconds: v.duration || 0 }));
+        let next = d.nextpage;
+        while (next && vids.length < 5000) {
+          const n = await fetchJSON(`${base}/nextpage/playlists/${listId}?nextpage=${encodeURIComponent(next)}`, 9000);
+          vids.push(...(n.relatedStreams || []).map(v => ({ id: new URL(v.url, 'https://x.y').searchParams.get('v'), title: v.title, author: v.uploaderName, seconds: v.duration || 0 })));
+          next = n.nextpage;
+        }
+        if (vids.length) { record(base, true, 1500); return { title: d.name || 'YouTube playlist', videos: vids }; }
+      }
+    } catch (e) { record(base, false, 0, e.rate); }
+  }
+  throw new Error('Couldn\'t read that playlist. Make sure it\'s public or unlisted, or sign in with YouTube to import your private playlists.');
+}
+
+return { setYTSettings, startInstances, rawSearch, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
+})();
+// ---------- ytaccount.js ----------
+const __m_ytaccount = (() => {
+// YouTube account sync: save BAZINGA! playlists to the user's YouTube account and
+// import their YouTube playlists back (a second backup of their music).
+//
+// Uses Google's own sign-in popup (Google Identity Services) in the browser — no server.
+// The access token lives only in memory/this device and expires after about an hour.
+//
+// YouTube limits (per Google sign-in key, per day): 10,000 "units".
+//   create playlist = 50, add one song = 50, read 50 songs = 1.
+//   → about 200 songs can be added per day per key. Uploads that hit the limit pause and
+//     can be resumed the next day (Google resets the quota at midnight Pacific time).
+const { kv } = __m_db;
+const { sleep, emit } = __m_util;
+
+const SCOPE = 'https://www.googleapis.com/auth/youtube';
+const API = 'https://www.googleapis.com/youtube/v3/';
+let clientId = '';
+let token = null; // {access, expires}
+
+function setGoogleClientId(id) { clientId = (id || '').trim(); }
+const configured = () => !!clientId;
+const signedIn = () => !!token && Date.now() < token.expires;
+
+let gisP = null;
+function loadGIS() {
+  if (window.google?.accounts?.oauth2) return Promise.resolve();
+  if (gisP) return gisP;
+  gisP = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
+    s.onload = () => res(); s.onerror = () => { gisP = null; rej(new Error('Couldn\'t load Google sign-in. Check your connection.')); };
+    document.head.appendChild(s);
+  });
+  return gisP;
+}
+
+async function restoreSession() {
+  const t = await kv.get('ytToken');
+  if (t && Date.now() < t.expires) token = t;
+}
+
+// Must be called from a click (browsers block popups otherwise)
+async function signIn({ prompt = '' } = {}) {
+  if (!clientId) throw new Error('YouTube sign-in isn\'t set up yet. See Settings → YouTube account.');
+  if (!location.protocol.startsWith('http')) throw new Error('YouTube sign-in only works on the hosted (GitHub Pages) version of BAZINGA!.');
+  await loadGIS();
+  return new Promise((resolve, reject) => {
+    const tc = google.accounts.oauth2.initTokenClient({
+      client_id: clientId, scope: SCOPE,
+      callback: async r => {
+        if (r.error) return reject(new Error(r.error === 'access_denied' ? 'YouTube access was not allowed.' : 'Google sign-in failed: ' + r.error));
+        token = { access: r.access_token, expires: Date.now() + (r.expires_in - 60) * 1000 };
+        await kv.set('ytToken', token);
+        emit('yt-account');
+        resolve(token);
+      },
+      error_callback: e => reject(new Error(e?.type === 'popup_closed' ? 'Sign-in window was closed.' : e?.type === 'popup_failed_to_open' ? 'Your browser blocked the sign-in popup — allow popups for this site.' : 'Google sign-in failed.'))
+    });
+    tc.requestAccessToken({ prompt });
+  });
+}
+async function signOut() {
+  try { if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.access, () => { }); } catch { }
+  token = null; await kv.del('ytToken'); emit('yt-account');
+}
+
+class QuotaError extends Error { constructor() { super('YouTube\'s daily limit for this app has been reached. Your upload is saved — tap "Resume" tomorrow (limits reset at midnight Pacific time), or add your own Google key in Settings for your own limit.'); this.quota = true; } }
+
+async function api(method, path, { params = {}, body } = {}) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!signedIn()) await signIn();
+    const r = await fetch(API + path + '?' + new URLSearchParams(params), {
+      method, headers: { Authorization: 'Bearer ' + token.access, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    if (r.status === 401) { token = null; await kv.del('ytToken'); continue; }
+    const d = r.status === 204 ? {} : await r.json().catch(() => ({}));
+    if (r.ok) return d;
+    const reason = d?.error?.errors?.[0]?.reason || '';
+    if (/quotaExceeded|dailyLimitExceeded|rateLimitExceeded/.test(reason)) {
+      if (reason === 'rateLimitExceeded' && attempt < 2) { await sleep(1500 * (attempt + 1)); continue; }
+      throw new QuotaError();
+    }
+    if (r.status === 409 && attempt < 2) { await sleep(800); continue; } // YouTube busy with the previous insert
+    if (reason === 'youtubeSignupRequired') throw new Error('This Google account doesn\'t have a YouTube channel yet. Open youtube.com, create your channel, then try again.');
+    if (reason === 'videoNotFound' || reason === 'forbidden' && path === 'playlistItems') { const e = new Error('skip'); e.skip = true; throw e; }
+    throw new Error(d?.error?.message || `YouTube error ${r.status}`);
+  }
+  throw new Error('Couldn\'t sign in to YouTube.');
+}
+
+async function allPages(path, params, map) {
+  const out = []; let pageToken = '';
+  do {
+    const d = await api('GET', path, { params: { ...params, maxResults: 50, ...(pageToken ? { pageToken } : {}) } });
+    out.push(...(d.items || []).map(map).filter(Boolean));
+    pageToken = d.nextPageToken || '';
+  } while (pageToken && out.length < 5000);
+  return out;
+}
+
+// ---------- reading ----------
+async function myPlaylists() {
+  const lists = await allPages('playlists', { part: 'snippet,contentDetails', mine: true }, p => ({
+    id: p.id, title: p.snippet.title, count: p.contentDetails?.itemCount ?? null, image: p.snippet.thumbnails?.medium?.url || ''
+  }));
+  try {
+    const ch = await api('GET', 'channels', { params: { part: 'contentDetails', mine: true } });
+    const likes = ch.items?.[0]?.contentDetails?.relatedPlaylists?.likes;
+    if (likes) lists.unshift({ id: likes, title: 'Liked videos', count: null, image: '', liked: true });
+  } catch { }
+  return lists;
+}
+async function playlistVideos(id) {
+  return allPages('playlistItems', { part: 'snippet,contentDetails', playlistId: id }, it => {
+    const vid = it.contentDetails?.videoId || it.snippet?.resourceId?.videoId;
+    if (!vid || /^(Deleted|Private) video$/.test(it.snippet?.title || '')) return null;
+    return { id: vid, title: it.snippet.title, author: it.snippet.videoOwnerChannelTitle || '' };
+  });
+}
+
+// ---------- writing ----------
+async function createPlaylist(title, description, privacy = 'private') {
+  const d = await api('POST', 'playlists', { params: { part: 'snippet,status' }, body: { snippet: { title: title.slice(0, 150), description: description.slice(0, 4900) }, status: { privacyStatus: privacy } } });
+  return d.id;
+}
+async function existingVideoIds(playlistId) {
+  try { return new Set((await playlistVideos(playlistId)).map(v => v.id)); }
+  catch (e) { if (/not ?found/i.test(e.message)) return null; throw e; }
+}
+
+// Upload job, resumable. job = {key, title, ytPlaylistId, videoIds, done, privacy, created}
+async function runUpload(job, { onProgress, isCancelled } = {}) {
+  if (!job.ytPlaylistId) {
+    job.ytPlaylistId = await createPlaylist(job.title, 'Made with BAZINGA! ⚡', job.privacy);
+    await saveJob(job);
+  }
+  let skipped = job.skipped || 0;
+  while (job.done < job.videoIds.length) {
+    if (isCancelled?.()) break;
+    const videoId = job.videoIds[job.done];
+    try {
+      await api('POST', 'playlistItems', { params: { part: 'snippet' }, body: { snippet: { playlistId: job.ytPlaylistId, resourceId: { kind: 'youtube#video', videoId } } } });
+    } catch (e) {
+      if (!e.skip) { await saveJob(job); throw e; }
+      skipped++; job.skipped = skipped;
+    }
+    job.done++;
+    if (job.done % 5 === 0) await saveJob(job);
+    onProgress?.(job.done, job.videoIds.length);
+    await sleep(120); // YouTube rejects inserts into the same playlist that arrive too close together
+  }
+  if (job.done >= job.videoIds.length) await clearJob(job.key); else await saveJob(job);
+  return { url: 'https://www.youtube.com/playlist?list=' + job.ytPlaylistId, skipped, finished: job.done >= job.videoIds.length };
+}
+const pendingJobs = async () => (await kv.get('ytUploads')) || {};
+async function saveJob(job) { const all = await pendingJobs(); all[job.key] = job; await kv.set('ytUploads', all); emit('yt-account'); }
+async function clearJob(key) { const all = await pendingJobs(); delete all[key]; await kv.set('ytUploads', all); emit('yt-account'); }
+const dropJob = clearJob;
+
+// Units this upload will use (so we can tell the user before starting)
+const unitsFor = (n, newPlaylist) => n * 50 + (newPlaylist ? 50 : 0);
+
+return { setGoogleClientId, configured, signedIn, restoreSession, signIn, signOut, myPlaylists, playlistVideos, createPlaylist, existingVideoIds, runUpload, pendingJobs, dropJob, unitsFor };
+})();
+// ---------- spotify.js ----------
+const __m_spotify = (() => {
+// Spotify import (Liked Songs + playlists). Runs 100% in the browser using
+// OAuth PKCE with the user's OWN free Spotify developer Client ID, so there is
+// no shared server and no shared request limit. Tokens stay on the device.
+const { kv } = __m_db;
+const { trackKey, albumKey, yearOf, sleep } = __m_util;
+
+const SCOPES = 'user-library-read playlist-read-private playlist-read-collaborative';
+const redirectUri = () => location.origin + location.pathname;
+
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function login(clientId) {
+  if (!location.protocol.startsWith('http')) throw new Error('Spotify login only works on the hosted (GitHub Pages) version of BAZINGA.');
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.setItem('bz_sp_verifier', verifier);
+  sessionStorage.setItem('bz_sp_state', state);
+  await kv.set('spotifyClientId', clientId);
+  const p = new URLSearchParams({
+    client_id: clientId, response_type: 'code', redirect_uri: redirectUri(),
+    code_challenge_method: 'S256', code_challenge: challenge, scope: SCOPES, state
+  });
+  location.href = 'https://accounts.spotify.com/authorize?' + p;
+}
+
+// Call on startup: completes the login if we just came back from Spotify.
+async function handleRedirect() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('auth') === 'sb') return false; // that's a BAZINGA! account sign-in, not Spotify
+  if (!q.get('code') && !q.get('error')) return false;
+  const clean = () => history.replaceState(null, '', redirectUri() + location.hash);
+  if (q.get('error')) { clean(); throw new Error('Spotify login was cancelled.'); }
+  if (q.get('state') !== sessionStorage.getItem('bz_sp_state')) { clean(); throw new Error('Spotify login expired — please try again.'); }
+  const clientId = await kv.get('spotifyClientId');
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: clientId, grant_type: 'authorization_code', code: q.get('code'),
+      redirect_uri: redirectUri(), code_verifier: sessionStorage.getItem('bz_sp_verifier')
+    })
+  });
+  clean();
+  if (!r.ok) throw new Error('Spotify login failed (' + r.status + '). Check the Redirect URI in your Spotify app.');
+  await saveToken(await r.json());
+  return true;
+}
+
+async function saveToken(t) {
+  const prev = (await kv.get('spotifyToken')) || {};
+  await kv.set('spotifyToken', {
+    access: t.access_token, refresh: t.refresh_token || prev.refresh,
+    expires: Date.now() + (t.expires_in - 60) * 1000
+  });
+}
+
+async function token() {
+  const t = await kv.get('spotifyToken');
+  if (!t) throw new Error('Not connected to Spotify.');
+  if (Date.now() < t.expires) return t.access;
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: t.refresh, client_id: await kv.get('spotifyClientId') })
+  });
+  if (!r.ok) { await kv.del('spotifyToken'); throw new Error('Spotify session expired — reconnect.'); }
+  await saveToken(await r.json());
+  return (await kv.get('spotifyToken')).access;
+}
+
+const isConnected = async () => !!(await kv.get('spotifyToken'));
+const disconnect = () => kv.del('spotifyToken');
+
+async function api(url) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const r = await fetch(url.startsWith('http') ? url : 'https://api.spotify.com/v1' + url, {
+      headers: { Authorization: 'Bearer ' + await token() }
+    });
+    if (r.status === 429) { await sleep((+r.headers.get('Retry-After') || 2) * 1000); continue; }
+    if (!r.ok) { const e = new Error('Spotify ' + r.status); e.status = r.status; throw e; }
+    return r.json();
+  }
+  throw new Error('Spotify is rate-limiting — try again in a minute.');
+}
+
+// Follow `next` links, trying a big page size first and smaller ones if Spotify refuses.
+async function paged(path, onPage) {
+  let out = [];
+  for (const limit of [50, 20, 10]) {
+    try {
+      let url = path + (path.includes('?') ? '&' : '?') + 'limit=' + limit;
+      out = [];
+      while (url) {
+        const d = await api(url);
+        out.push(...(d.items || []));
+        onPage?.(out.length, d.total);
+        url = d.next;
+      }
+      return out;
+    } catch (e) { if (e.status !== 400) throw e; }
+  }
+  return out;
+}
+
+function toTrack(t, addedAt) {
+  if (!t || t.type === 'episode' || !t.name) return null;
+  const artists = (t.artists || []).map(a => a.name);
+  const artist = artists[0] || '';
+  const al = t.album || {};
+  return {
+    id: trackKey(artist, t.name),
+    title: t.name, artist, artists,
+    album: al.name || '',
+    albumId: al.name ? albumKey((al.artists?.[0]?.name) || artists[0], al.name) : '',
+    spotifyId: t.id || null, spotifyAlbumId: al.id || null,
+    releaseDate: al.release_date || '', year: yearOf(al.release_date),
+    durationMs: t.duration_ms || 0,
+    artwork: al.images?.[0]?.url || '',
+    explicit: !!t.explicit,
+    trackNumber: t.track_number || 0,
+    addedAt: addedAt ? Date.parse(addedAt) : Date.now()
+  };
+}
+
+async function likedSongs(onProgress) {
+  const items = await paged('/me/tracks', onProgress);
+  return items.map(i => toTrack(i.track || i.item, i.added_at)).filter(Boolean);
+}
+
+async function playlists() {
+  const items = await paged('/me/playlists');
+  return items.filter(Boolean).map(p => ({
+    spotifyId: p.id, name: p.name, image: p.images?.[0]?.url || '',
+    total: (p.items || p.tracks)?.total ?? null, owner: p.owner?.display_name || ''
+  }));
+}
+
+async function playlistTracks(id, onProgress) {
+  let items;
+  try { items = await paged(`/playlists/${id}/items`, onProgress); }
+  catch (e) {
+    if (e.status === 404 || e.status === 403) items = await paged(`/playlists/${id}/tracks`, onProgress);
+    else throw e;
+  }
+  return items.map(i => toTrack(i.item || i.track, i.added_at)).filter(Boolean);
+}
+
+return { redirectUri, login, handleRedirect, isConnected, disconnect, toTrack, likedSongs, playlists, playlistTracks };
+})();
+// ---------- importers.js ----------
+const __m_importers = (() => {
+// Importers that need no account at all: CSV exports (e.g. Exportify), pasted
+// text lists, and music files already on the device (read their tags).
+const { trackKey, albumKey, yearOf, splitArtists } = __m_util;
+
+function parseCSV(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') q = false;
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(x => x.trim()));
+}
+
+// Exportify's "saved_albums.csv" lists albums, not songs
+function isAlbumCSV(text) {
+  const head = (parseCSV(text.replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0])[0] || []).map(x => x.trim().toLowerCase());
+  return head.includes('album name') && !head.some(x => x === 'track name' || x === 'title' || x === 'song');
+}
+function tracksFromCSV(text) {
+  const rows = parseCSV(text.replace(/^\uFEFF/, ''));
+  if (rows.length < 2) return [];
+  const h = rows[0].map(x => x.trim().toLowerCase());
+  const col = (...names) => h.findIndex(x => names.some(n => x === n || x.includes(n)));
+  const ci = {
+    title: col('track name', 'title', 'song', 'name'),
+    artist: col('artist name', 'artist'),
+    album: col('album name', 'album'),
+    date: col('release date', 'album release date', 'year'),
+    dur: col('duration (ms)', 'duration'),
+    genre: col('genres', 'genre'),
+    added: col('added at', 'date added'),
+    uri: col('track uri', 'spotify uri', 'uri'),
+    img: col('album image url', 'image url', 'artwork url', 'artwork', 'cover')
+  };
+  if (ci.title < 0 || ci.artist < 0) throw new Error('CSV needs at least a track/title column and an artist column.');
+  return rows.slice(1).map(r => {
+    const rawA = (r[ci.artist] || '').trim();
+    // Artists are split on ";" or on commas that aren't escaped as "\," (no regex look-behind: older Safari can't parse it)
+    const artists = (rawA.includes(';') ? rawA.split(';') : rawA.replace(/\\,/g, '\u0000').split(',')).map(a => a.replace(/\u0000/g, ',').trim()).filter(Boolean);
+    const title = (r[ci.title] || '').trim(), artist = artists[0] || '';
+    if (!title || !artist) return null;
+    const album = ci.album >= 0 ? r[ci.album]?.trim() : '';
+    let dur = ci.dur >= 0 ? r[ci.dur] : '';
+    let durationMs = 0;
+    if (/^\d+$/.test(dur)) durationMs = +dur > 10000 ? +dur : +dur * 1000;
+    else if (/^\d+:\d\d$/.test(dur)) { const [m, s] = dur.split(':'); durationMs = (+m * 60 + +s) * 1000; }
+    const genre = ci.genre >= 0 ? (r[ci.genre] || '').split(',')[0].trim() : '';
+    const releaseDate = ci.date >= 0 ? (r[ci.date] || '').trim() : '';
+    const uri = ci.uri >= 0 ? r[ci.uri] || '' : '';
+    return {
+      id: trackKey(artist, title), title, artist, artists,
+      album, albumId: album ? albumKey(artist, album) : '',
+      releaseDate, year: yearOf(releaseDate), durationMs,
+      genre: genre ? genre.replace(/\b\w/g, c => c.toUpperCase()) : '',
+      spotifyId: uri.startsWith('spotify:track:') ? uri.split(':')[2] : null,
+      artwork: ci.img >= 0 && /^https:\/\//.test(r[ci.img] || '') ? r[ci.img].trim() : '',
+      addedAt: ci.added >= 0 && Date.parse(r[ci.added]) ? Date.parse(r[ci.added]) : Date.now()
+    };
+  }).filter(Boolean);
+}
+
+// "Artist - Title", "Title by Artist", or "Artist – Title" one per line
+function tracksFromText(text) {
+  return text.split(/\r?\n/).map(l => l.replace(/^\s*\d+[\.\)]\s*/, '').trim()).filter(Boolean).map(l => {
+    let artist, title, m;
+    if ((m = l.match(/^(.+?)\s+[-–—]\s+(.+)$/))) { artist = m[1]; title = m[2]; }
+    else if ((m = l.match(/^(.+?)\s+by\s+(.+)$/i))) { title = m[1]; artist = m[2]; }
+    else return null;
+    const artists = splitArtists(artist);
+    return { id: trackKey(artists[0], title), title: title.trim(), artist: artists[0], artists, addedAt: Date.now() };
+  }).filter(Boolean);
+}
+
+// ---- Minimal ID3v2 / filename tag reader for local music files ----
+function readSyncsafe(b, o) { return (b[o] << 21) | (b[o + 1] << 14) | (b[o + 2] << 7) | b[o + 3]; }
+function decodeText(bytes) {
+  const enc = bytes[0]; const body = bytes.subarray(1);
+  let s;
+  if (enc === 1 || enc === 2) s = new TextDecoder(enc === 2 ? 'utf-16be' : 'utf-16').decode(body);
+  else if (enc === 3) s = new TextDecoder('utf-8').decode(body);
+  else s = new TextDecoder('latin1').decode(body);
+  return s.replace(/\0+$/g, '').split('\0')[0].trim();
+}
+async function readID3(file) {
+  const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+  if (String.fromCharCode(...head.subarray(0, 3)) !== 'ID3') return {};
+  const ver = head[3];
+  const size = readSyncsafe(head, 6);
+  const b = new Uint8Array(await file.slice(10, 10 + Math.min(size, 2_000_000)).arrayBuffer());
+  const tags = {}; let o = 0;
+  const map = { TIT2: 'title', TPE1: 'artist', TALB: 'album', TYER: 'year', TDRC: 'year', TCON: 'genre', TRCK: 'track', TPE2: 'albumArtist' };
+  while (o + 10 < b.length) {
+    const id = String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+    if (!/^[A-Z0-9]{4}$/.test(id)) break;
+    const fsz = ver === 4 ? readSyncsafe(b, o + 4) : (b[o + 4] << 24) | (b[o + 5] << 16) | (b[o + 6] << 8) | b[o + 7];
+    if (fsz <= 0 || o + 10 + fsz > b.length) break;
+    const data = b.subarray(o + 10, o + 10 + fsz);
+    if (map[id]) tags[map[id]] = decodeText(data);
+    if (id === 'APIC' && !tags.picture) {
+      try {
+        let p = 1; while (data[p]) p++; const mime = new TextDecoder('latin1').decode(data.subarray(1, p)) || 'image/jpeg';
+        p += 2; // picture type
+        if (data[0] === 1 || data[0] === 2) { while (p < data.length - 1 && !(data[p] === 0 && data[p + 1] === 0)) p += 2; p += 2; }
+        else { while (data[p]) p++; p++; }
+        tags.picture = new Blob([data.subarray(p)], { type: mime });
+      } catch { }
+    }
+    o += 10 + fsz;
+  }
+  if (tags.genre) tags.genre = tags.genre.replace(/^\(\d+\)/, '').trim();
+  return tags;
+}
+
+async function readLocalFile(file) {
+  let tags = {};
+  try { tags = await readID3(file); } catch { }
+  const base = file.name.replace(/\.[^.]+$/, '').replace(/^\d+[\s.\-_]+/, '');
+  let artist = tags.artist, title = tags.title;
+  if (!artist || !title) {
+    const m = base.match(/^(.+?)\s+-\s+(.+)$/);
+    if (m) { artist = artist || m[1]; title = title || m[2]; }
+    else { title = title || base; artist = artist || (file.webkitRelativePath?.split('/').slice(-3, -2)[0]) || 'Unknown Artist'; }
+  }
+  return {
+    artist: artist.trim(), title: title.trim(), album: tags.album || '', albumArtist: tags.albumArtist || '',
+    year: yearOf(tags.year), genre: tags.genre || '', trackNumber: parseInt(tags.track) || 0, picture: tags.picture || null
+  };
+}
+
+const AUDIO_EXT = /\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|webm|mp4)$/i;
+
+// ---------- Apple Music / iTunes exports ----------
+// Music app (Mac) or Apple Music / iTunes (Windows):
+//   File → Library → Export Playlist…  → "Plain Text" (.txt, UTF-16, tab separated)
+//   File → Library → Export Library…   → .xml (every playlist + Loved songs)
+async function readTextSmart(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  if (buf[0] === 0xFF && buf[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  if (buf[0] === 0xFE && buf[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  // UTF-16 without BOM: lots of zero bytes
+  let zeros = 0; for (let i = 1; i < Math.min(buf.length, 400); i += 2) if (buf[i] === 0) zeros++;
+  if (zeros > 100) return new TextDecoder('utf-16le').decode(buf);
+  return new TextDecoder('utf-8').decode(buf).replace(/^﻿/, '');
+}
+
+function appleTrack(o) {
+  const title = (o.title || '').trim();
+  const artists = splitArtists(o.artist), artist = artists[0] || '';
+  if (!title || !artist) return null;
+  const year = parseInt(o.year) || null;
+  return {
+    id: trackKey(artist, title), title, artist, artists,
+    album: (o.album || '').trim(), albumId: o.album ? albumKey(o.albumArtist || artist, o.album) : '',
+    genre: (o.genre || '').trim(), year, releaseDate: o.releaseDate || (year ? String(year) : ''),
+    durationMs: o.durationMs || 0, trackNumber: parseInt(o.trackNumber) || 0,
+    addedAt: o.added && Date.parse(o.added) ? Date.parse(o.added) : Date.now()
+  };
+}
+
+// Plain-text playlist export (tab separated, first row = headers)
+function tracksFromAppleTxt(text) {
+  const lines = text.split(/\r\n|\r|\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const h = lines[0].split('\t').map(x => x.trim().toLowerCase());
+  const ix = n => h.indexOf(n);
+  const c = { name: ix('name'), artist: ix('artist'), album: ix('album'), genre: ix('genre'), year: ix('year'), time: ix('time'), track: ix('track number'), added: ix('date added'), albumArtist: ix('album artist') };
+  if (c.name < 0 || c.artist < 0) throw new Error('This doesn\'t look like an Apple Music playlist export (needs Name and Artist columns).');
+  return lines.slice(1).map(l => {
+    const r = l.split('\t');
+    const t = +r[c.time];
+    return appleTrack({
+      title: r[c.name], artist: r[c.artist], album: r[c.album], genre: r[c.genre], year: r[c.year],
+      durationMs: isFinite(t) && t > 0 ? (t > 20000 ? t : t * 1000) : 0, trackNumber: r[c.track], added: r[c.added],
+      albumArtist: c.albumArtist >= 0 ? r[c.albumArtist] : ''
+    });
+  }).filter(Boolean);
+}
+
+// Full library export (XML property list)
+function fromAppleXML(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('Couldn\'t read that XML file.');
+  const val = el => {
+    if (!el) return null;
+    switch (el.tagName) {
+      case 'dict': { const o = {}; const k = [...el.children]; for (let i = 0; i < k.length; i += 2) o[k[i].textContent] = val(k[i + 1]); return o; }
+      case 'array': return [...el.children].map(val);
+      case 'integer': case 'real': return +el.textContent;
+      case 'true': return true; case 'false': return false;
+      case 'data': return null;
+      default: return el.textContent;
+    }
+  };
+  const root = val(doc.querySelector('plist > dict'));
+  if (!root?.Tracks) throw new Error('This doesn\'t look like an Apple Music library export.');
+  const byId = new Map(), loved = [];
+  for (const [tid, o] of Object.entries(root.Tracks)) {
+    if (o['Has Video'] || o['Movie'] || o['TV Show'] || o['Podcast'] || o['Music Video']) continue;
+    const t = appleTrack({
+      title: o.Name, artist: o.Artist || o['Album Artist'], album: o.Album, albumArtist: o['Album Artist'], genre: o.Genre, year: o.Year,
+      releaseDate: o['Release Date'] ? String(o['Release Date']).slice(0, 10) : '', durationMs: o['Total Time'] || 0,
+      trackNumber: o['Track Number'], added: o['Date Added']
+    });
+    if (!t) continue;
+    byId.set(String(tid), t);
+    if (o.Loved || o.Favorited) loved.push(t.id);
+  }
+  const SKIP = /^(Library|Music|Movies|TV Shows|Podcasts|Audiobooks|Downloaded|Purchased|Genius|Recently (Added|Played)|Top 25 Most Played)$/i;
+  const playlists = (root.Playlists || []).filter(p => !p.Master && !p['Distinguished Kind'] && !p.Folder && !SKIP.test(p.Name || '') && p['Playlist Items']?.length)
+    .map(p => ({ name: p.Name, smart: !!p['Smart Info'], trackIds: [...new Set(p['Playlist Items'].map(i => byId.get(String(i['Track ID']))?.id).filter(Boolean))] }))
+    .filter(p => p.trackIds.length);
+  return { tracks: [...byId.values()], playlists, loved };
+}
+
+
+// ---------- ZIP files (Exportify's "Export All" downloads a .zip of CSVs) ----------
+// Tiny reader: walks the zip's central directory and inflates each entry with the browser's
+// built-in DecompressionStream (Chrome, Edge, Safari 16.4+, Firefox 113+).
+async function unzipText(file, want = n => /\.csv$/i.test(n)) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error('That zip file looks damaged — try downloading it again.');
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const out = [];
+  const td = new TextDecoder();
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true), elen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+    const local = dv.getUint32(p + 42, true);
+    const name = td.decode(buf.subarray(p + 46, p + 46 + nlen));
+    p += 46 + nlen + elen + clen;
+    if (name.endsWith('/') || !want(name)) continue;
+    const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+    const data = buf.subarray(start, start + csize);
+    let bytes;
+    if (method === 0) bytes = data;
+    else if (method === 8) {
+      if (typeof DecompressionStream === 'undefined') throw new Error('This browser can\'t open zip files — unzip it first and choose the .csv files instead.');
+      bytes = new Uint8Array(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+    } else continue;
+    out.push({ name: name.split('/').pop(), text: td.decode(bytes) });
+  }
+  return out;
+}
+
+return { parseCSV, isAlbumCSV, tracksFromCSV, tracksFromText, readLocalFile, AUDIO_EXT, readTextSmart, tracksFromAppleTxt, fromAppleXML, unzipText };
+})();
+// ---------- player.js ----------
+const __m_player = (() => {
+// Playback engine: YouTube (music video or audio upload) or an offline file on the device.
+const { db, kv } = __m_db;
+const { lib } = __m_store;
+const store = __m_store;
+const yt = __m_youtube;
+const { emit, toast, debounce } = __m_util;
+
+const P = {
+  queue: [],          // [{id, user}]
+  cursor: -1,
+  mode: 'audio',      // 'video' | 'audio'
+  preferOffline: true,
+  shuffle: false,
+  repeat: 'off',      // off | all | one
+  playing: false,
+  loading: false,
+  source: null,       // 'yt' | 'local'
+  ytId: null,
+  time: 0, duration: 0,
+  volume: 0.9,
+  error: ''
+};
+
+const audio = new Audio();
+audio.preload = 'auto';
+let ytPlayer = null, ytReady = null, tick = null, objUrl = null, loadToken = 0;
+let wantPlay = false;      // the listener wants music playing (used to undo pauses the phone does on its own)
+let resumeAt = 0, resumeFor = null; // where to pick up the restored song after a refresh
+let duckLevel = 1;         // temporary volume dip while the voice assistant talks (never saved)
+let endHook = null;        // app.js: what to play when the queue runs out
+let pausedDuring = -1;     // the listener paused while this load was still starting
+let verify = null;         // checks that an instant "play" really started
+// Read-only: does the listener want music playing right now? (drives instant Play/Pause feedback)
+Object.defineProperty(P, 'want', { get: () => wantPlay, enumerable: false });
+// What every Play/Pause button should show: flips the moment you tap, no waiting for YouTube
+const isOn = () => P.playing || (wantPlay && P.loading);
+
+const changed = () => {
+  emit('player', P);
+  if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
+};
+const persist = debounce(() => kv.set('player', {
+  queue: P.queue, cursor: P.cursor, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
+  time: Math.floor(P.time || 0)
+}), 500);
+const setEndHook = fn => { endHook = fn; };
+const outVol = () => Math.max(0, Math.min(1, P.volume * duckLevel));
+
+// Ask the phone for a proper music audio session (high quality, keeps playing when locked).
+// Safari 17+ supports this; elsewhere it's a harmless no-op.
+function audioMode(type = 'playback') { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch { } }
+
+const current = () => (P.cursor >= 0 && P.queue[P.cursor]) ? lib.tracks.get(P.queue[P.cursor].id) : null;
+
+async function restore() {
+  const s = await kv.get('player');
+  if (s) { Object.assign(P, s, { playing: false }); resumeAt = +s.time || 0; P.time = resumeAt; }
+  P.queue = P.queue.filter(q => lib.tracks.has(q.id));
+  if (P.cursor >= P.queue.length) P.cursor = P.queue.length - 1;
+  const t = current();
+  if (t) P.duration = (t.durationMs || 0) / 1000;
+  if (resumeAt && P.duration && resumeAt > P.duration - 5) resumeAt = P.time = 0;
+  resumeFor = t?.id || null;
+  audio.volume = P.volume;
+  setupMediaSession();
+  changed();
+  // Look up the restored song (and the next ones) in the background, so "Resume" starts instantly
+  if (t) setTimeout(() => { prefetch(t.id); prefetchNext(loadToken); }, 1200);
+}
+
+// ---------- YouTube IFrame player ----------
+function loadYT() {
+  if (ytReady) return ytReady;
+  ytReady = new Promise((resolve, reject) => {
+    window.onYouTubeIframeAPIReady = () => {
+      ytPlayer = new YT.Player('yt-player', {
+        width: '100%', height: '100%',
+        // cc_load_policy 0 + unloading the captions module = no subtitles by default
+        playerVars: { playsinline: 1, rel: 0, modestbranding: 1, cc_load_policy: 0, iv_load_policy: 3, ...(location.protocol.startsWith('http') ? { origin: location.origin } : {}) },
+        events: {
+          onReady: () => { ytPlayer.setVolume(outVol() * 100); resolve(ytPlayer); },
+          onStateChange: e => {
+            if (P.source !== 'yt') return;
+            if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
+            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); changed(); }
+            else if (e.data === YT.PlayerState.PAUSED) {
+              if (isRerouting()) return;
+              // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
+              // ask for that, start it again straight away.
+              // (Only right after leaving / a new song starting — a pause you make later from the lock screen is respected.)
+              if (wantPlay && document.hidden && (Date.now() - hiddenAt < 8000 || Date.now() - startedAt < 8000) && resumeTries < 10) { resumeTries++; setTimeout(() => { try { if (wantPlay) ytPlayer.playVideo(); } catch { } }, Math.min(150 * resumeTries, 1500)); return; }
+              P.playing = false; P.loading = false; if (!document.hidden) wantPlay = false; changed();
+            }
+            else if (e.data === YT.PlayerState.ENDED) ended();
+            else if (e.data === YT.PlayerState.BUFFERING) { if (!P.loading) { P.loading = true; changed(); } }
+            else if (e.data === YT.PlayerState.CUED && wantPlay) ytPlayer.playVideo();
+          },
+          onError: e => ytError(e.data)
+        }
+      });
+    };
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.onerror = () => { ytReady = null; reject(new Error('Could not load YouTube player (offline?)')); };
+    document.head.appendChild(s);
+  });
+  return ytReady;
+}
+
+let ytRetried = false, resumeTries = 0, hiddenAt = 0, startedAt = 0, captionsOffFor = null;
+function noCaptions() {
+  if (captionsOffFor === P.ytId) return; captionsOffFor = P.ytId;
+  try { ytPlayer.unloadModule('captions'); ytPlayer.unloadModule('cc'); } catch { }
+  try { ytPlayer.setOption('captions', 'track', {}); } catch { }
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    // Back in the app: if the phone stopped the music while you were away, carry on right where it was
+    resumeTries = 0;
+    if (!wantPlay) return;
+    if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); if (st === 2 || st === 5 || st === -1) ytPlayer.playVideo(); } catch { } }
+    else if (P.source === 'local' && audio.paused) audio.play().catch(() => { });
+    return;
+  }
+  hiddenAt = Date.now(); resumeTries = 0;
+  audioMode('playback');
+  // Leaving the browser / locking the phone: keep going
+  if (wantPlay && P.source === 'yt') setTimeout(() => { try { if (wantPlay && ytPlayer?.getPlayerState?.() !== 1) ytPlayer.playVideo(); } catch { } }, 500);
+  if (wantPlay && P.source === 'local' && audio.paused) audio.play().catch(() => { });
+  persist();
+});
+async function ytError(code) {
+  const t = current(); if (!t) return;
+  // 101/150 = embedding disabled by owner; try the other version, then re-search once
+  const c = await db.get('ytcache', t.id) || {};
+  const other = P.mode === 'video' ? 'audio' : 'video';
+  if (c[other] && c[other] !== P.ytId) { toast('That upload can\'t be embedded — using the ' + other + ' version'); return startYT(c[other]); }
+  if (!ytRetried) {
+    ytRetried = true;
+    try { const n = await yt.findForTrack(t, { force: true }); const id = n[P.mode] || n[other]; if (id && id !== P.ytId) return startYT(id); } catch { }
+  }
+  P.error = 'YouTube won\'t play this one here (code ' + code + '). Set a different link from the ⋯ menu.';
+  P.loading = false; changed();
+  setTimeout(() => { if (P.error) next(); }, 2500);
+}
+
+let tickN = 0;
+function startTick() {
+  clearInterval(tick);
+  tick = setInterval(() => {
+    if (P.source === 'yt' && ytPlayer?.getCurrentTime) {
+      P.time = ytPlayer.getCurrentTime() || 0;
+      P.duration = ytPlayer.getDuration() || P.duration;
+    } else if (P.source === 'local') {
+      P.time = audio.currentTime; P.duration = audio.duration || P.duration;
+    }
+    emit('time', P);
+    updatePositionState();
+    if (P.playing && ++tickN % 10 === 0) persist(); // remember the spot every ~5 s
+  }, 500);
+}
+
+let startWatch = null;
+async function startYT(id, start = 0) {
+  P.source = 'yt'; P.ytId = id; P.loading = true; P.needsTap = false; changed();
+  startedAt = Date.now(); if (document.hidden) resumeTries = 0;
+  const pl = await loadYT();
+  pl.loadVideoById(start > 1 ? { videoId: id, startSeconds: start } : id);
+  pl.setVolume(outVol() * 100);
+  emit('video-visible', true);
+  // Some phones (iPhone especially) only let YouTube start after you tap the video itself once.
+  // If nothing has started after a few seconds, show the video so one tap starts it.
+  clearTimeout(startWatch);
+  const my = loadToken;
+  startWatch = setTimeout(() => {
+    if (my !== loadToken || !wantPlay || P.source !== 'yt' || document.hidden) return;
+    let st = -9; try { st = ytPlayer.getPlayerState(); } catch { }
+    if (st === -1 || st === 5 || st === 2 && !P.playing) { P.needsTap = true; P.loading = false; changed(); emit('needs-tap'); }
+  }, 3500);
+}
+// Load the YouTube player in the background right after start-up, so the first song starts instantly
+function warmup() { if (location.protocol.startsWith('http') && navigator.onLine) loadYT().catch(() => { }); }
+
+// ---------- Core ----------
+async function load(autoplay = true) {
+  const my = ++loadToken;
+  const t = current();
+  const at = resumeFor && resumeFor === t?.id ? resumeAt : 0; resumeAt = 0; resumeFor = null;
+  audio.pause();
+  if (P.source !== 'yt') { try { ytPlayer?.pauseVideo?.(); } catch { } }
+  P.error = ''; P.time = at; P.duration = (t?.durationMs || 0) / 1000; ytRetried = false;
+  if (!t) { P.playing = false; P.source = null; wantPlay = false; changed(); return; }
+  if (autoplay) { wantPlay = true; audioMode('playback'); }
+  P.loading = true; changed();
+  setMediaSession(t);
+  persist();
+
+  // Offline file first (if user prefers it or we're offline)
+  if (t.localFileId && (P.preferOffline || !navigator.onLine)) {
+    const f = await db.get('files', t.localFileId);
+    if (my !== loadToken) return;
+    if (f?.blob) {
+      if (objUrl) URL.revokeObjectURL(objUrl);
+      objUrl = URL.createObjectURL(f.blob);
+      P.source = 'local'; P.ytId = null;
+      emit('video-visible', false);
+      audio.src = objUrl;
+      audio.volume = outVol();
+      if (at) audio.addEventListener('loadedmetadata', () => { try { audio.currentTime = at; } catch { } }, { once: true });
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      P.loading = false; changed(); startTick();
+      return;
+    }
+  }
+  if (!navigator.onLine) {
+    P.error = 'You\'re offline and this song has no offline file. Skipping…'; P.loading = false; changed();
+    setTimeout(() => my === loadToken && next(), 1500); return;
+  }
+  try {
+    const c = await yt.findForTrack(t, { need: P.mode });
+    if (my !== loadToken) return;
+    const id = c[P.mode] || c[P.mode === 'video' ? 'audio' : 'video'];
+    if (!t.artwork) store.coverFromVideo(t.id, c.audio || c.video);
+    if (!id) throw new Error('No YouTube match found for this song. Use ⋯ → "Set YouTube link".');
+    if (!c[P.mode]) toast(`No ${P.mode === 'video' ? 'music video' : 'audio upload'} found — playing the other version`);
+    await startYT(id, at);
+    if (!autoplay) ytPlayer.pauseVideo();
+    startTick();
+    prefetchNext(my);
+  } catch (e) {
+    if (my !== loadToken) return;
+    P.error = e.message; P.loading = false; P.playing = false; changed();
+  }
+}
+
+// Look up the next couple of songs while this one plays, so skipping is instant.
+function prefetchNext(my) {
+  setTimeout(() => {
+    if (my !== loadToken || !navigator.onLine) return;
+    const around = [...P.queue.slice(P.cursor + 1, P.cursor + 6), ...(P.cursor > 0 ? [P.queue[P.cursor - 1]] : [])];
+    // one after another (the very next song first), so they never compete with each other
+    (async () => { for (const q of around) {
+      if (my !== loadToken) return;
+      const t = lib.tracks.get(q.id);
+      if (t && !(t.localFileId && P.preferOffline)) await yt.findForTrack(t, { need: P.mode }).catch(() => { });
+    } })();
+  }, 300);
+}
+// Start looking up a song the moment the pointer rests on it, so tapping it plays right away
+function prefetch(id) {
+  const t = lib.tracks.get(id);
+  if (t && navigator.onLine && !(t.localFileId && P.preferOffline)) yt.findForTrack(t, { need: P.mode }).catch(() => { });
+}
+
+function ended() {
+  if (P.repeat === 'one') { seek(0); play(); return; }
+  next(true);
+}
+audio.addEventListener('ended', () => P.source === 'local' && ended());
+audio.addEventListener('play', () => { P.playing = true; changed(); });
+audio.addEventListener('pause', () => { if (isRerouting()) return; P.playing = false; changed(); });
+audio.addEventListener('error', () => { if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
+
+// Play/pause update every button instantly (optimistic); the player then catches up.
+function play() {
+  if (!current()) return;
+  wantPlay = true; pausedDuring = -1; audioMode('playback');
+  if (P.source === 'local') { P.playing = true; changed(); audio.play().catch(() => { P.playing = false; changed(); }); }
+  else if (P.source === 'yt' && ytPlayer) {
+    P.playing = true; P.error = ''; changed();
+    try { ytPlayer.playVideo(); } catch { }
+    // If the phone refused to start it, show the real state again
+    clearTimeout(verify);
+    verify = setTimeout(() => { let st = -9; try { st = ytPlayer.getPlayerState(); } catch { } if (wantPlay && st !== 1 && st !== 3 && !document.hidden) { P.playing = false; P.loading = false; changed(); } }, 2500);
+  }
+  else load(true);
+}
+function pause() {
+  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify);
+  P.playing = false; P.loading = false; changed();
+  if (P.source === 'local') audio.pause();
+  else if (ytPlayer?.pauseVideo) try { ytPlayer.pauseVideo(); } catch { }
+}
+const toggle = () => isOn() ? pause() : play();
+
+function seek(sec) {
+  if (!P.source) { resumeAt = sec; resumeFor = current()?.id || null; } // not started yet (e.g. after a refresh): start from here
+  if (P.source === 'local') audio.currentTime = sec;
+  else ytPlayer?.seekTo?.(sec, true);
+  P.time = sec; emit('time', P);
+}
+
+function next(auto = false) {
+  if (!P.queue.length) return;
+  if (P.cursor < P.queue.length - 1) P.cursor++;
+  else if (P.repeat === 'all') P.cursor = 0;
+  else {
+    // Queue finished: autoplay (replay the queue or start Liked Songs — Settings → Playback)
+    const plan = endHook?.(P.queue.map(q => q.id));
+    if (plan?.ids?.length) {
+      let list = plan.ids.filter(id => lib.tracks.has(id)).map(id => ({ id, user: false }));
+      if (plan.shuffle) list.sort(() => Math.random() - 0.5);
+      if (list.length) { P.queue = list; P.cursor = 0; if (plan.msg) toast(plan.msg); load(true); return; }
+    }
+    if (auto) { P.playing = false; wantPlay = false; changed(); }
+    return;
+  }
+  load(true);
+}
+function prev() {
+  if (P.time > 4) return seek(0);
+  if (P.cursor > 0) { P.cursor--; load(true); }
+  else seek(0);
+}
+
+// Replace the queue with a list and start at `start`
+function playList(ids, start = 0, { shuffle = P.shuffle } = {}) {
+  ids = ids.filter(id => lib.tracks.has(id));
+  if (!ids.length) return toast('Nothing to play');
+  let list = ids.map(id => ({ id, user: false }));
+  if (shuffle) {
+    const first = list.splice(start, 1)[0];
+    list.sort(() => Math.random() - 0.5);
+    list.unshift(first); start = 0;
+  }
+  P.queue = list; P.cursor = start; P.shuffle = shuffle;
+  load(true);
+}
+
+// Add to the end of the "up next" user section (after the current song and any user-queued songs)
+function addToQueue(ids, playNext = false) {
+  ids = [].concat(ids).filter(id => lib.tracks.has(id));
+  if (!ids.length) return;
+  const items = ids.map(id => ({ id, user: true }));
+  if (P.cursor < 0) { P.queue = items; P.cursor = 0; load(true); return; }
+  let at = P.cursor + 1;
+  if (!playNext) while (at < P.queue.length && P.queue[at].user) at++;
+  P.queue.splice(at, 0, ...items);
+  persist(); changed();
+  toast(ids.length === 1 ? (playNext ? 'Playing next' : 'Added to queue') : `${ids.length} songs added to queue`);
+}
+function removeFromQueue(i) {
+  if (i === P.cursor) return;
+  P.queue.splice(i, 1);
+  if (i < P.cursor) P.cursor--;
+  persist(); changed();
+}
+function moveInQueue(from, to) {
+  if (from === to) return;
+  const [it] = P.queue.splice(from, 1);
+  P.queue.splice(to, 0, it);
+  if (P.cursor === from) P.cursor = to;
+  else if (from < P.cursor && to >= P.cursor) P.cursor--;
+  else if (from > P.cursor && to <= P.cursor) P.cursor++;
+  persist(); changed();
+}
+function jumpTo(i) { P.cursor = i; load(true); }
+function clearQueue() { P.queue = P.queue.slice(0, P.cursor + 1); persist(); changed(); }
+function clearUserQueue() { P.queue = P.queue.filter((q, i) => i <= P.cursor || !q.user); persist(); changed(); }
+
+function setShuffle(v) {
+  P.shuffle = v;
+  if (v && P.cursor >= 0) {
+    const rest = P.queue.slice(P.cursor + 1).sort(() => Math.random() - 0.5);
+    P.queue = [...P.queue.slice(0, P.cursor + 1), ...rest];
+  }
+  persist(); changed();
+}
+function cycleRepeat() { P.repeat = { off: 'all', all: 'one', one: 'off' }[P.repeat]; persist(); changed(); }
+function setVolume(v) { P.volume = v; duckLevel = 1; applyVol(); persist(); changed(); }
+function applyVol() { audio.volume = outVol(); try { ytPlayer?.setVolume?.(outVol() * 100); } catch { } }
+// Quietly dip the music (voice assistant) without touching the saved volume
+function duck(on) { duckLevel = on ? Math.min(1, 0.25 / Math.max(P.volume, 0.01)) : 1; applyVol(); }
+
+// Switch between music video and audio-only version, keeping position
+async function setMode(mode) {
+  if (mode === P.mode) return;
+  P.mode = mode; persist(); changed();
+  const t = current();
+  if (t && P.source === 'yt') {
+    const at = P.time, wasPlaying = P.playing;
+    const c = await yt.findForTrack(t);
+    const id = c[mode];
+    if (!id) { toast(`No ${mode === 'video' ? 'music video' : 'audio version'} found for this song`); return; }
+    await startYT(id, at);
+    if (!wasPlaying) setTimeout(() => ytPlayer.pauseVideo(), 600);
+  }
+}
+function setPreferOffline(v) { P.preferOffline = v; persist(); }
+const reloadCurrent = () => load(true);
+// Restart the sound output in place (fixes thin "phone call" audio after the microphone was used)
+let rerouting = 0;
+function refreshOutput() {
+  if (!P.playing) return;
+  rerouting = Date.now();
+  if (P.source === 'local') { const at = audio.currentTime; audio.pause(); setTimeout(() => { try { audio.currentTime = at; } catch { } audio.play().catch(() => { }); }, 120); }
+  else if (P.source === 'yt' && ytPlayer) { try { ytPlayer.pauseVideo(); setTimeout(() => ytPlayer.playVideo(), 160); } catch { } }
+}
+const isRerouting = () => Date.now() - rerouting < 1500;
+
+// ---------- Lock screen / media keys ----------
+function setMediaSession(t) {
+  if (!('mediaSession' in navigator)) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: t.title, artist: t.artist, album: t.album || '',
+      artwork: t.artwork && !t.artwork.startsWith('data:') ? [{ src: t.artwork, sizes: '600x600', type: 'image/jpeg' }] : [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }]
+    });
+  } catch { }
+}
+function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const ms = navigator.mediaSession;
+  const h = (k, fn) => { try { ms.setActionHandler(k, fn); } catch { } };
+  h('play', play); h('pause', pause); h('stop', pause);
+  h('previoustrack', prev); h('nexttrack', () => next());
+  h('seekto', d => seek(d.seekTime));
+  h('seekbackward', d => seek(Math.max(0, P.time - (d.seekOffset || 10))));
+  h('seekforward', d => seek(Math.min(P.duration || 1e9, P.time + (d.seekOffset || 10))));
+  const t = current(); if (t) setMediaSession(t);
+}
+function updatePositionState() {
+  if (!('mediaSession' in navigator) || !P.duration) return;
+  try { navigator.mediaSession.setPositionState({ duration: P.duration, position: Math.min(P.time, P.duration), playbackRate: 1 }); } catch { }
+}
+
+// Stop everything (used when deleting the account)
+function stopAll() {
+  loadToken++; wantPlay = false; audio.pause(); audio.removeAttribute('src');
+  try { ytPlayer?.stopVideo?.(); } catch { }
+  P.queue = []; P.cursor = -1; P.playing = false; changed();
+}
+
+return { P, isOn, setEndHook, audioMode, current, restore, warmup, prefetch, play, pause, toggle, seek, next, prev, playList, addToQueue, removeFromQueue, moveInQueue, jumpTo, clearQueue, clearUserQueue, setShuffle, cycleRepeat, setVolume, duck, setMode, setPreferOffline, reloadCurrent, refreshOutput, stopAll };
+})();
+// ---------- backup.js ----------
+const __m_backup = (() => {
+// Auto-updating backups, all on the user's own device:
+//  • Rolling snapshots inside the app's storage (last 5) — instant undo for mistakes.
+//  • A linked backup FILE on the device (Chrome/Edge desktop): rewritten automatically on every change,
+//    so it survives even if the browser's data is wiped.
+//  • One-tap download / restore of a .json backup file on every browser.
+const { db, kv } = __m_db;
+const { debounce, emit, downloadBlob, on, toast } = __m_util;
+
+const KEEP = 5;
+const fsSupported = 'showSaveFilePicker' in window;
+
+async function snapshot() {
+  const [tracks, albums, playlists] = await Promise.all([db.all('tracks'), db.all('albums'), db.all('playlists')]);
+  const ytKeys = await db.keys('ytcache');
+  const ytVals = await db.all('ytcache');
+  return {
+    app: 'BAZINGA', version: 1, createdAt: new Date().toISOString(),
+    profile: await kv.get('profile'),
+    settings: await kv.get('settings'),
+    player: await kv.get('player'),
+    tracks: tracks.map(t => ({ ...t, localFileId: undefined, hadLocalFile: !!t.localFileId || t.hadLocalFile })),
+    albums, playlists,
+    ytcache: ytKeys.map((k, i) => [k, ytVals[i]])
+  };
+}
+
+async function restore(data) {
+  if (!data || data.app !== 'BAZINGA') throw new Error('That isn\'t a BAZINGA backup file.');
+  // Keep links to offline files that still exist on this device
+  const existing = new Map((await db.all('tracks')).filter(t => t.localFileId).map(t => [t.id, t.localFileId]));
+  for (const s of ['tracks', 'albums', 'playlists', 'ytcache']) await db.clear(s);
+  await db.putMany('tracks', (data.tracks || []).map(t => {
+    const x = { ...t }; delete x.localFileId;
+    if (existing.has(t.id)) x.localFileId = existing.get(t.id);
+    return x;
+  }));
+  await db.putMany('albums', data.albums || []);
+  await db.putMany('playlists', data.playlists || []);
+  for (const [k, v] of data.ytcache || []) await db.put('ytcache', v, k);
+  if (data.profile) await kv.set('profile', data.profile);
+  if (data.settings) await kv.set('settings', data.settings);
+  if (data.player) await kv.set('player', data.player);
+}
+
+async function writeInternal(snap) {
+  const id = 'bk_' + Date.now();
+  await db.put('backups', { id, ts: Date.now(), size: JSON.stringify(snap).length, counts: { tracks: snap.tracks.length, playlists: snap.playlists.length, albums: snap.albums.length }, data: snap });
+  const all = (await db.all('backups')).sort((a, b) => b.ts - a.ts);
+  for (const old of all.slice(KEEP)) await db.del('backups', old.id);
+}
+
+let fileState = 'none'; // none | ok | needs-permission | error
+const linkedFileState = () => fileState;
+
+async function writeFile(snap) {
+  const h = await kv.get('backupHandle');
+  if (!h) { fileState = 'none'; return; }
+  const perm = await h.queryPermission({ mode: 'readwrite' });
+  if (perm !== 'granted') { fileState = 'needs-permission'; emit('backup-state'); return; }
+  try {
+    const w = await h.createWritable();
+    await w.write(JSON.stringify(snap));
+    await w.close();
+    fileState = 'ok';
+  } catch (e) { fileState = 'error'; console.warn(e); }
+}
+
+async function runBackup() {
+  const profile = await kv.get('profile');
+  if (!profile) return; // no account yet
+  const snap = await snapshot();
+  await writeInternal(snap);
+  if (fsSupported) await writeFile(snap);
+  await kv.set('lastBackup', Date.now());
+  emit('backup-state');
+}
+
+const scheduled = debounce(runBackup, 4000);
+function startAuto() {
+  on('dirty', scheduled);
+  // Also back up when the app is hidden/closed so nothing is lost
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') runBackup(); });
+  // Check linked file permission on start
+  kv.get('backupHandle').then(async h => {
+    if (!h) return;
+    fileState = (await h.queryPermission({ mode: 'readwrite' })) === 'granted' ? 'ok' : 'needs-permission';
+    emit('backup-state');
+  });
+}
+
+async function linkFile() {
+  const h = await window.showSaveFilePicker({
+    suggestedName: 'BAZINGA-backup.json',
+    types: [{ description: 'BAZINGA backup', accept: { 'application/json': ['.json'] } }]
+  });
+  await kv.set('backupHandle', h);
+  fileState = 'ok';
+  await runBackup();
+  toast('Auto-backup file linked — it updates itself on every change');
+}
+async function regrant() {
+  const h = await kv.get('backupHandle'); if (!h) return;
+  if ((await h.requestPermission({ mode: 'readwrite' })) === 'granted') { fileState = 'ok'; await runBackup(); toast('Auto-backup resumed'); }
+}
+async function unlinkFile() { await kv.del('backupHandle'); fileState = 'none'; emit('backup-state'); }
+
+async function download() {
+  const snap = await snapshot();
+  const d = new Date().toISOString().slice(0, 10);
+  downloadBlob(new Blob([JSON.stringify(snap)], { type: 'application/json' }), `BAZINGA-backup-${d}.json`);
+  await kv.set('lastDownload', Date.now());
+  emit('backup-state');
+}
+
+const listInternal = async () => (await db.all('backups')).sort((a, b) => b.ts - a.ts);
+async function restoreInternal(id) { const b = await db.get('backups', id); if (b) await restore(b.data); }
+async function restoreFromFile(file) { await restore(JSON.parse(await file.text())); }
+
+return { fsSupported, snapshot, restore, linkedFileState, runBackup, startAuto, linkFile, regrant, unlinkFile, download, listInternal, restoreInternal, restoreFromFile };
+})();
+// ---------- cloud.js ----------
+const __m_cloud = (() => {
+// Optional BAZINGA! accounts, powered by Supabase (Auth + Database + Storage).
+// A tiny built-in client for Supabase's documented REST APIs — no extra library to download.
+// Sign-in methods: Google, Discord, email + password (with email verification and password reset).
+// Uses the secure PKCE flow; sessions are kept on this device and refreshed automatically.
+const { kv } = __m_db;
+const { emit } = __m_util;
+
+let URL_ = '', KEY = '';
+let session = null; // {access_token, refresh_token, expires_at(ms), user}
+
+function configure(url, anonKey) { URL_ = (url || '').replace(/\/$/, ''); KEY = anonKey || ''; }
+const configured = () => !!(URL_ && KEY);
+const user = () => session?.user || null;
+const signedIn = () => !!session?.user;
+const redirectBase = () => location.origin + location.pathname;
+
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function newPkce() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  try { localStorage.setItem('bz_sb_verifier', verifier); } catch { }
+  return challenge;
+}
+
+function errText(d, status) {
+  const code = d?.error_code || d?.code || d?.error;
+  const msg = d?.msg || d?.error_description || d?.message || '';
+  const nice = {
+    invalid_credentials: 'Wrong email or password.', invalid_grant: 'Wrong email or password.',
+    email_not_confirmed: 'Please verify your email first — check your inbox (and spam folder).',
+    user_already_exists: 'An account with this email already exists. Try logging in.', email_exists: 'An account with this email already exists. Try logging in.',
+    weak_password: 'That password is too weak — use at least 8 characters with a mix of letters and numbers.',
+    over_email_send_rate_limit: 'Too many emails were sent just now. Please wait a few minutes and try again.',
+    over_request_rate_limit: 'Too many attempts. Please wait a minute and try again.',
+    email_address_invalid: 'That email address doesn\'t look right.', validation_failed: msg || 'Please check the details you entered.',
+    signup_disabled: 'New sign-ups are turned off right now.', provider_disabled: 'That sign-in method isn\'t turned on yet.',
+    same_password: 'Your new password must be different from the old one.'
+  };
+  if (/invalid login credentials/i.test(msg)) return nice.invalid_credentials;
+  if (/email not confirmed/i.test(msg)) return nice.email_not_confirmed;
+  if (/already registered/i.test(msg)) return nice.user_already_exists;
+  const e = new Error(nice[code] || msg || `Account service error (${status})`);
+  e.code = code; e.status = status;
+  return e.message;
+}
+async function req(method, path, { body, auth = false, query = {}, headers = {}, raw = false } = {}) {
+  if (!configured()) throw new Error('Accounts aren\'t set up for this copy of BAZINGA! yet.');
+  if (auth) await fresh();
+  const q = new URLSearchParams(query).toString();
+  const r = await fetch(`${URL_}${path}${q ? (path.includes('?') ? '&' : '?') + q : ''}`, {
+    method,
+    headers: { apikey: KEY, ...(auth && session ? { Authorization: 'Bearer ' + session.access_token } : { Authorization: 'Bearer ' + KEY }), ...(body !== undefined && !(body instanceof Blob) ? { 'Content-Type': 'application/json' } : {}), ...headers },
+    body: body === undefined ? undefined : body instanceof Blob ? body : JSON.stringify(body)
+  });
+  if (raw) { if (!r.ok) { const d = await r.json().catch(() => ({})); const e = new Error(errText(d, r.status)); e.status = r.status; throw e; } return r; }
+  const text = await r.text();
+  let d = {}; try { d = text ? JSON.parse(text) : {}; } catch { d = { msg: text }; }
+  if (!r.ok) { const e = new Error(errText(d, r.status)); e.status = r.status; e.code = d?.error_code || d?.code || d?.error; throw e; }
+  return d;
+}
+
+async function setSession(d) {
+  if (!d?.access_token) return;
+  session = { access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000 - 60e3, user: d.user || session?.user };
+  if (!session.user) session.user = await req('GET', '/auth/v1/user', { auth: true });
+  await kv.set('sbSession', session);
+  emit('account', session.user);
+}
+let refreshing = null;
+async function fresh() {
+  if (!session) return;
+  if (Date.now() < session.expires_at) return;
+  if (!refreshing) refreshing = (async () => {
+    try {
+      const d = await fetch(`${URL_}/auth/v1/token?grant_type=refresh_token`, { method: 'POST', headers: { apikey: KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ refresh_token: session.refresh_token }) });
+      if (d.status === 400 || d.status === 401) { await clearSession(); throw new Error('Your session expired — please log in again.'); }
+      if (!d.ok) throw new Error('offline');
+      await setSession(await d.json());
+    } finally { refreshing = null; }
+  })();
+  return refreshing;
+}
+async function clearSession() { session = null; await kv.del('sbSession'); emit('account', null); }
+
+async function restore() {
+  const s = await kv.get('sbSession');
+  if (s?.user) { session = s; emit('account', s.user); fresh().catch(() => { }); }
+}
+
+// ---------- sign-in methods ----------
+async function signInWithProvider(provider) { // 'google' | 'discord'
+  if (!configured()) throw new Error('Accounts aren\'t set up for this copy of BAZINGA! yet.');
+  if (!location.protocol.startsWith('http')) throw new Error('Signing in only works on the hosted (GitHub Pages) version of BAZINGA!.');
+  const challenge = await newPkce();
+  const p = new URLSearchParams({ provider, redirect_to: redirectBase() + '?auth=sb', code_challenge: challenge, code_challenge_method: 's256' });
+  if (provider === 'google') p.set('scopes', 'email profile');
+  if (provider === 'discord') p.set('scopes', 'identify email');
+  location.href = `${URL_}/auth/v1/authorize?${p}`;
+}
+async function signUp(email, password, username) {
+  const challenge = await newPkce();
+  const d = await req('POST', '/auth/v1/signup', { query: { redirect_to: redirectBase() + '?auth=sb' }, body: { email, password, data: { username }, code_challenge: challenge, code_challenge_method: 's256' } });
+  if (d.access_token) { await setSession(d); return { needsVerify: false }; } // email confirmation turned off
+  return { needsVerify: true };
+}
+async function signInWithPassword(email, password) {
+  await setSession(await req('POST', '/auth/v1/token?grant_type=password', { body: { email, password } }));
+}
+async function resendVerification(email) {
+  await req('POST', '/auth/v1/resend', { query: { redirect_to: redirectBase() + '?auth=sb' }, body: { type: 'signup', email } });
+}
+async function sendPasswordReset(email) {
+  const challenge = await newPkce();
+  await req('POST', '/auth/v1/recover', { query: { redirect_to: redirectBase() + '?auth=sb&type=recovery' }, body: { email, code_challenge: challenge, code_challenge_method: 's256' } });
+}
+async function updatePassword(password) {
+  const u = await req('PUT', '/auth/v1/user', { auth: true, body: { password } });
+  if (session) { session.user = u; await kv.set('sbSession', session); }
+}
+async function signOut() {
+  try { if (session) await req('POST', '/auth/v1/logout', { auth: true, query: { scope: 'local' } }); } catch { }
+  await clearSession();
+}
+
+// Finish a sign-in that came back from Google/Discord or from an email link.
+// Returns {kind: 'signin'|'recovery'|'verified'} or null if this page load isn't a sign-in return.
+async function handleRedirect() {
+  const q = new URLSearchParams(location.search);
+  if (q.get('auth') !== 'sb') return null;
+  const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const clean = () => history.replaceState(null, '', redirectBase() + (location.hash.startsWith('#/') ? location.hash : '#/home'));
+  const err = q.get('error_description') || hash.get('error_description') || q.get('error') || hash.get('error');
+  if (err) { clean(); throw new Error(/expired|invalid/i.test(err) ? 'That link has expired or was already used. Request a new one.' : err.replace(/\+/g, ' ')); }
+  const code = q.get('code');
+  const type = q.get('type');
+  let verifier = null; try { verifier = localStorage.getItem('bz_sb_verifier'); } catch { }
+  if (!code) {
+    // Older-style link that puts the session in the URL hash
+    if (hash.get('access_token')) { await setSession({ access_token: hash.get('access_token'), refresh_token: hash.get('refresh_token'), expires_in: +hash.get('expires_in') || 3600 }); clean(); return { kind: hash.get('type') === 'recovery' ? 'recovery' : 'signin' }; }
+    clean(); return null;
+  }
+  try {
+    if (!verifier) throw Object.assign(new Error('no verifier'), { noVerifier: true });
+    const d = await req('POST', '/auth/v1/token?grant_type=pkce', { body: { auth_code: code, code_verifier: verifier } });
+    try { localStorage.removeItem('bz_sb_verifier'); } catch { }
+    await setSession(d);
+    clean();
+    return { kind: type === 'recovery' ? 'recovery' : 'signin' };
+  } catch (e) {
+    clean();
+    // The email was verified, but the link was opened on a different device/browser than sign-up
+    if (e.noVerifier || /verifier|flow state/i.test(e.message)) return { kind: 'verified' };
+    throw e;
+  }
+}
+
+// ---------- database (profiles) ----------
+async function getProfile() {
+  const rows = await req('GET', '/rest/v1/profiles', { auth: true, query: { id: 'eq.' + user().id, select: '*' } });
+  return rows[0] || null;
+}
+async function saveProfile(patch) {
+  const rows = await req('POST', '/rest/v1/profiles', { auth: true, headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: { id: user().id, ...patch, updated_at: new Date().toISOString() } });
+  return rows[0];
+}
+// Public (signed-out) read, e.g. the tippers leaderboard
+async function publicRpc(fn, args = {}) { return req('POST', '/rest/v1/rpc/' + fn, { body: args }); }
+async function rpc(fn, args = {}) { return req('POST', '/rest/v1/rpc/' + fn, { auth: true, body: args }); }
+
+// ---------- storage (the synced library file) ----------
+async function uploadFile(bucket, path, blob) {
+  return req('POST', `/storage/v1/object/${bucket}/${path}`, { auth: true, body: blob, headers: { 'x-upsert': 'true', 'Content-Type': blob.type || 'application/octet-stream', 'cache-control': 'no-cache' } });
+}
+async function downloadFile(bucket, path) {
+  const r = await req('GET', `/storage/v1/object/authenticated/${bucket}/${path}`, { auth: true, raw: true });
+  return r.blob();
+}
+async function deleteFiles(bucket, paths) {
+  if (!paths.length) return;
+  return req('DELETE', `/storage/v1/object/${bucket}`, { auth: true, body: { prefixes: paths } });
+}
+async function listFiles(bucket, prefix) {
+  return req('POST', `/storage/v1/object/list/${bucket}`, { auth: true, body: { prefix, limit: 100, offset: 0 } });
+}
+
+return { configure, configured, user, signedIn, redirectBase, restore, signInWithProvider, signUp, signInWithPassword, resendVerification, sendPasswordReset, updatePassword, signOut, handleRedirect, getProfile, saveProfile, publicRpc, rpc, uploadFile, downloadFile, deleteFiles, listFiles };
+})();
+// ---------- sync.js ----------
+const __m_sync = (() => {
+// Cross-device sync for signed-in users.
+// The whole library (songs, likes, playlists, albums, YouTube matches, settings) is saved as one
+// compressed file in the user's private Supabase Storage folder. Every change bumps a revision
+// number in their profile; devices compare revisions, download what's new, MERGE it with what
+// they have (newest edit wins per item, likes merge separately, deletions are remembered), and
+// upload the result. Two devices saving at the same moment can't overwrite each other: the
+// revision bump only succeeds if nobody else saved in between, otherwise we merge and retry.
+const { db, kv } = __m_db;
+const { emit, on, debounce, sleep } = __m_util;
+const cloud = __m_cloud;
+const store = __m_store;
+const backup = __m_backup;
+
+const BUCKET = 'libraries';
+const S = { status: 'off', lastSync: 0, error: '', rev: 0 };
+const state = () => S;
+let st = null; // persisted per user: {rev, hash}
+let running = null, again = false, started = false, timer = null;
+
+const device = () => {
+  const ua = navigator.userAgent;
+  const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'device';
+  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  return `${br} on ${os}`;
+};
+function setStatus(status, error = '') { S.status = status; S.error = error; if (status === 'synced') S.lastSync = Date.now(); emit('sync', S); }
+
+// ---------- file format ----------
+async function pack(obj) {
+  const bytes = new TextEncoder().encode(JSON.stringify(obj));
+  if ('CompressionStream' in window) return new Blob([await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()], { type: 'application/gzip' });
+  return new Blob([bytes], { type: 'application/json' });
+}
+async function unpack(blob) {
+  const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+  const stream = head[0] === 0x1f && head[1] === 0x8b ? blob.stream().pipeThrough(new DecompressionStream('gzip')) : blob.stream();
+  return JSON.parse(await new Response(stream).text());
+}
+const newFileName = rev => `${cloud.user().id}/lib-${rev}-${Math.random().toString(36).slice(2, 10)}.bz`;
+
+function hash(snap) {
+  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.settings]);
+  let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36) + ':' + s.length;
+}
+
+async function localSnap() {
+  const snap = await backup.snapshot();
+  snap.tombstones = store.tombstones();
+  snap.tracks = snap.tracks.map(t => { const x = { ...t }; delete x.hadLocalFile; delete x.localFileId; return x; }).sort((a, b) => a.id < b.id ? -1 : 1);
+  snap.albums.sort((a, b) => a.id < b.id ? -1 : 1); snap.playlists.sort((a, b) => a.id < b.id ? -1 : 1);
+  delete snap.player; delete snap.profile; delete snap.createdAt;
+  // never upload private keys/tokens; they stay on the device they were typed into
+  if (snap.settings) { snap.settings = { ...snap.settings }; for (const k of ['ytKey', 'geniusToken', 'googleClientId', 'customInstance']) delete snap.settings[k]; }
+  return snap;
+}
+
+// ---------- merge ----------
+const has = v => v !== undefined && v !== null && v !== '';
+function mergeTrack(a, b) {
+  const newer = (a.updatedAt || 0) >= (b.updatedAt || 0) ? a : b, older = newer === a ? b : a;
+  const out = { ...older };
+  for (const [k, v] of Object.entries(newer)) if (has(v)) out[k] = v;
+  const lk = (a.likeTs || 0) >= (b.likeTs || 0) ? a : b;
+  out.liked = !!lk.liked; out.likedAt = lk.likedAt || null; out.likeTs = lk.likeTs || 0;
+  return out;
+}
+function merge(L, R) {
+  const tomb = { t: {}, p: {}, a: {} };
+  for (const src of [L.tombstones, R.tombstones]) for (const k of ['t', 'p', 'a']) for (const [id, ts] of Object.entries(src?.[k] || {})) tomb[k][id] = Math.max(tomb[k][id] || 0, ts);
+  const byId = (xs) => new Map((xs || []).map(x => [x.id, x]));
+  const unite = (la, ra, kind, combine, stamp) => {
+    const A = byId(la), B = byId(ra), out = [];
+    for (const id of new Set([...A.keys(), ...B.keys()])) {
+      const a = A.get(id), b = B.get(id);
+      const x = a && b ? combine(a, b) : (a || b);
+      const dead = tomb[kind][id];
+      if (dead && dead >= stamp(x)) continue;
+      out.push(x);
+    }
+    return out.sort((p, q) => p.id < q.id ? -1 : 1);
+  };
+  const newerOf = f => (a, b) => (f(a) >= f(b) ? a : b);
+  const tracks = unite(L.tracks, R.tracks, 't', mergeTrack, x => Math.max(x.updatedAt || 0, x.likeTs || 0));
+  const playlists = unite(L.playlists, R.playlists, 'p', newerOf(x => x.updatedAt || x.createdAt || 0), x => x.updatedAt || x.createdAt || 0);
+  const albums = unite(L.albums, R.albums, 'a', newerOf(x => x.updatedAt || x.savedAt || 0), x => x.updatedAt || x.savedAt || 0);
+  const yc = new Map(R.ytcache || []);
+  for (const [k, v] of L.ytcache || []) { const r = yc.get(k); if (!r || v?.manual || !r.manual) yc.set(k, v); }
+  // keep songs that playlists/albums still point at
+  const ids = new Set(tracks.map(t => t.id));
+  for (const p of playlists) p.trackIds = (p.trackIds || []).filter(i => ids.has(i));
+  for (const a of albums) a.trackIds = (a.trackIds || []).filter(i => ids.has(i));
+  return {
+    app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb,
+    ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1),
+    settings: { ...(R.settings || {}), ...(L.settings || {}) } // this device's own settings win
+  };
+}
+
+async function applyLocal(m) {
+  const cur = new Map((await db.all('tracks')).map(t => [t.id, t]));
+  await db.clear('tracks');
+  await db.putMany('tracks', m.tracks.map(t => { const c = cur.get(t.id); return c?.localFileId ? { ...t, localFileId: c.localFileId } : t; }));
+  await db.clear('albums'); await db.putMany('albums', m.albums);
+  await db.clear('playlists'); await db.putMany('playlists', m.playlists);
+  for (const [k, v] of m.ytcache || []) await db.put('ytcache', v, k);
+  await store.setTombstones(m.tombstones);
+  await store.load();
+  emit('library'); emit('synced-in');
+}
+
+// ---------- profile (username + picture) ----------
+async function syncProfile(prof) {
+  const local = await kv.get('profile');
+  if (!local) return;
+  const remoteTs = prof?.updated_at ? Date.parse(prof.updated_at) : 0;
+  if (prof && remoteTs > (local.updatedAt || 0) && (prof.username || prof.avatar)) {
+    local.username = prof.username || local.username;
+    local.picture = prof.avatar ?? local.picture;
+    local.updatedAt = remoteTs;
+    await kv.set('profile', local); emit('profile-changed', local);
+  } else if (!prof || (local.updatedAt || 0) > remoteTs || !prof.username) {
+    await cloud.saveProfile({ username: local.username, avatar: local.picture || null, terms_version: local.termsAccepted || null });
+  }
+}
+async function pushProfile() { if (cloud.signedIn()) { try { const l = await kv.get('profile'); await cloud.saveProfile({ username: l.username, avatar: l.picture || null }); } catch { } } }
+
+// ---------- the sync itself ----------
+function syncNow() {
+  if (!cloud.signedIn() || !navigator.onLine) { if (cloud.signedIn()) setStatus('offline'); return Promise.resolve(); }
+  if (running) { again = true; return running; }
+  running = (async () => {
+    setStatus('syncing');
+    try {
+      do { again = false; await once(); } while (again);
+      setStatus('synced');
+    } catch (e) {
+      console.warn('sync failed', e);
+      setStatus('error', /Failed to fetch|NetworkError|Load failed/.test(e.message) ? 'Couldn\'t reach the sync server.' : e.message);
+    } finally { running = null; }
+  })();
+  return running;
+}
+async function once() {
+  const uid = cloud.user().id;
+  st = st || (await kv.get('sync:' + uid)) || { rev: 0, hash: '' };
+  for (let attempt = 0; attempt < 4; attempt++) {
+    let prof = await cloud.getProfile();
+    if (!prof) prof = await cloud.saveProfile({});
+    if (attempt === 0) await syncProfile(prof);
+    const remoteRev = prof.library_rev || 0;
+    let local = await localSnap(), base = local, remoteHash = st.hash;
+    if (remoteRev > st.rev) {
+      let remote = null;
+      if (prof.library_file) {
+        try { remote = await unpack(await cloud.downloadFile(BUCKET, prof.library_file)); } catch (e) { if (e.status !== 400 && e.status !== 404) throw e; }
+      }
+      if (remote) {
+        base = merge(local, remote);
+        remoteHash = hash(remote);
+        if (hash(base) !== hash(local)) await applyLocal(base);
+      }
+      st.rev = remoteRev; st.hash = remoteHash; await kv.set('sync:' + uid, st);
+    }
+    S.rev = st.rev;
+    const h = hash(base);
+    if (h === st.hash && remoteRev === st.rev) return; // nothing new to upload
+    // Upload under a brand-new file name, then claim the next revision for it.
+    // The claim only succeeds if no other device saved in between, so nothing is ever overwritten.
+    const next = remoteRev + 1, file = newFileName(next);
+    await cloud.uploadFile(BUCKET, file, await pack(base));
+    const got = await cloud.rpc('bump_library_rev', { expected: remoteRev, device: device(), file });
+    if (got === null || got === undefined || got === '' || (Array.isArray(got) && !got.length)) {
+      cloud.deleteFiles(BUCKET, [file]).catch(() => { }); // someone else saved first: drop ours, merge theirs, retry
+      continue;
+    }
+    st.rev = next; st.hash = h; S.rev = next;
+    await kv.set('sync:' + uid, st);
+    if (prof.library_file) cloud.deleteFiles(BUCKET, [prof.library_file]).catch(() => { });
+    return;
+  }
+  throw new Error('Another device keeps saving — will try again shortly.');
+}
+
+// When this device's library belonged to someone else (or to nobody), decide what to do with it
+async function ownerOf() { return kv.get('syncOwner'); }
+async function claim(mode) { // 'merge' | 'replace'
+  const uid = cloud.user().id;
+  if (mode === 'replace') {
+    for (const s of ['tracks', 'albums', 'playlists']) await db.clear(s);
+    await store.setTombstones({ t: {}, p: {}, a: {} });
+    await store.load(); emit('library');
+  }
+  await kv.set('syncOwner', uid);
+  st = { rev: 0, hash: '' }; await kv.set('sync:' + uid, st);
+}
+
+let lastPush = 0;
+const schedule = debounce(() => {
+  const wait = Math.max(0, lastPush + 30e3 - Date.now());
+  setTimeout(() => { lastPush = Date.now(); syncNow(); }, wait);
+}, 6000);
+function start() {
+  if (!cloud.signedIn()) { setStatus('off'); return; }
+  st = null;
+  syncNow();
+  if (started) return; started = true;
+  on('dirty', why => { if (cloud.signedIn() && why !== 'synced') schedule(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && cloud.signedIn() && Date.now() - S.lastSync > 20e3) syncNow(); });
+  window.addEventListener('online', () => cloud.signedIn() && syncNow());
+  timer = setInterval(() => { if (document.visibilityState === 'visible' && cloud.signedIn()) syncNow(); }, 120e3);
+}
+function stop() { st = null; setStatus('off'); }
+
+// Delete everything this user has in the cloud
+async function deleteCloudData() {
+  const uid = cloud.user().id;
+  try { const files = await cloud.listFiles(BUCKET, uid + '/'); await cloud.deleteFiles(BUCKET, files.map(f => `${uid}/${f.name}`)); } catch { }
+  await cloud.rpc('delete_my_account');
+}
+
+return { state, merge, pushProfile, syncNow, ownerOf, claim, start, stop, deleteCloudData };
+})();
+// ---------- voice.js ----------
+const __m_voice = (() => {
+// "Hey BAZINGA!" — voice assistant.
+// Listens with the browser's speech recognition, understands everyday phrasing,
+// and answers out loud with the most natural voice the device has
+// (e.g. Siri/"Enhanced"/"Premium" voices on Apple, "Natural" voices on Edge/Windows, Google voices on Chrome/Android).
+// Browsers without speech recognition (e.g. Firefox) get a text box instead — it still talks back.
+const { lib } = __m_store;
+const store = __m_store;
+const meta = __m_meta;
+const player = __m_player;
+const { P } = __m_player;
+const { $, esc, norm, mainArtist, displayTitle, emit } = __m_util;
+
+const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+// Brave ships the speech API but can't reach Google's speech service, so it gets the text box instead
+const canListen = !!Rec && !navigator.brave;
+let app = null;           // hooks from app.js: { go, search, openNP, closeNP, lyrics, back, toast }
+let rec = null, listening = false, open = false, ducked = false, keep = false, closeTimer = null, usedMic = false;
+
+const rand = a => a[Math.floor(Math.random() * a.length)];
+
+// ---------- voice output ----------
+let voice = null;
+// Rank every voice the device has: natural/neural voices first, robotic & novelty voices last.
+// (Browsers can't use Siri's own voice, but Apple's Premium/Enhanced voices, Edge's "Natural"
+// voices and Chrome's Google voices sound close to it.)
+const NOVELTY = /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|good news|hysterical|jester|organ|pipe organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|princess|bruce|agnes|vicki|victoria|grandma|grandpa|eddy|flo|reed|rocko|sandy|shelley|espeak|compact|robot|novelty)\b/i;
+function voiceScore(v) {
+  const lang = (navigator.language || 'en-US').toLowerCase(), base = lang.slice(0, 2);
+  const vl = v.lang.toLowerCase().replace('_', '-'), n = v.name;
+  let s = 0;
+  if (vl === lang) s += 40; else if (vl.startsWith(base)) s += 28; else return -100;
+  if (/natural|neural/i.test(n)) s += 60;                          // Edge / Windows "… Online (Natural)"
+  if (/premium/i.test(n)) s += 58;                                 // Apple downloadable Premium voices
+  if (/enhanced/i.test(n)) s += 50;                                // Apple Enhanced
+  if (/siri/i.test(n)) s += 55;
+  if (/^google /i.test(n)) s += 34;                                // Chrome network voices
+  if (/\b(ava|zoe|evan|nathan|noelle|samantha|allison|susan|serena|karen|moira|tessa|daniel|aria|jenny|michelle|ana|emma|brian|andrew|ava multilingual|libby|sonia|ryan|natasha|william)\b/i.test(n)) s += 14;
+  if (NOVELTY.test(n)) s -= 120;
+  if (/microsoft (david|zira|mark|hazel|george)(?!.*natural)/i.test(n)) s -= 10; // older desktop voices
+  return s;
+}
+let voicePref = '', rate = 1;
+function voiceOptions() {
+  if (!('speechSynthesis' in window)) return [];
+  const vs = speechSynthesis.getVoices().map(v => ({ v, s: voiceScore(v) })).filter(x => x.s > -50).sort((a, b) => b.s - a.s);
+  return vs.map(({ v, s }, i) => ({ name: v.name, lang: v.lang, best: i === 0, quality: s >= 80 ? 'Natural' : s >= 60 ? 'Good' : 'Basic' }));
+}
+function pickVoice() {
+  if (!('speechSynthesis' in window)) return null;
+  const vs = speechSynthesis.getVoices(); if (!vs.length) return null;
+  if (voicePref) { const v = vs.find(x => x.name === voicePref); if (v) return v; }
+  return vs.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0];
+}
+function setVoicePrefs({ name, speed } = {}) {
+  if (name !== undefined) { voicePref = name || ''; voice = pickVoice(); }
+  if (speed) rate = speed;
+}
+function previewVoice(name) {
+  const old = voicePref; voicePref = name || ''; voice = pickVoice();
+  say(rand(['Hey! I\'m BAZINGA. What do you want to hear?', 'Hi there. Say "play my liked songs" and I\'ll get the music going.']), { show: false });
+  voicePref = old; voice = null;
+}
+if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = () => { voice = pickVoice(); }; voice = pickVoice(); }
+
+// Dip the music while listening/talking. This never changes your saved volume, so the music
+// always comes back exactly as loud as it was.
+function duck(on) {
+  if (on === ducked) return;
+  ducked = on; player.duck(on);
+}
+// After using the microphone, phones keep audio in "phone call" mode (thin, quiet sound).
+// Hand the audio back to music mode and gently restart the output so it sounds right again.
+function restoreAudio() {
+  duck(false);
+  player.audioMode('playback');
+  if (usedMic) { usedMic = false; if (matchMedia('(pointer: coarse)').matches) setTimeout(() => player.refreshOutput(), 250); }
+}
+function fail(text) { keep = true; return say(text); }
+function say(text, { show = true } = {}) {
+  if (show) setReply(text);
+  if (!('speechSynthesis' in window)) return Promise.resolve();
+  return new Promise(res => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; clearTimeout(guard); setState(listening ? 'listening' : 'idle'); if (!listening) duck(false); res(); };
+    // Some phones never fire "end" for speech — don't leave the music dipped forever
+    const guard = setTimeout(finish, Math.max(2500, text.length * 85));
+    try {
+      speechSynthesis.cancel();
+      voice = voice || pickVoice();
+      // Speak sentence by sentence with a natural pace: sounds less robotic, and avoids
+      // Chrome cutting long speech off
+      const spoken = text.replace(/BAZINGA!/g, 'Bazinga').replace(/\s*—\s*/g, ', ');
+      const parts = spoken.match(/[^.!?]+[.!?]*/g) || [spoken];
+      setState('speaking'); duck(true);
+      parts.forEach((part, i) => {
+        const u = new SpeechSynthesisUtterance(part.trim());
+        if (voice) { u.voice = voice; u.lang = voice.lang; }
+        const natural = voice && /natural|neural|premium|enhanced|siri/i.test(voice.name);
+        u.rate = (natural ? 1 : 0.97) * rate; u.pitch = 1; u.volume = 1;
+        if (i === parts.length - 1) { u.onend = finish; }
+        u.onerror = finish;
+        speechSynthesis.speak(u);
+      });
+    } catch { finish(); }
+  });
+}
+
+// ---------- UI ----------
+function el() { return $('#voice'); }
+function setState(s) { const v = el(); if (v) v.dataset.state = s; }
+function setHeard(t) { const h = el()?.querySelector('.vc-heard'); if (h) { h.textContent = t; h.classList.toggle('empty', !t); } }
+function setReply(t) { const r = el()?.querySelector('.vc-reply'); if (r) r.textContent = t; }
+
+const SUGGEST = ['Play my liked songs', 'Play Blinding Lights by The Weeknd', 'Add Essence to the queue', 'Search for Burna Boy', 'Go to my artists', 'Show the lyrics', 'Switch to music video', 'What\'s playing?'];
+
+function initVoice(hooks) {
+  app = hooks;
+  const wrap = document.createElement('div');
+  wrap.id = 'voice'; wrap.hidden = true; wrap.dataset.state = 'idle';
+  wrap.innerHTML = `<div class="vc-back" data-vc="close"></div>
+    <div class="vc-sheet" role="dialog" aria-label="Voice assistant">
+      <button class="ib vc-x" data-vc="close" aria-label="Close">✕</button>
+      <div class="vc-orb" data-vc="mic" role="button" aria-label="Tap to talk"><i></i><i></i><i></i><b></b></div>
+      <div class="vc-heard empty"></div>
+      <div class="vc-reply">${canListen ? 'Listening… try "Play my liked songs"' : 'Type what you\'d like — for example "Play Tapout by Rich Gang"'}</div>
+      <div class="vc-confirm" hidden><button class="btn primary" data-vc="yes">${'Yes, play it'}</button><button class="btn" data-vc="no">No</button></div>
+      <form class="vc-form"><input name="q" placeholder="${canListen ? 'Or type a request…' : 'Type a request…'}" autocomplete="off" enterkeyhint="go"><button class="btn primary sm">Go</button></form>
+      <div class="vc-sugg">${SUGGEST.map(s => `<button class="chip" data-vc-say="${esc(s)}">${esc(s)}</button>`).join('')}</div>
+    </div>`;
+  document.body.appendChild(wrap);
+  wrap.addEventListener('click', e => {
+    const c = e.target.closest('[data-vc]');
+    if (c?.dataset.vc === 'close') close();
+    if (c?.dataset.vc === 'mic') listening ? stopListening() : listen();
+    if (c?.dataset.vc === 'yes' || c?.dataset.vc === 'no') { stopListening(); setHeard(c.dataset.vc === 'yes' ? 'Yes' : 'No'); handle(c.dataset.vc); }
+    const s = e.target.closest('[data-vc-say]'); if (s) { setHeard(s.dataset.vcSay); handle(s.dataset.vcSay); }
+  });
+  wrap.querySelector('.vc-form').addEventListener('submit', e => {
+    e.preventDefault(); const q = e.target.q.value.trim(); if (!q) return;
+    e.target.q.value = ''; stopListening(); setHeard(q); handle(q);
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && open) close(); });
+}
+
+function openVoice({ listenNow = true, fromWake = false } = {}) {
+  const v = el(); if (!v) return;
+  if (!fromWake) stopWake();
+  clearTimeout(closeTimer); keep = false;
+  open = true; v.hidden = false; requestAnimationFrame(() => v.classList.add('on'));
+  setHeard('');
+  setReply(canListen ? rand(['I\'m listening…', 'Go ahead, I\'m listening.', 'What do you want to hear?']) : 'Type what you\'d like — for example "Play Tapout by Rich Gang"');
+  // Unlock speech on iOS: speak an empty utterance inside the tap
+  try { if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch { }
+  if (!listenNow) return;
+  if (canListen) listen(); else v.querySelector('input').focus();
+}
+function close() {
+  clearTimeout(closeTimer); pending = null; confirmUI(false);
+  stopListening(); try { speechSynthesis.cancel(); } catch { }
+  restoreAudio();
+  const v = el(); if (!v) return;
+  open = false; v.classList.remove('on'); setTimeout(() => { if (!open) v.hidden = true; }, 220);
+  scheduleWake(1200);
+}
+
+function listen() {
+  if (!canListen) return;
+  try { speechSynthesis.cancel(); } catch { }
+  clearTimeout(closeTimer); keep = false;
+  stopListening(); stopWake();
+  player.audioMode('play-and-record');
+  usedMic = true;
+  rec = new Rec();
+  rec.lang = navigator.language || 'en-US';
+  // Ask for several guesses of what was said; each one is checked against your library
+  rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 5;
+  let final = '', finals = [];
+  rec.onstart = () => { listening = true; setState('listening'); duck(true); };
+  rec.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) { final += r[0].transcript; finals.push([...Array(r.length)].map((_, k) => r[k].transcript)); }
+      else interim += r[0].transcript;
+    }
+    setHeard((final + ' ' + interim).trim());
+  };
+  rec.onerror = e => {
+    listening = false; setState('idle'); keep = true;
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setReply('I need microphone access. Allow it in your browser\'s site settings, or type below.');
+    else if (e.error === 'no-speech') setReply('I didn\'t hear anything. Tap the orb and try again.');
+    else if (e.error === 'network') setReply('Voice recognition needs internet. You can type instead.');
+  };
+  rec.onend = () => {
+    listening = false; setState('idle'); rec = null;
+    player.audioMode('playback'); // release the microphone's audio mode right away
+    const alts = [];
+    for (let k = 1; k < 5; k++) { const a = finals.map(f => f[k] || f[0]).join(' ').trim(); if (a && a !== final.trim() && !alts.includes(a)) alts.push(a); }
+    if (final.trim()) handle(final.trim(), alts); else restoreAudio();
+  };
+  try { rec.start(); } catch { player.audioMode('playback'); }
+}
+function stopListening() {
+  const r = rec; rec = null;
+  if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch { } try { r.stop(); } catch { } player.audioMode('playback'); }
+  listening = false;
+}
+
+// ---------- understanding ----------
+function clean(s) {
+  return s.toLowerCase().replace(/[’']/g, "'").replace(/[.!?,]+$/g, '')
+    .replace(/^(hey |ok |okay )?(bazinga|bazinga!)[, ]*/i, '')
+    .replace(/^(please |can you |could you |would you |will you |i want to |i wanna |i'd like to |let's |lets |yo |hey )+/g, '')
+    .replace(/ please$/g, '').replace(/\s+/g, ' ').trim();
+}
+function sim(a, b) {
+  const A = norm(a), B = norm(b); if (!A || !B) return 0;
+  if (A === B) return 1;
+  if (B.includes(A) || A.includes(B)) return 0.85 * Math.min(A.length, B.length) / Math.max(A.length, B.length) + 0.15;
+  const ta = new Set(A.split(' ')), tb = new Set(B.split(' '));
+  let inter = 0; ta.forEach(x => { if (tb.has(x)) inter++; });
+  return inter / Math.max(ta.size, tb.size);
+}
+function bestOf(list, q, key, min = 0.55) {
+  let best = null, s = 0;
+  for (const x of list) { const v = sim(q, key(x)); if (v > s) { s = v; best = x; } }
+  return s >= min ? best : null;
+}
+const libTracks = () => store.saved();
+const likedIds = () => libTracks().filter(t => t.liked).sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id);
+function artistTracks(name) {
+  const n = norm(name);
+  return libTracks().filter(t => norm(mainArtist(t.artist)) === n || (t.artists || []).some(a => norm(a) === n));
+}
+
+// Work out what "X" is: liked songs / a playlist / an album / an artist / a song
+async function resolve(q, { prefer } = {}) {
+  q = q.replace(/^(the |some |a )/, '').trim();
+  if (/^(my )?(liked|favorite|favourite|loved)( songs| tracks| music)?$|^my (likes|favorites|favourites)$/.test(q)) {
+    const ids = likedIds(); return ids.length ? { kind: 'liked', ids, label: 'your Liked Songs' } : { none: 'You don\'t have any liked songs yet.' };
+  }
+  let m;
+  if ((m = q.match(/^(?:my )?playlist (?:called |named )?(.+)$/)) || (m = q.match(/^(?:my )?(.+?) playlist$/)) || prefer === 'playlist') {
+    const name = m ? m[1] : q;
+    const p = bestOf([...lib.playlists.values()], name, x => x.name, 0.45);
+    if (p) return { kind: 'playlist', ids: p.trackIds, label: `your ${p.name} playlist` };
+    if (m) return { none: `I couldn't find a playlist called ${name}.` };
+  }
+  if ((m = q.match(/^(?:the )?album (.+?)(?: by (.+))?$/))) {
+    const [, title, by] = m;
+    const local = bestOf([...lib.albums.values()], title, a => a.title, 0.6);
+    if (local && (!by || sim(by, local.artist) > 0.5)) return { kind: 'album', ids: local.trackIds, label: `${local.title} by ${local.artist}` };
+    const res = await meta.searchAlbums(by ? `${by} ${title}` : title, 5);
+    const a = res[0]; if (!a) return { none: `I couldn't find the album ${title}.` };
+    const { tracks } = await meta.albumTracks(a.itunesAlbumId);
+    return { kind: 'album', ids: tracks.map(t => (lib.tracks.get(t.id) || store.remember(t)).id), label: `${a.title} by ${a.artist}`, sure: !!by && sim(by, a.artist) > 0.7 && sim(title, a.title) > 0.6 };
+  }
+  if ((m = q.match(/^(?:songs|music|tracks|something|stuff|anything|hits) (?:by|from) (.+)$/)) || (m = q.match(/^(.+?)'s (?:songs|music|hits)$/))) {
+    return await artistPick(m[1]);
+  }
+  if ((m = q.match(/^(.+) by (.+)$/))) {
+    const [, title, by] = m;
+    const local = libTracks().find(t => sim(title, t.title) > 0.8 && (sim(by, t.artist) > 0.6 || (t.artists || []).some(a => sim(by, a) > 0.7)));
+    if (local) return { kind: 'song', ids: [local.id], label: `${displayTitle(local)} by ${local.artist}` };
+    const res = await meta.searchSongs(`${by} ${title}`, 8);
+    const hit = res.find(r => sim(by, r.artist) > 0.5) || res[0];
+    if (hit) { const t = lib.tracks.get(hit.id) || store.remember(hit); return { kind: 'song', ids: [t.id], label: `${t.title} by ${t.artist}`, sure: sim(by, t.artist) > 0.7 && sim(title, t.title) > 0.7 }; }
+    return { none: `I couldn't find ${title} by ${by}.` };
+  }
+  // Bare name: playlist? artist? song?
+  const p = bestOf([...lib.playlists.values()], q, x => x.name, 0.8);
+  if (p) return { kind: 'playlist', ids: p.trackIds, label: `your ${p.name} playlist` };
+  const art = store.artists().find(a => norm(a.name) === norm(q));
+  if (art) return artistPick(art.name);
+  const local = bestOf(libTracks(), q, t => t.title, 0.75);
+  if (local) return { kind: 'song', ids: [local.id], label: `${displayTitle(local)} by ${local.artist}` };
+  const res = await meta.searchSongs(q, 8);
+  if (res[0]) {
+    // If the words are really an artist name, play that artist
+    if (res.filter(r => norm(r.artist) === norm(q)).length >= 3) return artistPick(res.find(r => norm(r.artist) === norm(q)).artist);
+    const t = lib.tracks.get(res[0].id) || store.remember(res[0]);
+    return { kind: 'song', ids: [t.id], label: `${t.title} by ${t.artist}` };
+  }
+  return { none: `I couldn't find anything for ${q}.` };
+}
+async function artistPick(name) {
+  const mine = artistTracks(name);
+  if (mine.length) return { kind: 'artist', ids: mine.map(t => t.id), label: mine[0].artist, shuffle: true, sure: true };
+  const id = await meta.findArtistId(name);
+  if (!id) return { none: `I couldn't find the artist ${name}.` };
+  const top = await meta.artistTopSongs(id);
+  if (!top.length) return { none: `I couldn't find songs by ${name}.` };
+  return { kind: 'artist', ids: top.map(t => (lib.tracks.get(t.id) || store.remember(t)).id), label: top[0].artist, shuffle: false, sure: norm(top[0].artist) === norm(name) };
+}
+
+// ---------- library-aware matching ----------
+// Speech recognition often mishears names ("Burner Boy", "wiz kid"), so everything is compared
+// with typo-tolerant, sound-alike matching against YOUR library first: playlists, artists,
+// albums and song titles (+ artist). Only if nothing in the library fits do we search the catalogue.
+function lev(a, b) {
+  if (a === b) return 0; if (!a.length) return b.length; if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+const ratio = (a, b) => (a && b) ? 1 - lev(a, b) / Math.max(a.length, b.length) : 0;
+// "sounds like": fold spellings the recogniser mixes up
+const sound = s => s.replace(/ph/g, 'f').replace(/ck|q/g, 'k').replace(/z/g, 's').replace(/y/g, 'i').replace(/ee|ea/g, 'i').replace(/oo|ou/g, 'u').replace(/er\b/g, 'a').replace(/([a-z])\1+/g, '$1').replace(/h(?![aeiou])/g, '');
+const STOP = new Set(['the', 'a', 'an', 'my', 'song', 'songs', 'track', 'music', 'by', 'from', 'of', 'and']);
+// "seven" = "7", "number one" = "no 1"… so spoken numbers match titles
+const NUMW = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, hundred: 100 };
+const numify = s => s.replace(/\b(twenty|thirty|forty|fifty) (one|two|three|four|five|six|seven|eight|nine)\b/g, (m, a, b) => String(NUMW[a] + NUMW[b])).replace(/\b[a-z]+\b/g, w => w in NUMW ? String(NUMW[w]) : w);
+function fuzzy(q, target) {
+  const A = numify(norm(q)), B = numify(norm(target)); if (!A || !B) return 0;
+  if (A === B) return 1;
+  const cA = A.replace(/ /g, ''), cB = B.replace(/ /g, '');
+  let s = Math.max(ratio(A, B), ratio(cA, cB) * 0.98, ratio(sound(cA), sound(cB)) * 0.95);
+  if (B.includes(A) && A.length >= 3) s = Math.max(s, 0.7 + 0.3 * A.length / B.length);
+  // word-by-word: every word you said should match a word in the name
+  const ta = A.split(' ').filter(w => !STOP.has(w)), tb = B.split(' ').filter(w => !STOP.has(w));
+  if (ta.length && tb.length) {
+    let hit = 0;
+    for (const w of ta) hit += Math.max(...tb.map(x => Math.max(ratio(w, x), ratio(sound(w), sound(x)))));
+    const cover = hit / ta.length, coverB = Math.min(1, ta.length / tb.length);
+    s = Math.max(s, cover * (0.8 + 0.2 * coverB));
+  }
+  return Math.min(1, s);
+}
+const artistNames = t => (t.artists?.length ? t.artists : [t.artist]).filter(Boolean);
+function libraryCandidates(phrase) {
+  let q = phrase.replace(/^(the |some |a )/, '').trim(), m;
+  const out = [];
+  const add = (c) => out.push(c);
+  const pls = [...lib.playlists.values()];
+  const albums = [...lib.albums.values(), ...store.implicitAlbums()];
+  if (/^(my )?(liked|favorite|favourite|loved)( songs| tracks| music)?$|^my (likes|favorites|favourites)$/.test(q)) {
+    const ids = likedIds(); if (ids.length) add({ kind: 'liked', ids, label: 'your Liked Songs', score: 1, key: 'liked' });
+    return out;
+  }
+  if ((m = q.match(/^(?:my )?playlist (?:called |named )?(.+)$/)) || (m = q.match(/^(?:my )?(.+?) playlist$/))) {
+    for (const p of pls) add({ kind: 'playlist', ids: p.trackIds, label: `your ${p.name} playlist`, name: p.name, score: fuzzy(m[1], p.name) + 0.04, key: 'p:' + p.id });
+    return out;
+  }
+  if ((m = q.match(/^(?:the )?album (.+?)(?: by (.+))?$/))) {
+    for (const a of albums) { let sc = fuzzy(m[1], a.title); if (m[2]) sc = sc * 0.65 + fuzzy(m[2], a.artist) * 0.35; add({ kind: 'album', ids: a.trackIds || [], label: `${a.title} by ${a.artist}`, name: a.title, score: sc, key: 'a:' + a.id }); }
+    return out;
+  }
+  if ((m = q.match(/^(?:songs|music|tracks|something|stuff|anything|hits) (?:by|from) (.+)$/)) || (m = q.match(/^(.+?)'s (?:songs|music|hits)$/))) {
+    for (const a of store.artists()) add({ kind: 'artist', name: a.name, label: a.name, score: fuzzy(m[1], a.name) + 0.03, key: 'r:' + a.key, shuffle: true });
+    return out;
+  }
+  const songs = libTracks();
+  if ((m = q.match(/^(.+) by (.+)$/))) {
+    const [, title, by] = m;
+    for (const t of songs) {
+      const ts = fuzzy(title, t.title); if (ts < 0.45) continue;
+      const as = Math.max(...artistNames(t).map(a => fuzzy(by, a)));
+      add({ kind: 'song', ids: [t.id], label: `${displayTitle(t)} by ${t.artist}`, name: t.title, score: ts * 0.62 + as * 0.38, key: 's:' + t.id });
+    }
+    // "play <album> by <artist>" also counts
+    for (const a of albums) add({ kind: 'album', ids: a.trackIds || [], label: `the album ${a.title} by ${a.artist}`, name: a.title, score: (fuzzy(title, a.title) * 0.62 + fuzzy(by, a.artist) * 0.38) - 0.04, key: 'a:' + a.id });
+    return out;
+  }
+  // a bare name: could be a playlist, an artist, an album or a song ("essence", "essence wizkid")
+  for (const p of pls) add({ kind: 'playlist', ids: p.trackIds, label: `your ${p.name} playlist`, name: p.name, score: fuzzy(q, p.name) + 0.02, key: 'p:' + p.id });
+  for (const a of store.artists()) add({ kind: 'artist', name: a.name, label: a.name, score: fuzzy(q, a.name) + 0.01, key: 'r:' + a.key, shuffle: true });
+  for (const a of albums) add({ kind: 'album', ids: a.trackIds || [], label: `the album ${a.title} by ${a.artist}`, name: a.title, score: fuzzy(q, a.title) - 0.03, key: 'a:' + a.id });
+  for (const t of songs) {
+    const s1 = fuzzy(q, t.title);
+    const s2 = Math.max(...artistNames(t).map(a => fuzzy(q, `${t.title} ${a}`)), ...artistNames(t).map(a => fuzzy(q, `${a} ${t.title}`)));
+    add({ kind: 'song', ids: [t.id], label: `${displayTitle(t)} by ${t.artist}`, name: t.title, score: Math.max(s1, s2 * 0.98), key: 's:' + t.id });
+  }
+  return out;
+}
+// Best library match over every way the phrase may have been heard
+async function bestMatch(phrases, { exclude = new Set() } = {}) {
+  const best = new Map();
+  phrases.forEach((ph, i) => {
+    const penalty = i === 0 ? 0 : 0.03; // the recogniser's first guess is usually right
+    for (const c of libraryCandidates(ph)) {
+      if (exclude.has(c.key)) continue;
+      const sc = c.score - penalty;
+      if (!best.has(c.key) || best.get(c.key).score < sc) best.set(c.key, { ...c, score: sc });
+    }
+  });
+  const list = [...best.values()].sort((a, b) => b.score - a.score);
+  const top = list[0]; if (!top) return null;
+  top.runnerUp = list.find(c => c.key !== top.key && c.score > 0.5) || null;
+  if (top.kind === 'artist') { const mine = artistTracks(top.name); top.ids = mine.map(t => t.id); }
+  return top.ids?.length ? top : null;
+}
+let pending = null; // { action, cand, opts, phrases, tried:Set }
+function confirmUI(on) { const c = el()?.querySelector('.vc-confirm'); if (c) c.hidden = !on; }
+async function decide(action, phrases, opts = {}) {
+  phrases = [...new Set(phrases.map(x => x.trim()).filter(Boolean))];
+  const lib0 = opts.pre || await bestMatch(phrases, { exclude: opts.tried });
+  const margin = lib0 ? lib0.score - (lib0.runnerUp?.score || 0) : 0;
+  // Sure enough: do it
+  if (lib0 && (lib0.score >= 0.9 || (lib0.score >= 0.8 && margin >= 0.1))) return perform(action, lib0, opts);
+  // Somewhat sure: ask first
+  if (lib0 && lib0.score >= 0.6) return ask(action, lib0, opts, phrases);
+  // Not in the library: look it up in the music catalogue
+  const r = await resolve(phrases[0]);
+  if (r.none) return fail(r.none);
+  const confident = r.kind === 'liked' || r.kind === 'playlist' || r.sure;
+  return confident ? perform(action, r, opts) : ask(action, r, opts, phrases);
+}
+function perform(action, r, opts = {}) {
+  pending = null; confirmUI(false);
+  if (action === 'queue' || action === 'next') {
+    player.addToQueue(r.ids, action === 'next');
+    return say(action === 'next' ? `${cap(r.label)} plays next.` : (r.ids.length > 1 ? `Added ${r.ids.length} songs from ${r.label} to your queue.` : `Added ${r.label} to your queue.`));
+  }
+  player.playList(r.ids, 0, { shuffle: !!opts.shuffle || !!r.shuffle });
+  const lines = r.kind === 'song' ? [`Playing ${r.label}.`, `Here's ${r.label}.`] :
+    r.kind === 'artist' ? [`Playing ${r.label}.`, `Here's some ${r.label}.`] : [`Playing ${r.label}.`, `Here's ${r.label}.`, `Starting ${r.label}.`];
+  return say(rand(lines));
+}
+async function ask(action, cand, opts, phrases) {
+  const tried = opts.tried || new Set();
+  if (cand.key) tried.add(cand.key);
+  pending = { action, cand, opts: { ...opts, tried, pre: null }, phrases };
+  keep = true;
+  confirmUI(true);
+  const verb = action === 'play' ? '' : action === 'next' ? ' next' : ' to the queue';
+  await say(`Did you mean ${cand.label}${verb}?`);
+  if (canListen && open) setTimeout(() => { if (pending && open && !listening) listen(); }, 150);
+}
+const YES = /^(yes|yeah|yep|yup|ya|sure|correct|right|ok|okay|that's it|that's right|that one|exactly|go ahead|play it|do it|please|of course|uh huh|mm hmm|yes please)\b/;
+const NO = /^(no|nope|nah|not that|wrong|neither|no thanks|not really|cancel)\b/;
+async function answer(q) {
+  const p = pending;
+  if (YES.test(q)) return perform(p.action, p.cand, p.opts);
+  if (NO.test(q)) {
+    // Offer the next-best library match once, otherwise ask again
+    const next = !p.offeredNext && await bestMatch(p.phrases, { exclude: p.opts.tried });
+    if (next && next.score >= 0.6) { await ask(p.action, next, p.opts, p.phrases); pending.offeredNext = true; return; }
+    pending = null; confirmUI(false); keep = true;
+    await say(p.action === 'play' ? 'Okay. What would you like me to play?' : 'Okay. Which song did you mean?');
+    if (canListen && open) setTimeout(() => { if (open && !listening) listen(); }, 150);
+    return;
+  }
+  // Said something else entirely: treat it as a new request (bare names keep the same action)
+  pending = null; confirmUI(false);
+  if (/^(play|put on|listen to|start|blast|shuffle|add|queue|go|open|show|search|find|pause|stop|next|skip)\b/.test(q)) return run(q);
+  return decide(p.action, [q], { shuffle: p.opts.shuffle });
+}
+
+const PAGES = { home: '#/home', library: '#/library/songs', songs: '#/library/songs', 'liked songs': '#/library/liked', likes: '#/library/liked', liked: '#/library/liked', playlists: '#/library/playlists', albums: '#/library/albums', artists: '#/library/artists', search: '#/search', settings: '#/settings', import: '#/import', offline: '#/offline', queue: '#/queue', 'privacy policy': '#/legal', terms: '#/legal' };
+
+async function handle(raw, alts = []) {
+  const q = clean(raw);
+  if (!q) return;
+  keep = false;
+  setState('thinking');
+  try {
+    if (pending) await answer(q);
+    else await run(q, alts.map(clean).filter(Boolean));
+  } catch (e) { console.warn(e); await fail('Hmm, something went wrong there. Mind trying again?'); }
+  if (!listening) setState('idle');
+  restoreAudio();
+  // Task done: close the assistant (stays open if it couldn't help, so you can try again)
+  if (!keep && open && !listening) closeTimer = setTimeout(() => { if (!listening && !keep) close(); }, 700);
+}
+
+async function run(q, alts = []) {
+  let m;
+  const cur = player.current();
+  // --- playback controls
+  if (/^(pause|stop)( the| this)?( music| song| track| it| playing)?$/.test(q)) { player.pause(); return say(rand(['Paused.', 'Okay, paused.', 'Done.'])); }
+  if (/^(resume|continue|unpause|keep playing|play)( the| my)?( music| song| it)?$/.test(q)) { if (!cur) return fail('There\'s nothing queued up yet. Try "play my liked songs".'); player.play(); return say(rand(['Here we go.', 'Resuming.', 'Back on.'])); }
+  if (/^(next|skip)( song| track| this( one| song)?)?$|^play (the )?next song$/.test(q)) { player.next(); return say(rand(['Skipping.', 'Next one.', 'Got it.'])); }
+  if (/^(previous|last|go to the previous|play the previous|back to the last)( song| track| one)?$/.test(q)) { player.prev(); return say('Going back.'); }
+  if (/^(restart|start over|play (it|this) again|from the (top|beginning))$/.test(q)) { player.seek(0); player.play(); return say('From the top.'); }
+  if ((m = q.match(/^(turn )?(shuffle)( on| off)?$|^(turn (on|off) )shuffle$/))) { const off = /off/.test(q); player.setShuffle(!off); return say(off ? 'Shuffle\'s off.' : 'Shuffle\'s on.'); }
+  if (/repeat (this|the song|one|it)|loop (this|it|the song)/.test(q)) { while (P.repeat !== 'one') player.cycleRepeat(); return say('I\'ll keep this one on repeat.'); }
+  if (/^(turn )?(repeat|loop)( on| all)?$/.test(q)) { while (P.repeat !== 'all') player.cycleRepeat(); return say('Repeat is on.'); }
+  if (/(repeat|loop) off|stop (repeating|looping)/.test(q)) { while (P.repeat !== 'off') player.cycleRepeat(); return say('Repeat is off.'); }
+  if (/^(volume up|louder|turn (it|this|the volume) up|crank it( up)?)$/.test(q)) { const v = Math.min(1, P.volume + 0.2); player.setVolume(v); return say('Turning it up.'); }
+  if (/^(volume down|quieter|softer|turn (it|this|the volume) down)$/.test(q)) { const v = Math.max(0.05, P.volume - 0.2); player.setVolume(v); return say('Turning it down.'); }
+  if ((m = q.match(/^(?:set )?(?:the )?volume (?:to )?(\d{1,3})(?: percent|%)?$/))) { player.setVolume(Math.min(100, +m[1]) / 100); return say(`Volume at ${Math.min(100, +m[1])} percent.`); }
+  if (/^mute$/.test(q)) { player.setVolume(0); return say('Muted.', { show: true }); }
+  if (/(switch to|show|play|watch)( me)?( the)?( music)? video|video mode/.test(q)) { if (!cur) return fail('Nothing\'s playing yet.'); await player.setMode('video'); app.openNP(); return say('Here\'s the music video.'); }
+  if (/(audio only|switch to audio|audio mode|hide (the )?video|just (the )?audio)/.test(q)) { await player.setMode('audio'); return say('Switched to audio only.'); }
+  if (/^(show|open|display|pull up|give me)( me)?( the)? lyrics/.test(q) || /^lyrics$/.test(q)) { if (!cur) return fail('Play something first and I\'ll pull up the lyrics.'); app.openNP(); app.lyrics(true); return say('Here are the lyrics.'); }
+  if (/^(hide|close)( the)? lyrics/.test(q)) { app.lyrics(false); return say('Lyrics hidden.'); }
+  if (/^(open|show|go to)( the)? (now playing|full ?screen|player)$/.test(q)) { app.openNP(); return say('Here you go.'); }
+  if (/^(close|exit|leave)( the)? (now playing|full ?screen|player)$/.test(q)) { app.closeNP(); return say('Okay.'); }
+  if (/^(what'?s|what is) (this|playing|this song)|^what song is (this|playing)|^who (sings|is singing|made) (this|it)|^what am i listening to/.test(q)) {
+    if (!cur) return say('Nothing\'s playing right now.');
+    return say(`This is ${displayTitle(cur)} by ${cur.artist}${cur.album ? `, from ${cur.album}` : ''}.`);
+  }
+  if (/^(i )?(like|love)( this| this song| it)$|^(save|like|add) (this|this song|it) to (my )?(liked|likes|favorites|library)/.test(q)) {
+    if (!cur) return fail('Nothing\'s playing.');
+    if (!cur.liked || cur.transient) await store.upsertTracks([{ ...cur, liked: true, likedAt: Date.now() }]);
+    return say(rand(['Saved to your Liked Songs.', 'Love it too. Added to Liked Songs.']));
+  }
+  // --- navigation
+  if (/^(go )?back$|^go to the previous page$/.test(q)) { app.back(); return say('Okay.'); }
+  if ((m = q.match(/^(?:go to|open|show(?: me)?|take me to|bring up|navigate to)(?: the| my)? (home|library|songs|liked songs|likes|liked|playlists|albums|artists|search|settings|import|offline|queue|privacy policy|terms)(?: page| tab| list)?$/))) {
+    app.go(PAGES[m[1]]); return say(rand(['Here you go.', 'Opening ' + m[1] + '.', 'Sure.']));
+  }
+  if ((m = q.match(/^(?:go to|open|show(?: me)?)(?: the)? artist (.+)$/))) { app.go('#/artist/' + encodeURIComponent(m[1])); return say(`Here's ${m[1]}.`); }
+  // --- search
+  if ((m = q.match(/^(?:search(?: for)?|find(?: me)?|look up|look for|search youtube for) (.+)$/))) {
+    app.search(m[1], /youtube/.test(q) ? 'youtube' : 'all'); return say(rand([`Here's what I found for ${m[1]}.`, `Searching for ${m[1]}.`]));
+  }
+  // --- queue
+  const QUEUE_RE = [/^(?:add|put|throw|stick) (.+?) (?:to|in|on|into) (?:the |my )?queue$/, /^queue(?: up)? (.+)$/, /^play (.+?) next$/];
+  if (QUEUE_RE.some(re => (m = q.match(re)))) {
+    const next = /^play .+ next$/.test(q);
+    const phrases = [m[1], ...alts.map(a => { for (const re of QUEUE_RE) { const x = a.match(re); if (x) return x[1]; } return null; }).filter(Boolean)];
+    return decide(next ? 'next' : 'queue', phrases);
+  }
+  // --- play something
+  const PLAY_RE = /^(?:play|put on|listen to|start|blast|shuffle)(?: me)? (.+)$/;
+  if ((m = q.match(PLAY_RE))) {
+    const shuffleWanted = /^shuffle /.test(q) || / on shuffle$/.test(q);
+    const phrases = [m[1], ...alts.map(a => a.match(PLAY_RE)?.[1]).filter(Boolean)].map(x => x.replace(/ on shuffle$/, ''));
+    return decide('play', phrases, { shuffle: shuffleWanted });
+  }
+  // --- anything else: treat it as something to play if it looks like a name, else search
+  if (q.split(' ').length <= 6) {
+    const best = await bestMatch([q, ...alts]);
+    if (best && best.score >= 0.6) return decide('play', [q, ...alts], { pre: best });
+  }
+  app.search(q, 'all');
+  return say(`I wasn't sure what you meant, so I searched for "${q}".`);
+}
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+
+// ---------- "Hey BAZINGA" — hands-free wake word (opt-in, Settings → Voice assistant) ----------
+// While it's on and BAZINGA! is open on screen, the browser listens in the background. Saying
+// "Hey Bazinga" (or just "Bazinga") opens the assistant; "Hey Bazinga, play my liked songs"
+// does it straight away. Nothing is recorded or kept by BAZINGA!.
+const WAKE = /\b(?:hey|hi|okay|ok|yo|a)?[\s,]*(ba[\s-]?[sz]ing(?:a|er|ah|uh|o)|bah?[\s-]?zing(?:a|er|ah)|bazooka|bossinga|bizinga|bezinga|pazinga)\b[\s,.!?]*/i;
+let wakeOn = false, wakeRec = null, wakeTimer = null, wakeFails = 0, wakeHeard = false, wakeHeardTimer = null, wakeNeedsTap = false;
+const wakeSupported = canListen;
+const wakeActive = () => wakeOn;
+function setWake(on) {
+  wakeOn = !!on && canListen;
+  if (wakeOn) { wakeFails = 0; startWake(); } else stopWake();
+  emit('wake', wakeOn);
+}
+function scheduleWake(ms = 300) { clearTimeout(wakeTimer); if (wakeOn) wakeTimer = setTimeout(startWake, ms); }
+function stopWake() {
+  clearTimeout(wakeTimer); clearTimeout(wakeHeardTimer); wakeHeard = false;
+  const r = wakeRec; wakeRec = null;
+  if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch { } }
+  document.body.classList.remove('wake-on');
+}
+function startWake() {
+  if (!wakeOn || open || listening || wakeRec || document.hidden) return;
+  let r;
+  try { r = new Rec(); } catch { return; }
+  r.lang = navigator.language || 'en-US';
+  r.continuous = true; r.interimResults = true; r.maxAlternatives = 3;
+  r.onstart = () => { wakeFails = 0; document.body.classList.add('wake-on'); };
+  r.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      for (let k = 0; k < res.length; k++) {
+        const text = res[k].transcript, m = text.match(WAKE);
+        if (!m) continue;
+        const rest = text.slice(m.index + m[0].length).trim();
+        if (!wakeHeard) {               // show the assistant right away…
+          wakeHeard = true;
+          openVoice({ listenNow: false, fromWake: true }); // keep this listener going to catch the request
+          setState('listening'); setReply('I\'m listening…'); duck(true);
+          clearTimeout(wakeHeardTimer);
+          wakeHeardTimer = setTimeout(() => finishWake(''), 3500);
+        }
+        if (rest) setHeard(rest);
+        if (res.isFinal) return finishWake(rest);
+        return;
+      }
+    }
+  };
+  r.onerror = e => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      // Some browsers only allow the mic to start after a tap: try again on the next tap
+      wakeNeedsTap = true;
+      document.addEventListener('pointerdown', () => { if (wakeNeedsTap) { wakeNeedsTap = false; scheduleWake(50); } }, { once: true, capture: true });
+    } else if (e.error !== 'no-speech' && e.error !== 'aborted') wakeFails++;
+  };
+  r.onend = () => {
+    if (wakeRec === r) wakeRec = null;
+    document.body.classList.remove('wake-on');
+    if (wakeHeard) return finishWake('');
+    if (!wakeNeedsTap) scheduleWake(wakeFails > 4 ? 15000 : wakeFails > 1 ? 3000 : 250);
+  };
+  wakeRec = r;
+  try { r.start(); } catch { wakeRec = null; scheduleWake(3000); }
+}
+function finishWake(rest) {
+  if (!wakeHeard) return;
+  clearTimeout(wakeHeardTimer); wakeHeard = false;
+  const r = wakeRec; wakeRec = null;
+  if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch { } }
+  document.body.classList.remove('wake-on');
+  usedMic = true;
+  const cmd = rest.replace(/^[,.\s]+/, '').trim();
+  if (cmd.split(' ').length >= 1 && cmd.length > 2) { setHeard(cmd); handle(cmd); }
+  else { setReply(rand(['Yes?', 'I\'m listening…', 'What do you want to hear?'])); setTimeout(() => { if (open && !listening) listen(); }, 120); }
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopWake(); else scheduleWake(400); });
+
+return { canListen, voiceOptions, setVoicePrefs, previewVoice, initVoice, openVoice, wakeSupported, wakeActive, setWake };
+})();
+// ---------- legal.js ----------
+const __m_legal = (() => {
+// Privacy Policy & Terms of Use. Bump TERMS_VERSION whenever the text changes —
+// every user will then be asked to accept again.
+const TERMS_VERSION = '2026-10-23.3';
+const OWNER = 'Abbel Dawit';
+
+const LEGAL_HTML = `
+<p class="tiny muted">Last updated: 23 October 2026 · Version ${TERMS_VERSION}</p>
+
+<h3>Terms of Use</h3>
+<p>BAZINGA! ("the App") is a free, personal project made available by ${OWNER} ("we", "us"). By creating a profile or otherwise using the App you agree to these Terms and the Privacy Policy below. If you do not agree, do not use the App.</p>
+
+<h4>1. What the App is</h4>
+<p>The App is a tool that runs entirely in your web browser. It helps you organise music you already have access to, look up matching videos on YouTube, and play them through YouTube's official embedded player or from files stored on your own device. The App does not host, sell, stream from its own servers, or distribute any music or video.</p>
+
+<h4>2. Not affiliated</h4>
+<p>The App is independent and is not affiliated with, endorsed by or sponsored by Spotify, YouTube, Google, Apple, or any artist, label or rights holder. All trademarks, names and artwork belong to their respective owners.</p>
+
+<h4>3. Your responsibilities</h4>
+<ul>
+<li>You must be at least 13 years old (or the minimum age required where you live) to use the App.</li>
+<li>You are solely responsible for how you use the App and for any content you import, add, play or share, including making sure you have the right to use any music files you add to the App.</li>
+<li>You must follow the terms of every third-party service you use through the App, including YouTube's Terms of Service, Spotify's Developer and User Terms, and Apple's terms.</li>
+<li>Lyrics are shown through Genius's own embed and remain the property of their rights holders; you may only use them for personal viewing.</li>
+<li>You must not use the App for anything unlawful, to infringe anyone's rights, or to attempt to download or copy content from YouTube or other services.</li>
+<li>You are responsible for keeping your own backups. Data stored in a browser can be lost (for example if browser data is cleared or a device is lost).</li>
+</ul>
+
+<h4>4. Third-party services</h4>
+<p>The App connects directly from your device to third-party services (listed in the Privacy Policy). We do not control those services and are not responsible for their availability, accuracy, content, matching results, or how they handle your data. Search results and video matches are produced automatically and may be wrong, unavailable or removed at any time.</p>
+
+<h4>5. No warranty</h4>
+<p>THE APP IS PROVIDED "AS IS" AND "AS AVAILABLE", FREE OF CHARGE, WITHOUT WARRANTIES OF ANY KIND, WHETHER EXPRESS OR IMPLIED, INCLUDING ANY WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, ACCURACY, AVAILABILITY, SECURITY, OR THAT IT WILL BE ERROR-FREE OR THAT DATA WILL NOT BE LOST.</p>
+
+<h4>6. Limitation of liability</h4>
+<p>TO THE FULLEST EXTENT PERMITTED BY LAW, ${OWNER.toUpperCase()} AND ANY CONTRIBUTORS TO BAZINGA! SHALL NOT BE LIABLE FOR ANY CLAIM, LOSS OR DAMAGE OF ANY KIND — INCLUDING DIRECT, INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL OR PUNITIVE DAMAGES, LOSS OF DATA, LOSS OF PROFITS, DEVICE PROBLEMS, DATA CHARGES, OR CLAIMS BY THIRD PARTIES (INCLUDING COPYRIGHT CLAIMS) — ARISING OUT OF OR RELATED TO YOUR USE OF, OR INABILITY TO USE, THE APP OR ANY THIRD-PARTY SERVICE OR CONTENT ACCESSED THROUGH IT, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. YOU USE THE APP ENTIRELY AT YOUR OWN RISK.</p>
+<p>Some jurisdictions do not allow certain warranties or liabilities to be excluded. In those places, the exclusions above apply to the maximum extent the law allows.</p>
+
+<h4>7. Indemnity</h4>
+<p>You agree to defend, indemnify and hold harmless ${OWNER} and any contributors from any claims, damages, costs and expenses (including reasonable legal fees) arising from your use of the App, your content, or your breach of these Terms or of any third party's rights or terms.</p>
+
+<h4>8. Changes and ending use</h4>
+<p>We may change, suspend or discontinue the App, or update these Terms, at any time without notice. If the Terms change, the App will ask you to accept the new version before continuing. You can stop using the App at any time and delete your account and all its data from Settings.</p>
+
+<h4>9. General</h4>
+<p>If any part of these Terms is found unenforceable, the rest remains in effect. These Terms are the entire agreement between you and us about the App.</p>
+
+<h3>Privacy Policy</h3>
+<h4>What we collect</h4>
+<p><b>If you use BAZINGA! without an account: nothing.</b> There are no analytics and no advertising, and we never receive your username, profile picture, music library, listening history or backups.</p>
+<p><b>If you create an account</b> (optional), we store, in our Supabase database and storage: your email address (or the name and email your Google or Discord account shares with us), your username and profile picture, the date you accepted these terms, and a copy of your music library (songs, likes, playlists, albums, YouTube matches and app settings, but never your API keys, tokens or offline music files) so it can sync between your devices. Passwords are handled by Supabase and stored only as secure hashes. We don't sell or share this data with anyone, and only you can read it. You can delete your account and all of this data at any time in <b>Settings → Delete account</b>; signing out lets you keep or remove the copy on a device.</p>
+
+<h4>What is stored on your device</h4>
+<p>Your username, profile picture, library, playlists, albums, YouTube matches, settings, any music files you add, any Spotify sign-in token, and automatic backups are stored only in your browser's storage on your device (and in any backup file you choose to save). You can erase all of it at any time with <b>Settings → Delete account</b>.</p>
+
+<h4>Third-party services your device talks to</h4>
+<p>To work, the App sends requests directly from your device to these services, which receive your IP address and the search terms or IDs needed. Their own privacy policies apply:</p>
+<ul>
+<li><b>YouTube / Google</b> — to show and play videos with the official YouTube player, and, if you add your own API key, to search YouTube.</li>
+<li><b>Public Invidious and Piped servers</b> (independent, community-run) — to search for matching YouTube videos without an API key.</li>
+<li><b>Apple iTunes Search API</b> — to look up genres, release dates, artwork, albums, artists and new releases.</li>
+<li><b>Deezer API</b> — to find missing cover art and artist photos.</li>
+<li><b>Genius</b> — only when you open lyrics: to find the song and show Genius's official lyrics widget (and, if you add one, using your own Genius access token).</li>
+<li><b>Spotify</b> — only if you choose to connect it, to read your Liked Songs and playlists.</li>
+<li><b>Supabase</b> — only if you create an account: hosts accounts, sign-in emails and your synced library.</li>
+<li><b>Google or Discord sign-in</b> — only if you choose "Continue with Google/Discord": shares your name, email and picture with BAZINGA! for your account.</li>
+<li><b>Google / YouTube account</b> — only if you choose to connect it (see below).</li>
+<li><b>Buy Me a Coffee</b> — only if you choose to send a tip; payments happen on their site and BAZINGA! never sees your payment details.</li>
+<li><b>Google Fonts</b> and <b>GitHub Pages</b> — to load the App's fonts and files.</li>
+</ul>
+
+<h4>YouTube account connection</h4>
+<p>If you connect your YouTube account, BAZINGA! uses Google's sign-in to ask for permission to manage your YouTube playlists. It uses that permission <b>only</b> to (a) list your playlists and their videos when you choose to import them, and (b) create playlists and add videos to them when you choose "Save to YouTube". It never deletes anything, never uploads videos, never posts comments, and never reads anything else from your account. The access token Google issues is stored only on your device, expires after about an hour, and is never sent to us — we have no server. You can disconnect in Settings at any time, and revoke access completely at <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">myaccount.google.com/permissions</a>.</p>
+<p>BAZINGA! uses YouTube API Services. By using these features you agree to the <a href="https://www.youtube.com/t/terms" target="_blank" rel="noopener">YouTube Terms of Service</a>, and Google's handling of your data is described in the <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google Privacy Policy</a>.</p>
+
+<h4>Voice assistant</h4>
+<p>The voice assistant only listens after you tap the microphone, and stops after one request. Speech recognition is provided by your browser or operating system (for example Google in Chrome, Apple in Safari, Microsoft in Edge), which may process your voice on their servers under their own privacy policies. BAZINGA! itself never records, stores or sends your voice anywhere. If you prefer, you can type requests instead.</p>
+
+<h4>Sharing</h4>
+<p>When you share a song, playlist or album, its song list (and your username) is packed into the link itself. Anyone you give the link to can read it. Nothing is uploaded by the App.</p>
+
+<h4>Children</h4>
+<p>The App is not directed at children under 13.</p>
+
+<h4>Contact</h4>
+<p>Questions about these terms can be raised through the App's public GitHub repository.</p>
+`;
+
+return { TERMS_VERSION, OWNER, LEGAL_HTML };
+})();
+// ---------- app.js ----------
+const __m_app = (() => {
+// BAZINGA — app shell, router and views
+const { db, kv } = __m_db;
+const { $, $$, esc, on, emit, toast, debounce, fmtTime, fmtDur, imageToDataURL, mainArtist, norm, trackKey, albumKey, yearOf, packToString, unpackString, sleep, downloadBlob, uid, displayTitle, genreOf } = __m_util;
+const { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, filterBar, empty, likedCover, loader, sized, toastUndo } = __m_ui;
+const { initVoice, openVoice, canListen, voiceOptions, setVoicePrefs, previewVoice, setWake, wakeSupported } = __m_voice;
+const store = __m_store;
+const { lib } = __m_store;
+const meta = __m_meta;
+const yt = __m_youtube;
+const ya = __m_ytaccount;
+const cloud = __m_cloud;
+const sync = __m_sync;
+const sp = __m_spotify;
+const imp = __m_importers;
+const player = __m_player;
+const { P } = __m_player;
+const backup = __m_backup;
+const { LEGAL_HTML, TERMS_VERSION } = __m_legal;
+
+const view = () => $('#view');
+const lists = new Map();      // listKey -> [trackIds] for "play from here"
+const sections = new Map();   // sectionKey -> {tracks, opts}
+const fstate = {};            // sectionKey -> filter state
+let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
+const APP_VERSION = 'v1.1';
+const APP_TAGLINE = 'Music Made For You';
+const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
+let profile = null;
+let routeToken = 0;
+
+// ================= BOOT =================
+async function boot() {
+  window.__bzStarted = true;
+  if (location.protocol === 'file:') setTimeout(() => toast('Opened from a file: library & offline files work, but YouTube playback, Spotify and sharing need the GitHub Pages link.', 'err'), 1500);
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
+  settings = { ...settings, ...(await kv.get('settings', {})) };
+  applySettings();
+  yt.startInstances(); // warm up the YouTube server list in the background
+  ya.restoreSession();
+  const cfg = window.BAZINGA_CONFIG || {};
+  cloud.configure(cfg.supabaseUrl, cfg.supabaseAnonKey);
+  await cloud.restore();
+  let authResult = null;
+  try { authResult = await cloud.handleRedirect(); } catch (e) { setTimeout(() => toast(e.message, 'err'), 300); }
+  try { if (await sp.handleRedirect()) { toast('Spotify connected ✓'); location.hash = '#/import'; } }
+  catch (e) { toast(e.message, 'err'); }
+  await store.load();
+  profile = await kv.get('profile');
+  if (!profile && cloud.signedIn()) profile = await profileFromAccount();
+  await player.restore();
+  player.setEndHook(queueEnded);
+  (window.requestIdleCallback || (f => setTimeout(f, 1200)))(() => player.warmup());
+  backup.startAuto();
+  wireGlobal();
+  on('account', () => { if (profile) renderProfileChip(); });
+  on('sync', () => { renderProfileChip(); const el = $('#sync-line'); if (el) el.innerHTML = syncLine(); });
+  on('profile-changed', p => { profile = p; renderProfileChip(); });
+  if (!profile) {
+    onboarding();
+    if (authResult?.kind === 'verified') { toast('Email verified ✓ — log in to continue', 'ok'); openAuth('login'); }
+    return;
+  }
+  await showApp();
+  afterSignIn(authResult?.kind);
+}
+
+// ---------- accounts ----------
+async function profileFromAccount() {
+  const u = cloud.user(); if (!u) return null;
+  let cp = null; try { cp = await cloud.getProfile(); } catch { }
+  const md = u.user_metadata || {};
+  let termsOk = null; try { termsOk = localStorage.getItem('bz_terms_ok'); } catch { }
+  const p = {
+    username: (cp?.username || md.username || md.full_name || md.name || md.user_name || (u.email || 'listener').split('@')[0]).slice(0, 30),
+    picture: cp?.avatar || md.avatar_url || md.picture || '',
+    createdAt: Date.now(), updatedAt: cp?.updated_at ? Date.parse(cp.updated_at) : 0,
+    termsAccepted: termsOk === TERMS_VERSION || cp?.terms_version === TERMS_VERSION ? TERMS_VERSION : (cp?.terms_version || null),
+    termsAcceptedAt: termsOk ? new Date().toISOString() : null
+  };
+  await kv.set('profile', p);
+  return p;
+}
+async function afterSignIn(kind) {
+  if (kind === 'recovery') { await setNewPassword(); }
+  if (kind === 'verified') { toast('Email verified ✓ — log in to continue', 'ok'); if (!cloud.signedIn()) openAuth('login'); }
+  if (!cloud.signedIn()) return;
+  // Whose music is on this device?
+  const owner = await sync.ownerOf(), uid = cloud.user().id;
+  if (owner !== uid) {
+    const hasLocal = store.saved().length || lib.playlists.size || lib.albums.size;
+    let mode = 'merge';
+    if (hasLocal) {
+      mode = await modal(`<h3>${icon('cloud')} Sync this device</h3>
+        <p class="muted">${owner ? 'This device has music from a different BAZINGA! account.' : 'You already have music on this device.'} What should happen to it?</p>
+        <div class="pick-list">
+          <button class="pick wrap" data-resolve="merge">${cover('', '+', 'sm')}<span><b>Add it to my account</b><small>Combine this device's music with your account (recommended)</small></span></button>
+          <button class="pick wrap" data-resolve="replace">${cover('', '↺', 'sm')}<span><b>Use only my account's music</b><small>Replace what's on this device with your synced library</small></span></button>
+        </div>`, { locked: true }) || 'merge';
+    }
+    // A brand-new account created from guest mode keeps the name/picture chosen on this device
+    if (!owner && hasLocal && mode === 'merge') {
+      try { const cp = await cloud.getProfile(); if (!cp || !(cp.library_rev > 0)) { profile.updatedAt = Date.now(); await kv.set('profile', profile); } } catch { }
+    }
+    await sync.claim(mode);
+  }
+  if (kind === 'signin') toast(`Signed in as ${cloud.user().email || profile.username} — syncing your music`, 'ok');
+  sync.start();
+}
+function syncLine() {
+  const S = sync.state();
+  if (!cloud.signedIn()) return '';
+  const ago = S.lastSync ? Math.max(0, Math.round((Date.now() - S.lastSync) / 60e3)) : null;
+  return S.status === 'syncing' ? `<span class="sync-st busy">${icon('cloud')} Syncing…</span>`
+    : S.status === 'error' ? `<span class="sync-st err">${icon('cloudOff')} ${esc(S.error || 'Sync failed')} — will retry</span>`
+    : S.status === 'offline' ? `<span class="sync-st">${icon('cloudOff')} Offline — will sync when you're back online</span>`
+    : `<span class="sync-st ok">${icon('check')} Synced${ago === null ? '' : ago < 1 ? ' just now' : ` ${ago} min ago`}</span>`;
+}
+const providerOf = u => (u?.app_metadata?.provider || 'email');
+const PROVIDER_NAME = { google: 'Google', discord: 'Discord', email: 'email & password' };
+
+function startProvider(provider) {
+  try { localStorage.setItem('bz_terms_ok', TERMS_VERSION); } catch { }
+  cloud.signInWithProvider(provider).catch(e => toast(e.message, 'err'));
+}
+const brandBtn = (p, label) => `<button type="button" class="btn sso sso-${p}" data-act="sso" data-p="${p}">${p === 'google' ? icon('google') : p === 'discord' ? icon('discord') : icon('mail')}<span>${label}</span></button>`;
+const ssoButtons = () => `${brandBtn('google', 'Continue with Google')}${brandBtn('discord', 'Continue with Discord')}${brandBtn('email', 'Continue with email')}`;
+
+// Email + password: log in, sign up (with verification), forgot password
+async function openAuth(mode = 'login') {
+  let cooldown = 0;
+  const html = m => `<div class="auth">
+    <div class="auth-tabs"><button class="${m === 'login' ? 'on' : ''}" data-mode="login">Log in</button><button class="${m === 'signup' ? 'on' : ''}" data-mode="signup">Create account</button></div>
+    ${m === 'forgot' ? `<h3>Reset your password</h3><p class="muted tiny">We'll email you a link to choose a new password.</p>
+      <form data-form="forgot"><label class="fld"><span>Email</span><input name="email" type="email" required autocomplete="email"></label>
+      <button class="btn primary big">Send reset link</button><button type="button" class="btn ghost block" data-mode="login">Back to log in</button></form>`
+    : m === 'sent' ? `<div class="auth-sent">${icon('mail')}<h3>Check your inbox</h3><p class="muted">We sent a verification link to <b class="sent-to"></b>. Open it on this device to finish signing up. (Check spam too.)</p>
+      <button class="btn block" data-resend>Resend email</button><button class="btn ghost block" data-mode="login">I've verified — log in</button></div>`
+    : `<form data-form="${m}">
+      ${m === 'signup' ? `<label class="fld"><span>Username</span><input name="username" required maxlength="30" value="${esc(profile?.username || '')}" autocomplete="nickname"></label>` : ''}
+      <label class="fld"><span>Email</span><input name="email" type="email" required autocomplete="email"></label>
+      <label class="fld"><span>Password</span><span class="pw"><input name="password" type="password" required minlength="8" autocomplete="${m === 'signup' ? 'new-password' : 'current-password'}"><button type="button" class="ib sm" data-pw aria-label="Show password">${icon('eye')}</button></span></label>
+      ${m === 'signup' ? '<p class="tiny muted">At least 8 characters. We\'ll send you an email to verify your address.</p>' : '<button type="button" class="lnk tiny forgot" data-mode="forgot">Forgot password?</button>'}
+      <p class="err-text auth-err" hidden></p>
+      <button class="btn primary big">${m === 'signup' ? 'Create account' : 'Log in'}</button>
+      </form>
+      <div class="or"><span>or</span></div>
+      <div class="sso-row">${brandBtn('google', 'Google')}${brandBtn('discord', 'Discord')}</div>`}
+  </div>`;
+  await modal(`<div class="auth-wrap">${html(mode)}</div>`, {
+    ownForms: true,
+    onMount: (m, close) => {
+      const wrap = m.querySelector('.auth-wrap');
+      let sentTo = '';
+      const show = md => { wrap.innerHTML = html(md); if (md === 'sent') wrap.querySelector('.sent-to').textContent = sentTo; wire(); wrap.querySelector('input')?.focus(); };
+      const fail = (f, msg, extra = '') => { const e = f.querySelector('.auth-err'); if (e) { e.hidden = false; e.innerHTML = esc(msg) + extra; } };
+      const wire = () => {
+        wrap.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => show(b.dataset.mode));
+        wrap.querySelectorAll('[data-act="sso"]').forEach(b => b.onclick = e => { e.stopPropagation(); startProvider(b.dataset.p); });
+        wrap.querySelectorAll('[data-pw]').forEach(b => b.onclick = () => { const i = b.previousElementSibling; i.type = i.type === 'password' ? 'text' : 'password'; });
+        const rs = wrap.querySelector('[data-resend]');
+        if (rs) rs.onclick = async () => {
+          if (Date.now() < cooldown) return toast('Please wait a minute before resending', 'err');
+          try { await cloud.resendVerification(sentTo); cooldown = Date.now() + 60e3; toast('Verification email sent again ✓', 'ok'); } catch (e) { toast(e.message, 'err'); }
+        };
+        const f = wrap.querySelector('form'); if (!f) return;
+        f.onsubmit = async e => {
+          e.preventDefault(); e.stopPropagation();
+          const fd = Object.fromEntries(new FormData(f));
+          const btn = f.querySelector('button.primary'); btn.disabled = true;
+          try { localStorage.setItem('bz_terms_ok', TERMS_VERSION); } catch { }
+          try {
+            if (f.dataset.form === 'signup') {
+              sentTo = fd.email.trim();
+              const r = await cloud.signUp(sentTo, fd.password, fd.username.trim());
+              if (r.needsVerify) { show('sent'); return; }
+              close(); finishLogin();
+            } else if (f.dataset.form === 'login') {
+              await cloud.signInWithPassword(fd.email.trim(), fd.password);
+              close(); finishLogin();
+            } else if (f.dataset.form === 'forgot') {
+              await cloud.sendPasswordReset(fd.email.trim());
+              wrap.innerHTML = `<div class="auth-sent">${icon('mail')}<h3>Check your inbox</h3><p class="muted">If an account exists for that email, a password reset link is on its way.</p><button class="btn block" data-close>Done</button></div>`;
+            }
+          } catch (err) {
+            btn.disabled = false;
+            if (err.code === 'email_not_confirmed' || /verify your email/.test(err.message)) {
+              sentTo = fd.email.trim();
+              fail(f, err.message, ' <button type="button" class="lnk" data-resend-now>Resend verification email</button>');
+              f.querySelector('[data-resend-now]').onclick = async () => { try { await cloud.resendVerification(sentTo); toast('Verification email sent ✓', 'ok'); } catch (e2) { toast(e2.message, 'err'); } };
+            } else fail(f, err.message);
+          }
+        };
+      };
+      wire();
+    }
+  });
+}
+async function finishLogin() {
+  if (!profile) { profile = await profileFromAccount(); await showApp(); }
+  else { if (!profile.termsAccepted) { profile.termsAccepted = TERMS_VERSION; await kv.set('profile', profile); } renderProfileChip(); }
+  await afterSignIn('signin');
+  route();
+}
+async function setNewPassword() {
+  const r = await modal(`<h3>${icon('shield')} Choose a new password</h3><form>
+    <label class="fld"><span>New password</span><input name="pw" type="password" minlength="8" required autocomplete="new-password"></label>
+    <label class="fld"><span>Repeat new password</span><input name="pw2" type="password" minlength="8" required autocomplete="new-password"></label>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Later</button><button class="btn primary">Save password</button></div></form>`);
+  if (!r) return;
+  if (r.pw !== r.pw2) { toast('Passwords didn\'t match — try again', 'err'); return setNewPassword(); }
+  try { await cloud.updatePassword(r.pw); toast('Password updated ✓', 'ok'); } catch (e) { toast(e.message, 'err'); }
+}
+async function signOutFlow() {
+  const r = await modal(`<h3>Sign out?</h3><p class="muted">Your music stays safe in your account. What should happen on this device?</p>
+    <div class="pick-list">
+      <button class="pick wrap" data-resolve="keep">${cover('', '✓', 'sm')}<span><b>Keep my music here</b><small>Keep using BAZINGA! on this device without syncing</small></span></button>
+      <button class="pick wrap" data-resolve="wipe">${cover('', '✕', 'sm')}<span><b>Remove it from this device</b><small>Good for shared or borrowed devices</small></span></button>
+    </div>`);
+  if (!r) return;
+  await sync.syncNow().catch(() => { });
+  await cloud.signOut(); sync.stop();
+  if (r === 'wipe') return wipeDevice();
+  toast('Signed out — your music is still on this device'); route(); renderProfileChip();
+}
+async function wipeDevice() {
+  player.stopAll();
+  await db.destroy();
+  try { localStorage.clear(); sessionStorage.clear(); } catch { }
+  if ('caches' in window) for (const k of await caches.keys()) await caches.delete(k);
+  if (navigator.serviceWorker) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  location.replace(location.pathname);
+}
+async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('profile', profile); emit('dirty', 'profile'); renderProfileChip(); sync.pushProfile(); }
+
+function applySettings() {
+  ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
+  meta.setCountry(settings.country);
+  yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
+  store.setEnrich(settings.enrich !== false);
+  keepAwake();
+}
+
+// ---------- Keep the screen on while BAZINGA! is open ----------
+// Phones stop web music when they lock, so by default the screen stays awake while the app is open.
+// Uses the Screen Wake Lock API; on older iPhones (no Wake Lock) a tiny silent, muted video does the same job.
+let wakeLock = null, awakeVid = null;
+async function keepAwake() {
+  const want = settings.keepAwake !== false && !!profile && document.visibilityState === 'visible' && matchMedia('(pointer: coarse)').matches; // phones & tablets
+  if (!want) {
+    try { await wakeLock?.release(); } catch { } wakeLock = null;
+    awakeVid?.pause();
+    return;
+  }
+  if ('wakeLock' in navigator) {
+    if (wakeLock && !wakeLock.released) return;
+    try { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener?.('release', () => { wakeLock = null; }); } catch { wakeLock = null; }
+    return;
+  }
+  if (!awakeVid) {
+    awakeVid = document.createElement('video');
+    Object.assign(awakeVid, { muted: true, loop: true, playsInline: true, src: 'media/awake.mp4' });
+    awakeVid.setAttribute('playsinline', ''); awakeVid.setAttribute('muted', ''); awakeVid.setAttribute('aria-hidden', 'true');
+    awakeVid.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;left:0;top:0';
+    document.body.appendChild(awakeVid);
+  }
+  awakeVid.play().catch(() => { });
+}
+document.addEventListener('visibilitychange', () => keepAwake());
+// Some browsers only grant it after a tap — try again on the first touches until it holds
+['pointerdown', 'keydown'].forEach(ev => document.addEventListener(ev, () => { if (settings.keepAwake !== false && profile && !(wakeLock && !wakeLock.released) && !(awakeVid && !awakeVid.paused)) keepAwake(); }, { passive: true }));
+async function saveSettings(patch) { settings = { ...settings, ...patch }; await kv.set('settings', settings); applySettings(); emit('dirty', 'settings'); }
+
+async function termsGate() {
+  while (profile.termsAccepted !== TERMS_VERSION) {
+    const r = await modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3>
+      <p class="muted tiny">${profile.termsAccepted ? 'Our terms have been updated. ' : ''}Please read and accept to keep using BAZINGA!.</p>
+      <div class="legal-box">${LEGAL_HTML}</div>
+      <form><label class="agree"><input type="checkbox" name="ok" required><span>I have read and agree to the Privacy Policy and Terms of Use, and I understand BAZINGA! is provided as-is with no liability.</span></label>
+      <div class="modal-actions"><button type="button" class="btn ghost" data-resolve="no">Decline</button><button class="btn primary">Accept</button></div></form>`, { wide: true, locked: true });
+    if (r && r.ok) { profile.termsAccepted = TERMS_VERSION; profile.termsAcceptedAt = new Date().toISOString(); await kv.set('profile', profile); emit('dirty', 'terms'); }
+    else if (r === 'no') await modal(`<h3>You need to accept to use BAZINGA!</h3><p class="muted">If you don't agree, you can delete your account and all its data from this device.</p>
+      <div class="modal-actions"><button class="btn danger" data-resolve="del">Delete my data</button><button class="btn primary" data-resolve="back">Go back</button></div>`, { locked: true })
+      .then(x => x === 'del' && deleteAccount());
+  }
+}
+
+// ---------- Remember where you were (refresh / reopening the app lands on the same spot) ----------
+const SPOT_KEY = 'bz_spot';
+function saveSpot() {
+  if (!profile || $('#app').hidden) return;
+  try { localStorage.setItem(SPOT_KEY, JSON.stringify({ h: location.hash || '#/home', y: $('#main')?.scrollTop || 0, np: document.body.classList.contains('np-open'), q: lastSearch.q, tab: lastSearch.tab, ts: Date.now() })); } catch { }
+}
+function readSpot() { try { return JSON.parse(localStorage.getItem(SPOT_KEY) || 'null'); } catch { return null; } }
+let restoreSpot = null;
+function planRestore() {
+  const sp = readSpot();
+  if (!sp || Date.now() - sp.ts > 7 * 864e5) return;
+  if (sp.q) lastSearch.q = sp.q;
+  if (sp.tab) lastSearch.tab = sp.tab;
+  const h = location.hash;
+  // Installed apps always reopen at the start page, and some sign-in redirects drop the page — go back to where you were
+  if ((!h || h === '#' || h === '#/' || h === '#/home') && sp.h && sp.h !== '#/home' && !/^#\/s\//.test(sp.h)) history.replaceState(null, '', location.pathname + location.search + sp.h);
+  if ((location.hash || '#/home') === sp.h) restoreSpot = sp;
+}
+const saveSpotSoon = debounce(saveSpot, 300);
+window.addEventListener('pagehide', saveSpot);
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveSpot(); });
+
+async function showApp() {
+  await termsGate();
+  planRestore();
+  $('#onboarding').hidden = true;
+  $('#app').hidden = false;
+  $$('.ni').forEach(el => { const n = [...el.classList].find(c => c.startsWith('ni-')).slice(3); el.outerHTML = icon(n); });
+  $('#main').addEventListener('scroll', saveSpotSoon, { passive: true });
+  wireToTop();
+  setTimeout(() => maybeInstallPrompt(), 25000);
+  renderProfileChip(); renderSidebarPlaylists(); renderPlayer();
+  initVoice({
+    go: h => { location.hash = h; }, back: () => goBack(),
+    search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
+    openNP: () => openNP(), closeNP: () => closeNP(), lyrics: on => setLyrics(on), toast
+  });
+  route();
+  try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
+  setVoicePrefs({ name: settings.voiceName || '' });
+  if (settings.wake && wakeSupported) setWake(true);
+  loadP2();
+  if (navigator.storage?.persist) navigator.storage.persist();
+}
+
+// ---------- Floating "back to top" (shows while you scroll far down, hides when you stop) ----------
+function wireToTop() {
+  const main = $('#main'), btn = $('#to-top');
+  let idle = null, lastY = 0;
+  const hide = () => btn.classList.remove('show');
+  main.addEventListener('scroll', () => {
+    const y = main.scrollTop;
+    const far = y > Math.max(700, innerHeight * 1.2);
+    btn.classList.toggle('show', far);
+    lastY = y;
+  }, { passive: true });
+  btn.onclick = () => { main.scrollTo({ top: 0, behavior: 'smooth' }); hide(); };
+}
+
+// ---------- "Add to Home Screen" ----------
+// Chrome/Edge/Samsung/Brave on Android & desktop give us a real install button; iPhone/iPad
+// (Safari, and Chrome/Edge/Firefox there) and Firefox on Android get short step-by-step instructions.
+let installEvt = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; });
+window.addEventListener('appinstalled', () => { installEvt = null; kv.set('a2hs', { done: true }); toast('BAZINGA! is on your Home Screen ⚡', 'ok'); });
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+async function maybeInstallPrompt(force = false) {
+  if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
+  const st = (await kv.get('a2hs')) || {};
+  if (!force) {
+    if (st.done || Date.now() < (st.snooze || 0)) return;
+    const touch = matchMedia('(pointer: coarse)').matches;
+    if (!touch && !installEvt) return;                       // desktops only when the browser can install
+    if ($('.modal-wrap') || document.body.classList.contains('np-open') || $('#voice.on')) return;
+  }
+  const ios = isIOS(), ua = navigator.userAgent;
+  const shareIc = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>';
+  const dots = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="19" r="1.8" fill="currentColor"/></svg>';
+  const steps = installEvt ? '' : ios ? `<ol class="a2-steps"><li>Tap the <b>Share</b> button <span class="a2-ic">${shareIc}</span> ${/CriOS|FxiOS|EdgiOS/.test(ua) ? '(top or bottom of the screen)' : 'in the toolbar'}.</li><li>Scroll and tap <b>Add to Home Screen</b> <span class="a2-ic">${icon('plus')}</span>.</li><li>Tap <b>Add</b>. Done — BAZINGA! opens like an app.</li></ol>`
+    : /Firefox/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install</b> (or <b>Add to Home screen</b>).</li></ol>`
+    : /SamsungBrowser/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">≡</span>.</li><li>Tap <b>Add page to</b> → <b>Home screen</b>.</li></ol>`
+    : `<ol class="a2-steps"><li>Open your browser menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install app</b> or <b>Add to Home screen</b>.</li></ol>`;
+  const r = await modal(`<div class="a2hs">
+      <div class="a2-icon"><img src="icons/app-192.png" alt="BAZINGA! app icon" width="96" height="96"></div>
+      <h3>Add BAZINGA! to your Home Screen</h3>
+      <p class="muted">One tap away, full screen like a real app, and music keeps going better in the background.</p>
+      ${steps}
+      <div class="modal-actions center">${installEvt ? `<button class="btn ghost" data-resolve="later">Not now</button><button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : `<button class="btn ghost" data-resolve="never">Don't show again</button><button class="btn primary" data-resolve="later">Got it</button>`}</div>
+    </div>`);
+  if (r === 'install' && installEvt) {
+    installEvt.prompt();
+    try { const c = await installEvt.userChoice; if (c.outcome === 'accepted') st.done = true; else st.snooze = Date.now() + 14 * 864e5; } catch { }
+    installEvt = null;
+  } else if (r === 'never') st.done = true;
+  else st.snooze = Date.now() + 10 * 864e5;
+  kv.set('a2hs', st);
+}
+
+// ================= ONBOARDING =================
+function onboarding() {
+  $('#app').hidden = true;
+  const ob = $('#onboarding'); ob.hidden = false;
+  let pic = '';
+  ob.innerHTML = `<div class="ob-card">
+    <div class="ob-brand"><span class="logo-mark big"><img src="icons/icon-512.png" class="ob-logo" alt=""></span><h1 class="wordmark">BAZINGA!</h1></div>
+    <p class="muted">Your Spotify library, turned into YouTube music videos & audio — with a full player, albums, offline files and backups.</p>
+    <label class="agree ob-terms"><input type="checkbox" id="ob-terms"><span>I agree to the <a class="lnk" href="#" id="ob-legal">Privacy Policy & Terms of Use</a>. BAZINGA! is provided as-is and isn't liable for anything.</span></label>
+    ${cloud.configured() ? `<div class="ob-acct">
+      <div class="ob-h">${icon('cloud')}<div><b>Sync across all your devices</b><small>Free account · log in or sign up</small></div></div>
+      ${ssoButtons()}
+    </div>
+    <div class="or"><span>or use without an account</span></div>` : ''}
+    <form id="ob-form">
+      <label class="ob-pic" title="Add a profile picture">
+        <input type="file" accept="image/*" id="ob-file" hidden>
+        <div class="avatar xl" id="ob-avatar">${icon('user')}</div>
+        <span>Add photo</span>
+      </label>
+      <label class="fld"><span>Pick a username</span><input name="username" required maxlength="30" autocomplete="nickname" placeholder="e.g. thunderkid"></label>
+      <button class="btn primary big">Let's go ${icon('play')}</button>
+      <p class="tiny muted">No email, no password. Just a name and a picture, saved only on this device. You can create an account later to sync, or delete everything any time in Settings.</p>
+    </form>
+    <button class="btn ghost" id="ob-restore">${icon('restore')}Restore from a backup file</button>
+    <p class="copyright">© 2026 Abbel Dawit · BAZINGA!</p>
+  </div>`;
+  $('#ob-legal').onclick = e => { e.preventDefault(); showLegal(); };
+  $$('#onboarding [data-act="sso"]').forEach(b => b.onclick = e => {
+    e.preventDefault(); e.stopPropagation();
+    if (!$('#ob-terms').checked) { $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600); return toast('Please accept the Privacy Policy & Terms first', 'err'); }
+    if (b.dataset.p === 'email') openAuth('signup'); else startProvider(b.dataset.p);
+  });
+  $('#ob-file').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    pic = await imageToDataURL(f, 256);
+    $('#ob-avatar').innerHTML = `<img src="${pic}" alt="">`;
+  };
+  $('#ob-form').onsubmit = async e => {
+    e.preventDefault();
+    const username = new FormData(e.target).get('username').trim();
+    if (!username) return;
+    if (!$('#ob-terms').checked) { $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600); return toast('Please accept the Privacy Policy & Terms first', 'err'); }
+    profile = { username, picture: pic, createdAt: Date.now(), termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
+    await kv.set('profile', profile);
+    emit('dirty', 'profile');
+    location.hash = '#/home';
+    showApp();
+  };
+  $('#ob-restore').onclick = () => pickFile('.json,application/json', async f => {
+    try { await backup.restoreFromFile(f); location.reload(); } catch (err) { toast(err.message, 'err'); }
+  });
+}
+
+// ================= ROUTER =================
+window.addEventListener('hashchange', () => profile && profile.termsAccepted === TERMS_VERSION && route());
+const showLegal = () => modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3><div class="legal-box">${LEGAL_HTML}</div>`, { wide: true });
+// Browser tab title: "BAZINGA! - <page>"
+const setTitle = x => { document.title = 'BAZINGA! - ' + (x || APP_TAGLINE); };
+const TITLES = { home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
+const LIB_TABS = { songs: 'Songs', liked: 'Liked Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
+// Where "Back" goes when there's no in-app history (e.g. a shared link opened directly)
+const BACK_TO = { artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
+const navStack = [];
+function goBack() {
+  const name = (location.hash.replace(/^#\/?/, '').split('/')[0]);
+  if (navStack.length > 1) history.back();
+  else location.hash = (BACK_TO[name] || ['#/home'])[0];
+}
+
+async function route() {
+  const my = ++routeToken;
+  const full = location.hash || '#/home';
+  if (navStack[navStack.length - 2] === full) navStack.pop(); else if (navStack[navStack.length - 1] !== full) navStack.push(full);
+  if (navStack.length > 50) navStack.shift();
+  const h = location.hash.replace(/^#\/?/, '') || 'home';
+  const [name, ...rest] = h.split('/');
+  setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'songs'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
+  const arg = rest.map(decodeURIComponent);
+  lists.clear(); sections.clear(); pagers.clear();
+  $$('.nav a, .tabbar a').forEach(a => a.classList.toggle('on', a.dataset.r === name || (name === 'import' && a.dataset.r === 'settings')));
+  if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
+  $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
+  closeQueueOnMobile();
+  const v = view();
+  v.scrollTop = 0; $('#main').scrollTop = 0;
+  const routes = { home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
+  const fn = routes[name] || vHome;
+  v.innerHTML = loader();
+  // Back button on detail pages (artist, album, playlist, genre, shared, …) — added as soon as the
+  // page appears, not after slow lookups finish
+  const addBack = () => {
+    const page = v.querySelector('.page');
+    if (my !== routeToken || !page || !BACK_TO[name] || page.querySelector('.backbtn')) return;
+    const prev = navStack[navStack.length - 2];
+    const label = prev ? backLabel(prev) : BACK_TO[name][1];
+    page.insertAdjacentHTML('afterbegin', `<button class="backbtn" data-act="go-back">${icon('back')}<span>${esc(label)}</span></button>`);
+  };
+  const run = (async () => fn(arg, my))();
+  addBack(); requestAnimationFrame(addBack);
+  try { await run; } catch (e) { console.error(e); if (my === routeToken) v.innerHTML = empty('Something went wrong', esc(e.message)); }
+  if (my !== routeToken) return;
+  addBack();
+  markNow();
+  // Coming back after a refresh: same scroll position, full-screen player open again if it was
+  if (restoreSpot) {
+    const sp = restoreSpot; restoreSpot = null;
+    const y = sp.y || 0;
+    if (y) { $('#main').scrollTop = y; setTimeout(() => { if ($('#main').scrollTop < y - 5) $('#main').scrollTop = y; }, 400); }
+    if (sp.np && player.current()) openNP();
+  }
+  saveSpotSoon();
+}
+function backLabel(hash) {
+  const [n, a] = hash.replace(/^#\/?/, '').split('/');
+  if (n === 'library') return LIB_TABS[a || 'songs'] || 'Library';
+  if (n === 'artist') return decodeURIComponent(a || 'Artist');
+  if (n === 'playlist') return lib.playlists.get(a)?.name || 'Playlist';
+  if (n === 'album') return 'Album';
+  if (n === 'genre') return decodeURIComponent(a || 'Genre');
+  return TITLES[n] === APP_TAGLINE ? 'Home' : (TITLES[n] || 'Back');
+}
+const stale = my => my !== routeToken;
+const rerender = debounce(() => {
+  // Re-render the current view softly when library changes (keeps scroll)
+  const sc = $('#main').scrollTop;
+  route().then(() => { $('#main').scrollTop = sc; });
+}, 250);
+
+// ================= TRACK LIST SECTIONS =================
+const PAGE = 150;
+function tracksSection(key, tracks, opts = {}) {
+  sections.set(key, { tracks, opts });
+  fstate[key] = fstate[key] || { sort: opts.defaultSort ?? 'added', open: false };
+  return `<div class="tsec" data-tsec="${key}">${tracksSectionInner(key)}</div>`;
+}
+function tracksSectionInner(key) {
+  const { tracks, opts } = sections.get(key);
+  const f = fstate[key];
+  const shown = opts.noFilter ? tracks : applyFilters(tracks, f);
+  lists.set(key, shown.map(t => t.id));
+  const cur = player.current()?.id;
+  const head = opts.noFilter ? '' : filterBar(f, tracks, { keepOrder: opts.keepOrder, likedSort: opts.likedSort });
+  const count = !opts.noFilter && shown.length !== tracks.length ? `<div class="muted tiny count">${shown.length} of ${tracks.length} songs</div>` : '';
+  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered }, cur)).join('');
+  const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
+  return head + count + `<div class="rows">${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
+}
+function refreshSection(key, keepFocus) {
+  const el = $(`[data-tsec="${key}"]`); if (!el) return;
+  const active = document.activeElement?.dataset?.f;
+  const pos = document.activeElement?.selectionStart;
+  el.innerHTML = tracksSectionInner(key);
+  markNow();
+  if (keepFocus && active) { const i = el.querySelector(`[data-f="${active}"]`); i?.focus(); try { i.setSelectionRange(pos, pos); } catch { } }
+  observeMore();
+}
+const moreObs = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    const el = e.target, key = el.dataset.more, at = +el.dataset.at;
+    const ids = lists.get(key) || [];
+    const rowsEl = el.previousElementSibling;
+    const cur = player.current()?.id;
+    const { opts } = sections.get(key) || { opts: {} };
+    rowsEl.insertAdjacentHTML('beforeend', ids.slice(at, at + PAGE).map((id, j) => trackRow(lib.tracks.get(id), at + j, { list: key, playlistId: opts.playlistId }, cur)).join(''));
+    if (at + PAGE >= ids.length) { moreObs.unobserve(el); el.remove(); } else el.dataset.at = at + PAGE;
+    markNow();
+  }
+}, { rootMargin: '600px' });
+function observeMore() { $$('[data-more]').forEach(el => moreObs.observe(el)); }
+
+// ================= VIEWS =================
+function header(title, sub = '', art = '', actions = '', kind = '') {
+  return `<header class="hero ${art ? 'has-art' : ''}">
+    ${art ? `<div class="hero-art ${kind === 'artist' ? 'round' : ''}">${art}</div>` : ''}
+    <div class="hero-txt">${kind ? `<div class="kicker">${kind}</div>` : ''}<h1>${title}</h1>${sub ? `<div class="hero-sub">${sub}</div>` : ''}</div>
+  </header>${actions ? `<div class="actions">${actions}</div>` : ''}`;
+}
+const playBtns = (act, id = '') => `<button class="btn primary round-play" data-act="${act}" data-id="${esc(id)}" aria-label="Play">${icon('play')}</button>
+  <button class="ib lg" data-act="${act}" data-id="${esc(id)}" data-shuffle="1" aria-label="Shuffle play" title="Shuffle">${icon('shuffle')}</button>
+  <button class="ib lg" data-act="${act}" data-id="${esc(id)}" data-queue="1" aria-label="Add all to queue" title="Add to queue">${icon('queue')}</button>`;
+
+// ---------- HOME ----------
+async function vHome(_, my) {
+  const all = store.saved();
+  const hr = new Date().getHours();
+  const greet = hr < 5 ? 'Late night vibes' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+  if (!all.length) {
+    view().innerHTML = `<div class="page home">
+      <section class="home-hero empty-hero"><div class="hh-bg"></div><div class="hh-txt"><div class="kicker">BAZINGA!</div><h1>${greet}, ${esc(profile.username)}</h1>
+        <p>Bring in your Spotify, Apple Music or YouTube favourites and play them as music videos or audio.</p>
+        <div class="row-btns"><a class="btn primary" href="#/import">${icon('import')}Import music</a><a class="btn" href="#/search">${icon('search')}Search</a><button class="btn" data-act="voice">${icon('mic')}Ask BAZINGA!</button></div>
+        <p class="tiny muted hh-note">You can import any time from Settings → Import music.</p></div></section></div>`;
+    return;
+  }
+  const liked = all.filter(t => t.liked);
+  const recent = [...all].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 12);
+  // Top playlists: the ones you play most, then the newest
+  const plays = (await kv.get('plPlays')) || {};
+  if (stale(my)) return;
+  const pls = [...lib.playlists.values()].sort((a, b) => ((plays[b.id]?.n || 0) - (plays[a.id]?.n || 0)) || ((plays[b.id]?.at || 0) - (plays[a.id]?.at || 0)) || ((b.createdAt || 0) - (a.createdAt || 0)));
+  const albums = [...lib.albums.values()].sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  const arts = store.artists().sort((a, b) => b.count - a.count).slice(0, 14);
+  const gens = store.genres().slice(0, 10);
+  const cur = player.current();
+  const heroArt = cur?.artwork || liked.find(t => t.artwork)?.artwork || all.find(t => t.artwork)?.artwork || '';
+  const collage = [...new Set([cur, ...liked, ...recent].filter(t => t?.artwork).map(t => t.artwork))].slice(0, 4);
+  lists.set('recent', recent.map(t => t.id));
+  if (cur) lists.set('cont', [cur.id]);
+  view().innerHTML = `<div class="page home">
+    <section class="home-hero">
+      <div class="hh-bg" ${heroArt ? `style="background-image:url('${esc(sized(heroArt, 300))}')"` : ''}></div>
+      <div class="hh-txt">
+        <div class="kicker">${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</div>
+        <h1>${greet}, ${esc(profile.username)}</h1>
+        <p>${all.length} songs · ${lib.playlists.size} playlists · ${store.artists().length} artists</p>
+        <div class="row-btns">
+          ${liked.length ? `<button class="btn primary" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
+          <button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>
+          <button class="btn glass" data-act="voice">${icon('mic')}Ask BAZINGA!</button>
+        </div>
+      </div>
+      ${collage.length >= 2 ? `<div class="hh-collage">${collage.map((src, i) => `<img src="${esc(sized(src, 300))}" alt="" style="--i:${i}" loading="lazy">`).join('')}</div>` : ''}
+    </section>
+    ${cur ? `<section class="jump" id="jump">${jumpInner(cur)}</section>` : ''}
+    <section class="home-pls"><div class="sec-h"><h2>Your playlists</h2><a href="#/library/playlists" class="lnk">See all</a></div>
+      <div class="pl-grid">
+        <a class="card" href="#/library/liked"><div class="card-art">${likedCover()}<button class="fab-play" data-act="play-list" data-id="home-liked" aria-label="Play Liked Songs">${icon('play')}</button></div><div class="card-t">Liked Songs</div><div class="card-s">${liked.length} songs</div></a>
+        ${pls.slice(0, 5).map(p => card({ href: `#/playlist/${p.id}`, img: plCover(p), title: p.name, sub: `${p.trackIds.length} songs`, act: 'play-playlist', id: p.id })).join('')}
+        ${!pls.length ? `<button class="card card-new" data-act="new-playlist"><div class="card-art"><div class="cover noimg new-pl">${icon('plus')}</div></div><div class="card-t">New playlist</div><div class="card-s">Make your own mix</div></button>` : ''}
+      </div></section>
+    <section id="new-releases" class="shelf-sec"></section>
+    <section class="home-recent"><div class="sec-h"><h2>Recently added</h2><a href="#/library/songs" class="lnk">See all</a></div>
+      <div class="rows two">${recent.map((t, i) => trackRow(t, i, { list: 'recent' })).join('')}</div></section>
+    <section class="shelf-sec"><div class="sec-h"><h2>Your artists</h2><a href="#/library/artists" class="lnk">See all</a></div>
+      <div class="shelf">${arts.map(a => artistCard(a.name, a.artwork, `${a.count} song${a.count > 1 ? 's' : ''}`)).join('')}</div></section>
+    ${gens.length ? `<section><div class="sec-h"><h2>Your genres</h2></div><div class="genre-tiles">${gens.map(([g, n]) => `<a class="gt" href="#/genre/${encodeURIComponent(g)}" style="--c:${genreColor(g)}"><b>${esc(g)}</b><small>${n} songs</small></a>`).join('')}</div></section>` : ''}
+    ${albums.length ? `<section class="shelf-sec"><div class="sec-h"><h2>Your albums</h2><a href="#/library/albums" class="lnk">See all</a></div><div class="shelf">${albums.slice(0, 14).map(albumCard).join('')}</div></section>` : ''}
+  </div>`;
+  lists.set('home-liked', liked.sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id));
+  lists.set('home-all', all.map(t => t.id));
+  fillArtistPics();
+  newReleases(my);
+}
+
+// "Jump back in" — kept in sync with the player instantly (no page reload)
+const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
+const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
+  <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
+function updateJump() {
+  const box = $('#jump'); if (!box) return;
+  const t = player.current(); if (!t) return;
+  const art = box.querySelector('.jump-art');
+  if (art?.dataset.jid !== t.id || (t.artwork && !art.querySelector('img'))) { box.innerHTML = jumpInner(t); return; }
+  const b = $('#jump-toggle'), on = player.isOn() ? '1' : '0';
+  if (b && b.dataset.on !== on) { b.dataset.on = on; b.innerHTML = jumpBtn(on === '1'); }
+}
+
+// "New from your artists": latest releases by the artists you listen to most.
+// Cached for 12 hours; uses only a handful of lookups, paced by the rate limiter.
+async function newReleases(my) {
+  const box = $('#new-releases'); if (!box) return;
+  const head = `<div class="sec-h"><h2>New from your top artists</h2></div>`;
+  const render = items => {
+    if (stale(my) || !$('#new-releases')) return;
+    if (!items.length) { box.innerHTML = ''; return; }
+    box.innerHTML = head + `<div class="shelf">${items.map(a => {
+      const days = a.releaseDate ? Math.round((Date.now() - Date.parse(a.releaseDate)) / 864e5) : 999;
+      const when = days < 0 ? 'Coming soon' : days < 1 ? 'Today' : days < 7 ? `${days} day${days > 1 ? 's' : ''} ago` : days < 60 ? `${Math.round(days / 7)} weeks ago` : (a.year || '');
+      return `<a class="card" href="#/album/it/${a.itunesAlbumId}"><div class="card-art">${cover(a.artwork, a.title)}${days <= 30 ? '<span class="new-badge">NEW</span>' : ''}<button class="fab-play" data-act="play-it-album" data-id="${a.itunesAlbumId}" aria-label="Play">${icon('play')}</button></div>
+        <div class="card-t">${esc(a.title.replace(/ - (Single|EP)$/, ''))}</div><div class="card-s">${esc(a.artist)} · ${/ - Single$/.test(a.title) ? 'Single' : / - EP$/.test(a.title) ? 'EP' : 'Album'} · ${when}</div></a>`;
+    }).join('')}</div>`;
+  };
+  // Your top artists = the ones with the most songs in your library, #1 first
+  const top = store.artists().sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 6);
+  const sig = 'v2|' + top.map(a => a.key).join('|');
+  const c = await kv.get('newReleases');
+  if (c?.items?.length && c.sig === sig) render(c.items);
+  if (c && c.sig === sig && Date.now() - c.ts < 12 * 36e5) return;
+  if (!navigator.onLine || !top.length) return;
+  if (!(c?.items?.length && c.sig === sig)) box.innerHTML = head + `<div class="shelf">${'<div class="card skel"><div class="card-art"><div class="cover"></div></div><div class="card-t"></div><div class="card-s"></div></div>'.repeat(6)}</div>`;
+  const have = new Set([...lib.albums.values()].map(a => a.itunesAlbumId));
+  const yearAgo = new Date(Date.now() - 365 * 864e5).toISOString().slice(0, 10);
+  const byRank = new Map(), seen = new Set();
+  // Newest releases of your #1 artist first, then #2, … (fresh ones from the last year preferred)
+  const pickItems = () => {
+    const out = [];
+    for (let r = 0; r < top.length; r++) {
+      const rel = (byRank.get(r) || []).filter(a => a.itunesAlbumId && !have.has(a.itunesAlbumId)).sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
+      const fresh = rel.filter(a => (a.releaseDate || '') >= yearAgo);
+      out.push(...(fresh.length ? fresh.slice(0, r === 0 ? 5 : 3) : rel.slice(0, r === 0 ? 2 : 1)));
+    }
+    return out.slice(0, 16);
+  };
+  let shown = !!(c?.items?.length && c.sig === sig);
+  const take = async (a, rank) => {
+    try {
+      const id = a.itunesArtistId || await meta.findArtistId(a.name);
+      if (!id) return;
+      const rel = [];
+      for (const al of await meta.artistLatest(id)) if (!seen.has(al.itunesAlbumId)) { seen.add(al.itunesAlbumId); rel.push(al); }
+      byRank.set(rank, rel);
+      if (!shown && rank === 0) { const items = pickItems(); if (items.length) { render(items); shown = true; } }
+    } catch { }
+  };
+  await Promise.all(top.map(take));
+  const items = pickItems();
+  await kv.set('newReleases', { ts: Date.now(), sig, items });
+  render(items);
+}
+
+// Artist card with a real artist photo (loaded lazily from Deezer, cached on the device)
+// Artist photo block: shows the remembered photo straight away; otherwise the library cover until
+// the photo is found (then it's swapped in only once fully loaded, so nothing flashes).
+function apic(name, fallback, cls, wrapCls = '') {
+  const pic = meta.artistPictureNow(name);
+  if (pic) return `<div class="${wrapCls}">${cover(pic, name, cls)}</div>`;
+  return `<div class="${wrapCls}" data-apic="${esc(name)}" data-cls="${esc(cls)}">${cover(fallback, name, cls)}</div>`;
+}
+function swapPic(el, pic) {
+  if (!pic || !el.isConnected) return;
+  const img = new Image(); img.decoding = 'async';
+  const px = /hero/.test(el.dataset.cls || '') ? 600 : /\bsm\b/.test(el.dataset.cls || '') ? 64 : 200;
+  img.src = sized(pic, px);
+  const put = () => { if (el.isConnected) { el.innerHTML = cover(pic, el.dataset.apic, el.dataset.cls || 'round'); el.removeAttribute('data-apic'); } };
+  (img.decode ? img.decode() : Promise.resolve()).then(put, put);
+}
+function artistCard(name, fallback, sub) {
+  return `<a class="card" href="#/artist/${encodeURIComponent(name)}">${apic(name, fallback, 'round', 'card-art round')}
+    <div class="card-t">${esc(name)}</div><div class="card-s">${esc(sub || '')}</div></a>`;
+}
+const apicObs = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    const el = e.target; apicObs.unobserve(el);
+    meta.artistPicture(el.dataset.apic).then(pic => swapPic(el, pic));
+  }
+}, { rootMargin: '600px' }) : null;
+function fillArtistPics(root = document) { if (apicObs) root.querySelectorAll('[data-apic]').forEach(el => apicObs.observe(el)); }
+
+function genreColor(g) { let h = 7; for (const c of g) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 42%)`; }
+const plCover = p => p.image || (p.trackIds.map(id => lib.tracks.get(id)?.artwork).find(Boolean) || '');
+const albumCard = a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: [a.year, a.artist].filter(Boolean).join(' · '), act: 'play-album', id: a.id });
+const albumHref = a => lib.albums.has(a.id) || !a.itunesAlbumId ? `#/album/${encodeURIComponent(a.id)}` : `#/album/it/${a.itunesAlbumId}`;
+
+// ---------- GENRE ----------
+async function vGenre([g]) {
+  const tracks = store.saved().filter(t => genreOf(t) === g);
+  view().innerHTML = `<div class="page">${header(esc(g), `${tracks.length} songs in your library`, '', playBtns('play-list', 'genre'), 'Genre')}
+    ${tracksSection('genre', tracks)}</div>`;
+  observeMore();
+}
+
+// ---------- LIBRARY ----------
+async function vLibrary([tab = 'songs']) {
+  const all = store.saved();
+  const tabs = [['songs', 'Songs', all.length], ['liked', 'Liked', all.filter(t => t.liked).length], ['playlists', 'Playlists', lib.playlists.size], ['albums', 'Albums', lib.albums.size + store.implicitAlbums().length], ['artists', 'Artists', store.artists().length]];
+  let body = '';
+  if (tab === 'songs' || tab === 'liked') {
+    const tracks = tab === 'liked' ? all.filter(t => t.liked) : all;
+    body = tracks.length ? `<div class="actions">${playBtns('play-list', tab)}${matchBtn(tab, tab === 'liked' ? 'Liked Songs (BAZINGA!)' : 'My BAZINGA! songs', 'lib:' + tab)}</div>${tracksSection(tab, tracks, tab === 'liked' ? { defaultSort: 'liked', likedSort: true } : {})}`
+      : empty(tab === 'liked' ? 'No liked songs yet' : 'No songs yet', 'Tap the heart on any song, or import your Spotify Liked Songs.', `<a class="btn primary" href="#/import">${icon('import')}Import</a>`);
+  } else if (tab === 'playlists') {
+    const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
+    body = `<div class="actions"><button class="btn" data-act="new-playlist">${icon('plus')}New playlist</button>${pls.length ? `<button class="btn yt-save" data-act="yt-backup">${icon('upload')}Save playlists to YouTube</button>` : ''}</div>
+      <div class="cards"><a class="card" href="#/library/liked"><div class="card-art">${likedCover()}<button class="fab-play" data-act="play-list" data-id="liked-all" aria-label="Play">${icon('play')}</button></div><div class="card-t">Liked Songs</div><div class="card-s">${all.filter(t => t.liked).length} songs</div></a>
+      ${pls.map(p => card({ href: `#/playlist/${p.id}`, img: plCover(p), title: p.name, sub: `${p.trackIds.length} songs${p.source ? ' · ' + p.source : ''}`, act: 'play-playlist', id: p.id })).join('')}</div>`;
+  } else if (tab === 'albums') {
+    const saved = [...lib.albums.values()].sort((a, b) => a.title.localeCompare(b.title));
+    const imp = store.implicitAlbums().sort((a, b) => b.trackIds.length - a.trackIds.length || a.title.localeCompare(b.title));
+    body = `<div class="actions"><a class="btn" href="#/search/albums">${icon('search')}Find albums</a></div>
+      ${saved.length ? `<h2>Saved albums</h2>${pagedGrid('alb-saved', saved.map(albumCard))}` : empty('No saved albums yet', 'Search any album, or open one from a song (⋯ → Go to album) and tap "Save album".')}
+      ${imp.length ? `<h2>From your songs</h2><p class="muted tiny">Albums you have songs from. Open one to see and save the full album.</p>${pagedGrid('alb-imp', imp.map(a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: `${a.artist} · ${a.trackIds.length} in library`, act: 'play-album', id: a.id })))}` : ''}`;
+  } else if (tab === 'artists') {
+    const arts = store.artists();
+    artistUI.limit = PAGE_N;
+    body = arts.length ? `<div class="art-tools">
+        <label class="searchbox sm art-search">${icon('search')}<input id="art-q" placeholder="Search your artists" value="${esc(artistUI.q)}" autocomplete="off" enterkeyhint="search"></label>
+        <div class="seg art-sort" role="group" aria-label="Sort artists"><button data-act="art-sort" data-v="count" class="${artistUI.sort === 'count' ? 'on' : ''}">Most songs</button><button data-act="art-sort" data-v="az" class="${artistUI.sort === 'az' ? 'on' : ''}">A–Z</button></div>
+      </div>
+      <div class="az">${[...new Set(arts.map(a => letterOf(a.name)))].sort((a, b) => a === '#' ? 1 : b === '#' ? -1 : a.localeCompare(b)).map(l => `<a href="#" data-act="az" data-l="${l}">${l}</a>`).join('')}</div>
+      <div class="artist-list" id="artist-list">${artistRows(arts)}</div>`
+      : empty('No artists yet', 'Artists from all your songs, playlists and albums show up here.');
+  }
+  lists.set('liked-all', all.filter(t => t.liked).sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id));
+  view().innerHTML = `<div class="page"><h1 class="page-h">Your Library</h1>
+    <div class="tabs">${tabs.map(([k, l, n]) => `<a href="#/library/${k}" class="tab ${tab === k ? 'on' : ''}" data-tab="${k}">${l}<small>${n}</small></a>`).join('')}</div>${body}</div>`;
+  observeMore();
+  fillArtistPics();
+  const aq = $('#art-q');
+  if (aq) aq.addEventListener('input', debounce(() => { artistUI.q = aq.value; artistUI.limit = PAGE_N; redrawArtists(); }, 120));
+}
+// ---------- Long lists load 100 at a time, with a quiet "Show more" at the bottom ----------
+const PAGE_N = 100;
+const pagers = new Map();
+function pagedGrid(key, items, cls = 'cards') {
+  pagers.set(key, { items, at: PAGE_N });
+  return `<div class="${cls}" data-pg="${key}">${items.slice(0, PAGE_N).join('')}</div>${moreBtn(key, items.length - PAGE_N)}`;
+}
+const moreBtn = (key, left) => left > 0 ? `<div class="more-wrap"><button class="more-btn" data-act="show-more" data-pg="${key}">Show more <small>${left} more</small></button></div>` : '';
+function showMore(key) {
+  const pg = pagers.get(key), grid = $(`[data-pg="${key}"]:not(button)`); if (!pg || !grid) return;
+  grid.insertAdjacentHTML('beforeend', pg.items.slice(pg.at, pg.at + PAGE_N).join(''));
+  pg.at += PAGE_N;
+  const wrap = grid.nextElementSibling;
+  if (wrap?.classList.contains('more-wrap')) wrap.outerHTML = moreBtn(key, pg.items.length - pg.at);
+  fillArtistPics(grid);
+}
+// ---------- Artists list: most songs first (or A–Z), with search ----------
+const artistUI = { sort: 'count', q: '', limit: PAGE_N };
+const letterOf = n => (n[0] || '#').toUpperCase().replace(/[^A-Z]/, '#');
+function artistRows(arts) {
+  const q = norm(artistUI.q);
+  let list = q ? arts.filter(a => norm(a.name).includes(q)) : arts;
+  list = artistUI.sort === 'az' ? [...list].sort((a, b) => a.name.localeCompare(b.name)) : [...list].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  if (!list.length) return `<p class="muted pad">No artists match "${esc(artistUI.q)}".</p>`;
+  const seen = new Set();
+  const left = list.length - artistUI.limit;
+  return list.slice(0, artistUI.limit).map(a => {
+    const L = letterOf(a.name), first = artistUI.sort === 'az' && !seen.has(L); seen.add(L);
+    return `<a class="artist-row" href="#/artist/${encodeURIComponent(a.name)}" ${first || artistUI.sort !== 'az' ? `data-letter="${L}"` : ''}>
+      ${apic(a.name, a.artwork, 'round sm')}<div><b>${esc(a.name)}</b><small>${a.count} song${a.count > 1 ? 's' : ''}${a.genres.size ? ' · ' + esc([...a.genres].slice(0, 2).join(', ')) : ''}</small></div>
+      <button class="ib art-play" data-act="play-artist" data-name="${esc(a.name)}" aria-label="Play ${esc(a.name)}">${icon('play')}</button></a>`;
+  }).join('') + (left > 0 ? `<div class="more-wrap span-all"><button class="more-btn" data-act="art-more">Show more <small>${left} more</small></button></div>` : '');
+}
+function redrawArtists() {
+  const el = $('#artist-list'); if (!el) return;
+  el.innerHTML = artistRows(store.artists());
+  $$('.art-sort button').forEach(b => b.classList.toggle('on', b.dataset.v === artistUI.sort));
+  fillArtistPics(el);
+}
+// On phones these two fold into a ⋯ menu so the action row stays on one line
+const matchBtn = (key, name = 'My BAZINGA! playlist', job = key) => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
+  <button class="btn yt-save" data-act="yt-export" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}">${icon('upload')}Save to YouTube</button></span>
+  <button class="ib lg yt-more" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" aria-label="More options" title="More">${icon('more')}</button>`;
+
+// ---------- PLAYLIST ----------
+async function vPlaylist([id]) {
+  const p = lib.playlists.get(id);
+  if (!p) { view().innerHTML = empty('Playlist not found', 'It may have been deleted.'); return; }
+  const tracks = p.trackIds.map(i => lib.tracks.get(i)).filter(Boolean);
+  setTitle(p.name);
+  const dur = tracks.reduce((s, t) => s + (t.durationMs || 0), 0);
+  fstate['pl'] = fstate['pl'] && fstate['pl']._id === id ? fstate['pl'] : { sort: '', open: false, _id: id };
+  view().innerHTML = `<div class="page">
+    ${header(esc(p.name), `${esc(profile.username)} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${p.source ? ' · from ' + esc(p.source) : ''}`, cover(plCover(p), p.name), '', 'Playlist')}
+    <div class="actions">${playBtns('play-list', 'pl')}
+      <button class="ib lg" data-act="share-playlist" data-id="${p.id}" title="Share">${icon('share')}</button>
+      <button class="ib lg" data-act="playlist-menu" data-id="${p.id}" title="More">${icon('more')}</button>
+      ${matchBtn('pl', p.name, p.id)}</div>
+    ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
+  </div>`;
+  observeMore();
+}
+
+// ---------- ALBUM ----------
+async function vAlbum(arg, my) {
+  let album, tracks, savedA = null, remote = null;
+  if (arg[0] === 'it') {
+    const res = await meta.albumTracks(arg[1]);
+    if (stale(my)) return;
+    if (!res.album) { view().innerHTML = empty('Album not found', ''); return; }
+    album = res.album; tracks = res.tracks;
+    savedA = lib.albums.get(album.id);
+  } else {
+    const id = arg[0];
+    savedA = lib.albums.get(id);
+    album = savedA || store.implicitAlbums().find(a => a.id === id);
+    if (!album) { view().innerHTML = empty('Album not found', ''); return; }
+    tracks = (album.trackIds || []).map(i => lib.tracks.get(i)).filter(Boolean);
+    if (!savedA && album.itunesAlbumId) { location.replace(`#/album/it/${album.itunesAlbumId}`); return; }
+    if (!savedA && navigator.onLine) {
+      // try to find the full album
+      try { remote = await meta.findAlbum(album.artist, album.title); } catch { }
+      if (stale(my)) return;
+      if (remote) { location.replace(`#/album/it/${remote.itunesAlbumId}`); return; }
+    }
+  }
+  // Use library versions of tracks where they exist (keeps likes, offline files, YouTube links)
+  tracks = tracks.map(t => lib.tracks.get(t.id) || store.remember(t));
+  const dur = tracks.reduce((s, t) => s + (t.durationMs || 0), 0);
+  const offlineN = tracks.filter(t => t.localFileId).length;
+  window.__album = { album, tracks };
+  setTitle(album.title);
+  const artistLink = `<a class="lnk" href="#/artist/${encodeURIComponent(mainArtist(album.artist))}">${esc(album.artist)}</a>`;
+  view().innerHTML = `<div class="page">
+    ${header(esc(album.title), `${artistLink} · ${album.year || ''} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${album.genre ? ' · ' + esc(album.genre) : ''}`, cover(album.artwork, album.title), '', 'Album')}
+    <div class="actions">${playBtns('play-list', 'album')}
+      ${savedA ? `<button class="btn" data-act="unsave-album" data-id="${esc(album.id)}">${icon('check')}Saved</button>` : `<button class="btn primary-o" data-act="save-album">${icon('plus')}Save album</button>`}
+      <button class="ib lg" data-act="share-album" title="Share">${icon('share')}</button>
+      <button class="btn ghost" data-act="album-offline">${icon('offline')}Offline files${offlineN ? ` (${offlineN}/${tracks.length})` : ''}</button>
+      ${matchBtn('album', `${album.title} — ${album.artist}`, 'album:' + album.id)}</div>
+    ${tracksSection('album', tracks, { noFilter: true, numbered: true })}
+    ${album.releaseDate ? `<p class="muted tiny pad">Released ${new Date(album.releaseDate).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</p>` : ''}
+  </div>`;
+}
+
+// ---------- ARTIST ----------
+async function vArtist([name], my) {
+  setTitle(name);
+  const n = norm(name);
+  const mine = store.saved().filter(t => (t.artists?.length ? t.artists : [mainArtist(t.artist)]).some(a => norm(a) === n) || norm(mainArtist(t.artist)) === n);
+  const a = store.artists().find(x => x.key === n);
+  view().innerHTML = `<div class="page">${header(esc(name), mine.length ? `${mine.length} song${mine.length === 1 ? '' : 's'} in your library` : 'Not in your library yet', apic(name, a?.artwork || mine[0]?.artwork, 'hero round'), '', 'artist')}
+    <div class="actions">${mine.length ? playBtns('play-list', 'artist-mine') : ''}</div>
+    ${mine.length ? `<h2>In your library</h2>${tracksSection('artist-mine', mine, { defaultSort: 'newest' })}`
+      : `<div class="panel artist-empty">${icon('heart')}<div><b>No songs by ${esc(name)} in your library yet</b><p class="muted tiny">Tap the ♡ on any song below to add it, or <a class="lnk" href="#/search" data-artist-search="${esc(name)}">search for more</a>.</p></div></div>`}
+    <div id="artist-top">${loader(mine.length ? 'Loading popular songs…' : `Finding the top songs by ${name}…`, 'sm')}</div>
+    <div id="artist-albums"></div></div>`;
+  // The big photo is fetched right now (ahead of anything else), not when it scrolls into view
+  const heroPic = view().querySelector('.page [data-apic][data-cls="hero round"]');
+  if (heroPic) meta.artistPicture(name, true).then(pic => swapPic(heroPic, pic));
+  observeMore(); fillArtistPics();
+  const $top = () => $('#artist-top'), $alb = () => $('#artist-albums');
+  let id = a?.itunesArtistId || mine.find(t => t.itunesArtistId && norm(mainArtist(t.artist)) === n)?.itunesArtistId;
+  const idP = id ? Promise.resolve(id) : meta.findArtistId(name).catch(() => null);
+  // Top 10: Apple first, Deezer if Apple is slow; never more than ~10 s of loading
+  const later = (ms, fn) => sleep(ms).then(fn).catch(() => []);
+  const topP = meta.withTimeout(meta.firstFull([idP.then(i => i ? meta.artistTopSongs(i) : []).catch(() => []), later(2000, () => meta.deezerArtistTop(name, 10))]), 10000, []);
+  topP.then(top => {
+    if (stale(my) || !$top()) return;
+    const topT = top.slice(0, 10).map(t => lib.tracks.get(t.id) || store.remember(t));
+    lists.set('artist-top', topT.map(t => t.id));
+    const cur = player.current()?.id;
+    $top().innerHTML = topT.length
+      ? `<div class="sec-h"><h2>${mine.length ? 'Popular songs' : `Top 10 songs by ${esc(name)}`}</h2><button class="btn sm ghost" data-act="play-list" data-id="artist-top">${icon('play')}Play all</button></div><div class="rows">${topT.map((t, i) => trackRow(t, i, { list: 'artist-top', numbered: true }, cur)).join('')}</div>`
+      : `<div class="pad"><p class="muted">${navigator.onLine ? 'Couldn\'t load songs by this artist right now.' : 'You\'re offline — songs by this artist will show when you\'re back online.'}</p>${navigator.onLine ? `<button class="btn" data-act="retry-route">${icon('restore')}Try again</button>` : ''}</div>`;
+    markNow();
+  });
+  // Albums (Apple only), loaded alongside
+  idP.then(async i => {
+    if (!i) return;
+    const albums = await meta.withTimeout(meta.artistAlbums(i).catch(() => []), 12000, []);
+    if (stale(my) || !$alb() || !albums.length) return;
+    $alb().innerHTML = `<h2>Discography</h2>${pagedGrid('artist-alb', albums.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: `${al.year || ''} · ${al.trackCount} songs` })))}`;
+  });
+  await Promise.race([topP, sleep(50)]);
+}
+
+// ---------- SEARCH ----------
+let lastSearch = { q: '', tab: 'all' };
+const SEARCH_TABS = [['all', 'All'], ['songs', 'Songs'], ['albums', 'Albums'], ['artists', 'Artists'], ['youtube', 'YouTube']];
+async function vSearch([tab = lastSearch.tab]) {
+  lastSearch.tab = tab;
+  view().innerHTML = `<div class="page"><h1 class="page-h">Search</h1>
+    <div class="search-row"><label class="searchbox big">${icon('search')}<input id="sq" placeholder="${tab === 'youtube' ? 'Search YouTube…' : 'Songs, albums, artists, YouTube…'}" value="${esc(lastSearch.q)}" autocomplete="off" enterkeyhint="search">
+      <button type="button" class="ib sb-clear" aria-label="Clear" ${lastSearch.q ? '' : 'hidden'}>${icon('close')}</button></label>
+      <button class="search-go" data-act="search-go" aria-label="Search" title="Search">${icon('search')}</button>
+      <button class="mic-btn ghosty" data-act="voice" aria-label="Search by voice" title="Ask BAZINGA!">${icon('mic')}</button></div>
+    <div class="tabs">${SEARCH_TABS.map(([k, l]) => `<a href="#/search/${k}" class="tab ${tab === k ? 'on' : ''}">${k === 'youtube' ? icon('yt') : ''}${l}</a>`).join('')}</div>
+    <div id="sres"></div></div>`;
+  const inp = $('#sq'), clr = $('.sb-clear');
+  const run = debounce(() => doSearch(inp.value.trim(), tab), 400);
+  inp.addEventListener('input', () => { clr.hidden = !inp.value; run(); });
+  const go = () => { run.cancel(); doSearch(inp.value.trim(), tab); inp.blur(); };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  $('.search-go').onclick = e => { e.preventDefault(); if (!inp.value.trim()) { inp.focus(); return; } go(); };
+  clr.onclick = () => { inp.value = ''; clr.hidden = true; doSearch('', tab); inp.focus(); };
+  if (innerWidth > 700) inp.focus();
+  if (lastSearch.q) doSearch(lastSearch.q, tab);
+  else $('#sres').innerHTML = searchHints(tab);
+}
+function searchHints(tab) {
+  const g = store.genres().slice(0, 12);
+  return `<p class="muted">${tab === 'youtube' ? 'Search all of YouTube — tap a result to play it, or use ⋯ to queue it, like it or add it to a playlist.' : 'Search the whole music catalogue and YouTube for songs, full albums and artists — play them as videos or audio and save albums to your library.'}</p>
+  ${g.length && tab !== 'youtube' ? `<h2>Browse your genres</h2><div class="genre-tiles">${g.map(([x, n]) => `<a class="gt" href="#/genre/${encodeURIComponent(x)}" style="--c:${genreColor(x)}"><b>${esc(x)}</b><small>${n} songs</small></a>`).join('')}</div>` : ''}`;
+}
+// Turn YouTube results into playable rows (each plays that exact video)
+async function ytResultsToTracks(results) {
+  const out = [];
+  for (const r of results.filter(r => r.id && (!r.seconds || r.seconds < 1800)).slice(0, 20)) {
+    const { artist, title } = yt.videoToSong(r);
+    const id = 'yt_' + r.id;
+    const t = lib.tracks.get(id) || store.remember({ id, title, artist, artists: [artist], artwork: yt.thumb(r.id), durationMs: (r.seconds || 0) * 1000, isVideo: true, ytTitle: r.title, enriched: true, coverTried: true, addedAt: Date.now() });
+    if (!(await db.get('ytcache', id))) await db.put('ytcache', { video: r.id, audio: r.id, videoTitle: r.title, audioTitle: r.title, fromSearch: true }, id);
+    out.push(t);
+  }
+  return out;
+}
+let searchSeq = 0;
+async function doSearch(q, tab) {
+  lastSearch.q = q;
+  const my = ++searchSeq;
+  const box = $('#sres'); if (!box) return;
+  if (!q) { box.innerHTML = searchHints(tab); return; }
+  const local = tab === 'youtube' ? [] : applyFilters(store.saved(), { q }).slice(0, 8);
+  box.innerHTML = `${local.length && tab !== 'albums' && tab !== 'artists' ? `<h2>In your library</h2>${rowsFor('s-local', local)}` : ''}<div id="s-main">${loader(tab === 'youtube' ? 'Searching YouTube…' : 'Searching…', 'search')}</div>${tab === 'all' ? '<div id="s-yt"></div>' : ''}`;
+  markNow();
+  if (!navigator.onLine) { $('#s-main').innerHTML = '<p class="muted">Offline — only your library is searchable.</p>'; return; }
+  const alive = () => my === searchSeq && $('#sres');
+  // YouTube results (own tab, or a section under the music results on "All")
+  const ytPart = async (target, limit) => {
+    if (q.length < 2) return;
+    try {
+      const res = await yt.rawSearch(q, { preferFree: true });
+      if (!alive()) return;
+      const tracks = (await ytResultsToTracks(res)).slice(0, limit);
+      const el = $(target); if (!el) return;
+      el.innerHTML = tracks.length ? `<div class="sec-h"><h2>${icon('yt')} From YouTube</h2>${tab === 'all' && tracks.length >= limit ? '<a class="lnk" href="#/search/youtube">See all</a>' : ''}</div>${rowsFor('s-yt-list', tracks)}` : (tab === 'youtube' ? '<p class="muted">No YouTube results.</p>' : '');
+      markNow();
+    } catch (e) { const el = $(target); if (el && alive()) el.innerHTML = tab === 'youtube' ? `<p class="muted">${esc(e.message)}</p>` : ''; }
+  };
+  if (tab === 'youtube') return ytPart('#s-main', 20);
+  if (tab === 'all') ytPart('#s-yt', 6);
+  try {
+    const want = t => tab === 'all' || tab === t;
+    // Apple's catalogue first; if it's slow, Deezer steps in. Nothing waits more than ~9 seconds.
+    const later = (ms, fn) => sleep(ms).then(fn).catch(() => []);
+    const songsP = want('songs') ? meta.firstFull([meta.searchSongs(q, tab === 'songs' ? 40 : 10).catch(() => []), later(1800, () => meta.deezerSearchSongs(q, tab === 'songs' ? 40 : 10))]) : [];
+    const artistsP = want('artists') ? meta.firstFull([meta.searchArtists(q, tab === 'artists' ? 20 : 6).catch(() => []), later(1800, () => meta.deezerSearchArtists(q, tab === 'artists' ? 20 : 6))]) : [];
+    const albumsP = want('albums') ? meta.searchAlbums(q, tab === 'albums' ? 40 : 12).catch(() => []) : [];
+    // Each section appears the moment its results arrive
+    const box = () => $('#s-main');
+    let shown = 0, settled = 0;
+    const parts = { artists: '', albums: '', songs: '' };
+    const paint = () => {
+      if (!alive() || !box()) return;
+      const html = parts.artists + parts.albums + parts.songs;
+      if (html) { box().innerHTML = html + (settled < 3 ? `<div class="s-more">${loader('', 'sm inline')}</div>` : ''); fillArtistPics(box()); markNow(); }
+      else if (settled === 3) box().innerHTML = `<p class="muted">No results from the music catalogue for "${esc(q)}". Check the spelling, or try the YouTube tab.</p>`;
+    };
+    const part = (p, fill) => meta.withTimeout(Promise.resolve(p), 9000, []).then(v => { if (alive()) { fill(v || []); settled++; shown++; paint(); } }, () => { settled++; paint(); });
+    await Promise.all([
+      part(artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
+      part(albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
+      part(songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
+    ]);
+  } catch (e) {
+    if (alive()) $('#s-main').innerHTML = '<p class="muted">Music search is unavailable right now. Try again in a moment.</p>';
+  }
+}
+function rowsFor(key, tracks) {
+  lists.set(key, tracks.map(t => t.id));
+  const cur = player.current()?.id;
+  return `<div class="rows">${tracks.map((t, i) => trackRow(t, i, { list: key }, cur)).join('')}</div>`;
+}
+
+// ---------- IMPORT ----------
+// Import lives inside Settings (Settings → Import music); #/import jumps straight there.
+async function importSection() {
+  const connected = await sp.isConnected();
+  const clientId = await kv.get('spotifyClientId', '');
+  return `<section id="import" class="set-group"><h2 class="group-h">${icon('import')} Import music</h2>
+    <p class="muted tiny group-sub">Bring in songs and playlists from Spotify, YouTube, Apple Music, CSV files, a pasted list, or music files on this device.</p>
+    <div class="panel">
+      <div class="panel-h">${icon('spotify', 'brand-sp')}<div><h2>From Spotify</h2><p class="muted tiny">Your Liked Songs and every playlist — no account setup, takes about a minute. Uses <b>Exportify</b>, a free, open-source tool that reads your Spotify library (read-only) right in your browser.</p></div></div>
+      <ol class="steps">
+        <li><b>Open Exportify</b> below → tap <b>Get Started</b> → log in to Spotify and allow access.</li>
+        <li>Tap <b>Export All</b> to download everything (a <code>.zip</code>), or <b>Export</b> next to just the playlists you want (<code>.csv</code>).</li>
+        <li>Come back here and choose the downloaded file. Liked Songs go to your Liked Songs, every playlist comes in as a playlist.</li>
+      </ol>
+      <div class="row-btns">
+        <button class="btn primary" data-act="exportify">${icon('spotify')}Open Exportify</button>
+        <label class="btn">${icon('import')}Choose downloaded file<input type="file" accept=".zip,.csv,application/zip,text/csv" multiple hidden data-act-change="exportify-file"></label>
+      </div>
+      <label class="drop" data-drop="csv">${icon('import')}<span>…or drop the .zip / .csv here</span><input type="file" accept=".zip,.csv,application/zip,text/csv" multiple hidden data-act-change="exportify-file"></label>
+      <details class="howto sp-dev" ${connected ? 'open' : ''}><summary>Advanced: connect Spotify directly with a developer key</summary>
+      ${connected ? `<div class="row-btns">
+          <button class="btn primary" data-act="sp-liked">${icon('heartFill')}Import Liked Songs</button>
+          <button class="btn" data-act="sp-playlists">${icon('library')}Choose playlists</button>
+          <button class="btn ghost" data-act="sp-disconnect">Disconnect</button></div>`
+      : `<p class="tiny muted">Imports straight from Spotify without downloading a file. Needs a free Spotify developer app (Spotify requires the developer account to have Premium).</p><ol>
+          <li>Open <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener" class="lnk">developer.spotify.com/dashboard</a> and log in.</li>
+          <li>Click <b>Create app</b>. Any name. Tick <b>Web API</b>.</li>
+          <li>Under <b>Redirect URIs</b> add exactly: <code class="copy" data-act="copy" data-v="${esc(sp.redirectUri())}">${esc(sp.redirectUri())}</code></li>
+          <li>Save, then copy the <b>Client ID</b> and paste it below.</li></ol>
+        <form class="inline-form" id="sp-form"><input name="cid" placeholder="Spotify Client ID" value="${esc(clientId)}" required pattern="[A-Za-z0-9]{20,40}"><button class="btn">${icon('spotify')}Connect Spotify</button></form>`}
+      </details>
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('yt', 'brand-yt')}<div><h2>From YouTube</h2><p class="muted tiny">Bring in your YouTube playlists and Liked videos — handy as a second backup of your music. Each song keeps the exact video from the playlist.</p></div></div>
+      <div class="row-btns">${ya.configured() ? `<button class="btn primary" data-act="yt-import-mine">${icon('yt')}${ya.signedIn() ? 'Choose my YouTube playlists' : 'Sign in & choose my playlists'}</button>${ya.signedIn() ? '<button class="btn ghost" data-act="yt-signout">Disconnect</button>' : ''}` : ''}</div>
+      <form class="inline-form" id="ytlink-form"><input name="u" placeholder="Paste any public or unlisted YouTube playlist link" required><button class="btn">${icon('import')}Import link</button></form>
+      ${!ya.configured() ? '<p class="tiny muted">Public and unlisted playlist links work right away. To pick your private playlists and Liked videos, connect a YouTube account below (Settings → YouTube backup).</p>' : ''}
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('apple', 'brand-am')}<div><h2>From Apple Music</h2><p class="muted tiny">Import playlists, your whole library and Favorite (Loved) songs, with genres and years. No Apple account login needed.</p></div></div>
+      <details class="howto"><summary>How to export from Apple Music</summary><ol>
+        <li><b>Mac</b> (Music app) or <b>Windows</b> (Apple Music / iTunes app).</li>
+        <li><b>Everything at once:</b> File → Library → <b>Export Library…</b> → save the <code>.xml</code> file.</li>
+        <li><b>One playlist:</b> select it, then File → Library → <b>Export Playlist…</b> → format <b>Plain Text</b> (<code>.txt</code>).</li>
+        <li>Drop the file below. On iPhone/Android the Apple Music app can't export — do it once on a computer, or use any converter that gives a CSV and the CSV option below.</li></ol></details>
+      <label class="drop"><input type="file" accept=".xml,.txt,text/plain,text/xml,application/xml" multiple hidden data-act-change="apple">${icon('apple')}<span>Choose Apple Music export (.xml / .txt)</span></label>
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('file')}<div><h2>From a CSV file</h2><p class="muted tiny">No Spotify key needed. Export any playlist or your Liked Songs at <a class="lnk" href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a> (or any CSV with title + artist columns), then drop the files here. Genres and release dates come along too.</p></div></div>
+      <label class="drop" data-drop="csv"><input type="file" accept=".csv,text/csv" multiple hidden data-act-change="csv">${icon('import')}<span>Choose CSV files</span></label>
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('edit')}<div><h2>Paste a list</h2><p class="muted tiny">One song per line — "Artist - Title" or "Title by Artist".</p></div></div>
+      <form id="paste-form"><textarea name="t" rows="5" placeholder="Daft Punk - One More Time&#10;Blinding Lights by The Weeknd"></textarea>
+      <div class="row-btns"><input name="name" placeholder="Playlist name (optional)"><button class="btn">${icon('plus')}Add songs</button></div></form>
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('folder')}<div><h2>Music files on this device</h2><p class="muted tiny">MP3/M4A/FLAC/etc. that you own. They play fully offline and get grouped into albums from their tags. Songs already in your library get linked automatically.</p></div></div>
+      <div class="row-btns"><button class="btn" data-act="add-files">${icon('file')}Add files</button><button class="btn" data-act="add-folder">${icon('folder')}Add a folder</button></div>
+    </div>
+  </section>`;
+}
+function wireImport() {
+  $('#sp-form')?.addEventListener('submit', e => { e.preventDefault(); sp.login(new FormData(e.target).get('cid').trim()); });
+  $('#paste-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const tracks = imp.tracksFromText(fd.get('t'));
+    if (!tracks.length) return toast('Couldn\'t read any "Artist - Title" lines', 'err');
+    const saved = await store.upsertTracks(tracks);
+    if (fd.get('name')) { const p = await store.createPlaylist(fd.get('name'), saved.map(t => t.id), { source: 'pasted' }); location.hash = '#/playlist/' + p.id; }
+    else { await Promise.all(saved.map(t => store.updateTrack(t.id, { liked: true }))); toast(`${saved.length} songs added to Liked`); location.hash = '#/library/liked'; }
+  });
+  $('[data-act-change="csv"]').addEventListener('change', e => importCSVFiles([...e.target.files]));
+  $$('[data-act-change="exportify-file"]').forEach(i => i.addEventListener('change', e => { exportifyWaiting = false; importCSVFiles([...e.target.files], { source: 'Spotify' }); e.target.value = ''; }));
+  $('[data-act-change="apple"]').addEventListener('change', e => importAppleFiles([...e.target.files]));
+  $('#ytlink-form').addEventListener('submit', e => { e.preventDefault(); ytImportLink(e.target.u.value.trim()); });
+}
+
+// CSV and ZIP files (Exportify, or any CSV with title + artist columns)
+async function importCSVFiles(files, { source = 'CSV' } = {}) {
+  const items = [];
+  for (const f of files) {
+    try {
+      if (/\.zip$/i.test(f.name) || f.type === 'application/zip') items.push(...await imp.unzipText(f));
+      else items.push({ name: f.name, text: await f.text() });
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  const csvs = items.filter(x => !imp.isAlbumCSV(x.text));
+  if (!csvs.length) { if (items.length) toast('No songs found in that file', 'err'); return; }
+  const prog = csvs.length > 1 ? progress(`Importing ${csvs.length} playlists…`) : null;
+  let likedN = 0, pls = 0, songs = 0, firstPl = null;
+  for (let i = 0; i < csvs.length; i++) {
+    const f = csvs[i];
+    prog?.set(i + 1, csvs.length);
+    if (prog?.cancelled) break;
+    try {
+      const tracks = imp.tracksFromCSV(f.text);
+      if (!tracks.length) continue;
+      const name = f.name.replace(/\.csv$/i, '').replace(/[_]+/g, ' ').trim();
+      if (/^liked( songs)?$|liked.?songs|^liked$/i.test(name)) {
+        await store.upsertTracks(tracks.map(t => ({ ...t, liked: true, likedAt: t.addedAt || Date.now() })));
+        likedN += tracks.length; songs += tracks.length; continue;
+      }
+      const saved = await store.upsertTracks(tracks);
+      const ex = [...lib.playlists.values()].find(x => x.name === name && (x.source === source || x.source === 'CSV' || x.source === 'Spotify'));
+      if (ex) { ex.trackIds = saved.map(t => t.id); await store.savePlaylist(ex); firstPl = firstPl || ex; }
+      else firstPl = firstPl || await store.createPlaylist(name, saved.map(t => t.id), { source });
+      pls++; songs += saved.length;
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  const msg = [likedN ? `${likedN} Liked Songs` : '', pls ? `${pls} playlist${pls > 1 ? 's' : ''}` : ''].filter(Boolean).join(' and ');
+  if (prog) prog.done(msg ? `Imported ${msg} ✓` : 'Nothing to import'); else if (msg) toast(`Imported ${msg} ✓`, 'ok'); else toast('No songs found in that file', 'err');
+  renderSidebarPlaylists();
+  if (pls === 1 && !likedN && firstPl) location.hash = '#/playlist/' + firstPl.id;
+  else if (likedN && !pls) location.hash = '#/library/liked';
+  else if (pls || likedN) location.hash = '#/library/playlists';
+}
+// Spotify via Exportify: open it in a small window, then pick up the downloaded file when you're back
+let exportifyWaiting = false;
+function openExportify() {
+  const narrow = innerWidth < 760;
+  const w = narrow ? null : window.open('https://exportify.net/', 'exportify', `popup=yes,width=${Math.min(1000, screen.availWidth - 80)},height=${Math.min(800, screen.availHeight - 80)},left=60,top=40`);
+  if (!w) window.open('https://exportify.net/', '_blank', 'noopener');
+  exportifyWaiting = true;
+  toast('Export from Exportify, then come back here and choose the file', 'info');
+}
+async function exportifyReturn() {
+  if (!exportifyWaiting || document.hidden || !profile) return;
+  exportifyWaiting = false;
+  await sleep(400);
+  if ($('.modal-wrap')) return;
+  modal(`<div class="sp-back"><div class="sp-back-ic">${icon('spotify')}</div><h3>Got your Spotify file?</h3>
+    <p class="muted">Choose the <b>.zip</b> (Export All) or <b>.csv</b> files you just downloaded from Exportify — usually in your <b>Downloads</b> folder.</p>
+    <label class="btn primary big">${icon('import')}Choose file<input type="file" accept=".zip,.csv,application/zip,text/csv" multiple hidden id="sp-back-file"></label>
+    <button class="btn ghost block" data-close>Not yet</button></div>`, {
+    onMount: (m, close) => m.querySelector('#sp-back-file').addEventListener('change', e => { const fs = [...e.target.files]; close(null); if (fs.length) importCSVFiles(fs, { source: 'Spotify' }); })
+  });
+}
+window.addEventListener('focus', () => setTimeout(exportifyReturn, 300));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(exportifyReturn, 300); });
+
+async function importAppleFiles(files) {
+  let any = false;
+  for (const f of files) {
+    try {
+      const text = await imp.readTextSmart(f);
+      if (/^\s*<\?xml|<plist/i.test(text.slice(0, 400))) {
+        const lib2 = imp.fromAppleXML(text);
+        if (!lib2.tracks.length) { toast(`${f.name}: no songs found`, 'err'); continue; }
+        const r = await modal(`<h3>Import from Apple Music</h3><p class="muted tiny">${lib2.tracks.length} songs found. Pick what to bring in.</p>
+          <form><div class="pick-list">
+            <label class="pick">${likedCover('sm')}<span><b>Favorite (Loved) songs → Liked</b><small>${lib2.loved.length} songs</small></span><input type="checkbox" name="loved" value="1" ${lib2.loved.length ? 'checked' : 'disabled'}></label>
+            <label class="pick"><div class="cover sm noimg"><span>♪</span></div><span><b>All songs in my library</b><small>${lib2.tracks.length} songs</small></span><input type="checkbox" name="all" value="1"></label>
+            ${lib2.playlists.map((p, i) => `<label class="pick">${cover('', p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} songs${p.smart ? ' · smart playlist' : ''}</small></span><input type="checkbox" name="p" value="${i}" ${p.smart ? '' : 'checked'}></label>`).join('')}
+          </div><div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">Import</button></div></form>`, { wide: true });
+        if (!r) continue;
+        const pick = [].concat(r.p || []).map(Number);
+        const need = new Set([...(r.loved ? lib2.loved : []), ...pick.flatMap(i => lib2.playlists[i].trackIds), ...(r.all ? lib2.tracks.map(t => t.id) : [])]);
+        const saved = await store.upsertTracks(lib2.tracks.filter(t => need.has(t.id)));
+        if (r.loved) for (const id of lib2.loved) if (need.has(id)) await store.updateTrack(id, { liked: true });
+        for (const i of pick) {
+          const p = lib2.playlists[i];
+          const ex = [...lib.playlists.values()].find(x => x.source === 'Apple Music' && x.name === p.name);
+          if (ex) { ex.trackIds = p.trackIds; await store.savePlaylist(ex); } else await store.createPlaylist(p.name, p.trackIds, { source: 'Apple Music' });
+        }
+        toast(`Apple Music: ${saved.length} songs, ${pick.length} playlists imported`, 'ok'); any = true;
+      } else {
+        const tracks = imp.tracksFromAppleTxt(text);
+        if (!tracks.length) { toast(`${f.name}: no songs found`, 'err'); continue; }
+        const saved = await store.upsertTracks(tracks);
+        const name = f.name.replace(/\.txt$/i, '');
+        await store.createPlaylist(name, saved.map(t => t.id), { source: 'Apple Music' });
+        toast(`Playlist "${name}" imported (${saved.length})`, 'ok'); any = true;
+      }
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
+  }
+  renderSidebarPlaylists();
+  if (any) location.hash = '#/library/playlists';
+}
+
+async function spImportLiked() {
+  const prog = progress('Importing Liked Songs…');
+  try {
+    const tracks = await sp.likedSongs((n, total) => prog.set(n, total));
+    await store.upsertTracks(tracks, { liked: true });
+    prog.done(`${tracks.length} Liked Songs imported`);
+    location.hash = '#/library/liked';
+  } catch (e) { prog.fail(e.message); }
+}
+async function spChoosePlaylists() {
+  let pls;
+  const prog = progress('Loading your playlists…');
+  try { pls = await sp.playlists(); prog.close(); } catch (e) { return prog.fail(e.message); }
+  if (!pls.length) return toast('No playlists found on that account');
+  const r = await modal(`<h3>Choose playlists to import</h3>
+    <form><div class="pick-list">${pls.map(p => `<label class="pick">${cover(p.image, p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.total ?? '?'} songs · ${esc(p.owner)}</small></span><input type="checkbox" name="p" value="${p.spotifyId}" checked></label>`).join('')}</div>
+    <p class="tiny muted">Spotify only lets apps read songs in playlists you own or collaborate on.</p>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">Import</button></div></form>`, { wide: true });
+  if (!r) return;
+  const sel = [].concat(r.p || []);
+  const picked = pls.filter(p => sel.includes(p.spotifyId));
+  let ok = 0;
+  for (const p of picked) {
+    const pr = progress(`Importing "${p.name}"…`);
+    try {
+      const tracks = await sp.playlistTracks(p.spotifyId, (n, t) => pr.set(n, t));
+      const saved = await store.upsertTracks(tracks);
+      const existing = [...lib.playlists.values()].find(x => x.spotifyId === p.spotifyId);
+      if (existing) { existing.trackIds = saved.map(t => t.id); existing.name = p.name; await store.savePlaylist(existing); }
+      else await store.createPlaylist(p.name, saved.map(t => t.id), { source: 'Spotify', spotifyId: p.spotifyId, image: p.image });
+      pr.done(`"${p.name}" — ${saved.length} songs`); ok++;
+    } catch (e) { pr.fail(`"${p.name}": ${e.status === 403 ? 'Spotify doesn\'t allow reading this playlist (not yours)' : e.message}`); }
+  }
+  renderSidebarPlaylists();
+  if (ok) location.hash = '#/library/playlists';
+}
+
+// ---------- OFFLINE ----------
+async function vOffline() {
+  const off = store.saved().filter(t => t.localFileId);
+  let est = '';
+  try { const e = await navigator.storage.estimate(); est = `${(e.usage / 1e6).toFixed(0)} MB used of ~${(e.quota / 1e9).toFixed(1)} GB available`; } catch { }
+  const persisted = await navigator.storage?.persisted?.();
+  view().innerHTML = `<div class="page">${header('Offline', `${off.length} songs playable without internet${est ? ' · ' + est : ''}`, '', '', '')}
+    <div class="panel">
+      <p class="muted">BAZINGA! plays offline from music files you own that are stored on this device. Add files or a whole folder — they're matched to songs in your library by their tags or by "Artist - Title" file names, and grouped into albums.</p>
+      <div class="row-btns"><button class="btn primary" data-act="add-files">${icon('file')}Add music files</button><button class="btn" data-act="add-folder">${icon('folder')}Add a folder</button>
+      <label class="toggle"><input type="checkbox" id="pref-off" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label></div>
+      ${persisted === false ? '<p class="tiny muted">Tip: install BAZINGA! (browser menu → Install / Add to Home Screen) so your browser keeps the files safe.</p>' : ''}
+      <p class="tiny muted">YouTube streams themselves can't be saved — that's against YouTube's rules — so songs without a file need internet.</p>
+    </div>
+    ${off.length ? `<div class="actions">${playBtns('play-list', 'offline')}</div>${tracksSection('offline', off)}` : empty('Nothing offline yet', 'Add music files above to listen anywhere.')}</div>`;
+  $('#pref-off').onchange = e => player.setPreferOffline(e.target.checked);
+  observeMore();
+}
+
+async function addLocalFiles(files, { albumHint } = {}) {
+  files = files.filter(f => imp.AUDIO_EXT.test(f.name) || f.type.startsWith('audio/'));
+  if (!files.length) return toast('No audio files found', 'err');
+  const prog = progress(`Adding ${files.length} files…`);
+  let linked = 0, added = 0;
+  const albums = new Map();
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    prog.set(i + 1, files.length);
+    try {
+      const tag = await imp.readLocalFile(f);
+      let id = trackKey(tag.artist, tag.title);
+      // Album page: match by title against the album's tracks
+      if (albumHint && !lib.tracks.has(id)) {
+        const m = albumHint.find(t => norm(t.title) === norm(tag.title) || norm(f.name).includes(norm(t.title)));
+        if (m) id = m.id;
+      }
+      const existing = lib.tracks.get(id);
+      const fileId = 'f_' + id;
+      await db.put('files', { id: fileId, blob: f, name: f.name, type: f.type, size: f.size, addedAt: Date.now() });
+      let art = existing?.artwork || '';
+      if (!art && tag.picture) { try { art = await imageToDataURL(tag.picture, 300); } catch { } }
+      const t = {
+        ...(existing || {}), id, title: existing?.title || tag.title, artist: existing?.artist || tag.artist,
+        album: existing?.album || tag.album, genre: existing?.genre || tag.genre, year: existing?.year || tag.year,
+        trackNumber: existing?.trackNumber || tag.trackNumber, artwork: art, localFileId: fileId
+      };
+      if (t.album && !t.albumId) t.albumId = albumKey(tag.albumArtist || t.artist, t.album);
+      await store.upsertTracks([t]);
+      existing && !existing.transient ? linked++ : added++;
+      if (t.album) {
+        const a = albums.get(t.albumId) || { id: t.albumId, title: t.album, artist: tag.albumArtist || mainArtist(t.artist), year: t.year, genre: t.genre, artwork: art, ids: [] };
+        a.ids.push([t.trackNumber || 999, id]); if (!a.artwork) a.artwork = art;
+        albums.set(t.albumId, a);
+      }
+    } catch (e) { console.warn('file failed', f.name, e); }
+  }
+  // Save albums found in the files (so they show up as albums on the device)
+  for (const a of albums.values()) {
+    const old = lib.albums.get(a.id);
+    const ids = a.ids.sort((x, y) => x[0] - y[0]).map(x => x[1]);
+    const merged = { ...(old || {}), updatedAt: Date.now(), id: a.id, title: old?.title || a.title, artist: old?.artist || a.artist, year: old?.year || a.year, genre: old?.genre || a.genre, artwork: old?.artwork || a.artwork, trackIds: [...new Set([...(old?.trackIds || []), ...ids])], savedAt: old?.savedAt || Date.now() };
+    lib.albums.set(a.id, merged); await db.put('albums', merged);
+  }
+  store.notify('files');
+  prog.done(`${added} new songs, ${linked} linked to your library${albums.size ? `, ${albums.size} albums` : ''} — available offline`);
+}
+
+// ---------- SETTINGS ----------
+async function vSettings([section] = []) {
+  const lastB = await kv.get('lastBackup');
+  const lastD = await kv.get('lastDownload');
+  const snaps = await backup.listInternal();
+  const fstate2 = backup.linkedFileState();
+  const imports = await importSection();
+  const ytPanel = await ytBackupPanel();
+  view().innerHTML = `<div class="page settings-page"><h1 class="page-h">Settings</h1>
+    <nav class="set-jump" aria-label="Settings sections">
+      <a href="#account" data-jump="account">${icon('user')}Account</a><a href="#import" data-jump="import">${icon('import')}Import music</a><a href="#yt-backup" data-jump="yt-backup">${icon('yt')}YouTube backup</a>
+      <a href="#playback" data-jump="playback">${icon('play')}Playback</a><a href="#voice-set" data-jump="voice-set">${icon('mic')}Voice</a><a href="#backup" data-jump="backup">${icon('restore')}Backup</a></nav>
+    <section class="acct-hero" id="account">
+      <div class="ah-bg" ${profile.picture ? `style="background-image:url('${esc(profile.picture)}')"` : ''}></div>
+      <label class="ah-pic" title="Change photo"><input type="file" accept="image/*" id="pf-file" hidden>
+        <span class="avatar xl ah-av">${profile.picture ? `<img src="${esc(profile.picture)}" alt="" referrerpolicy="no-referrer">` : icon('user')}</span><span class="ah-cam">${icon('edit')}</span></label>
+      <div class="ah-txt">
+        <div class="kicker">${cloud.signedIn() ? `${icon('cloud')} Synced account` : 'Your account'}</div>
+        <h2 class="pf-name">${esc(profile.username)}</h2>
+        <div class="ah-stats">${(() => { const all = store.saved(); return [[all.length, 'songs'], [all.filter(t => t.liked).length, 'liked'], [lib.playlists.size, 'playlists'], [store.artists().length, 'artists']].map(([n, l]) => `<span><b>${n}</b>${l}</span>`).join(''); })()}</div>
+        <div class="row-btns"><button class="btn" data-act="rename-user">${icon('edit')}Change username</button>${profile.picture ? `<button class="btn ghost" data-act="remove-pic">Remove photo</button>` : ''}</div>
+      </div>
+    </section>
+    ${cloud.configured() ? `<div class="panel acct-panel"><h2>${icon('cloud')} Account & sync</h2>
+      ${cloud.signedIn() ? `<p class="muted">Signed in as <b>${esc(cloud.user().email || profile.username)}</b> with ${PROVIDER_NAME[providerOf(cloud.user())] || providerOf(cloud.user())}. Your library, likes, playlists and albums sync automatically across every device you sign in on.</p>
+        <div id="sync-line">${syncLine()}</div>
+        <div class="row-btns"><button class="btn" data-act="sync-now">${icon('restore')}Sync now</button>${providerOf(cloud.user()) === 'email' ? `<button class="btn ghost" data-act="change-pw">${icon('shield')}Change password</button>` : ''}<button class="btn ghost" data-act="sign-out">Sign out</button></div>`
+      : `<p class="muted">Create a free account to keep your music in sync on your phone, laptop and any other device — and never lose it. Your music on this device will be added to your account.</p>
+        <div class="sso-col">${ssoButtons()}</div>`}
+    </div>` : ''}
+    <div class="panel support-panel only-m">${supportPanelInner()}</div>
+    ${imports}
+    ${ytPanel}
+    <div class="panel" id="playback"><h2>${icon('play')} Playback</h2>
+      <div class="fld"><span>When the queue finishes</span><div class="seg big choice" id="set-autoplay">
+        ${[['liked', 'Play Liked Songs'], ['replay', 'Replay the queue'], ['off', 'Stop']].map(([v, l]) => `<label><input type="radio" name="autoplay" value="${v}" ${(settings.autoplay || 'liked') === v ? 'checked' : ''}><span>${l}</span></label>`).join('')}
+      </div></div>
+      <p class="tiny muted">Autoplay keeps the music going: after the last song it starts your Liked Songs (shuffled), or plays the same queue again from the top. If the queue already was your Liked Songs, it replays them.</p>
+      <label class="toggle"><input type="checkbox" id="set-prefoff" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label>
+      <label class="toggle"><input type="checkbox" id="set-awake" ${settings.keepAwake !== false ? 'checked' : ''}><span></span><div>Keep the screen on while BAZINGA! is open<small class="tiny muted" style="display:block">Phones stop web music when they lock — this keeps your songs playing.</small></div></label>
+      <button class="btn" data-act="a2hs">${icon('plus')}Add BAZINGA! to your Home Screen</button>
+      <p class="tiny muted">Lock screen & background: for now, keep BAZINGA! open to keep the music going — phones pause web players when they lock or you switch apps. Songs with an offline file keep playing. Lock-screen listening is Phase 2: <a class="lnk" href="#/support" data-act="phase2">help us unlock it ☕</a></p>
+    </div>
+    <div class="panel" id="voice-set"><h2>${icon('mic')} Voice assistant</h2>
+      ${(() => {
+        const vs = voiceOptions();
+        if (!vs.length) return '<p class="muted tiny">This browser has no built-in voices, so the assistant answers on screen only.</p>';
+        return `<div class="fld"><span>Voice</span><div class="voice-pick"><select id="set-voice" class="select">
+          <option value="">Automatic — most natural voice (${esc(vs[0].name)})</option>
+          ${vs.map(v => `<option value="${esc(v.name)}" ${settings.voiceName === v.name ? 'selected' : ''}>${esc(v.name)} · ${v.quality}</option>`).join('')}
+          </select><button class="btn" id="voice-try" type="button">${icon('play')}Try it</button></div></div>
+          <p class="tiny muted">Browsers can't use Siri's voice itself, but these come close: on iPhone/iPad/Mac download a <b>Premium</b> or <b>Enhanced</b> voice (Settings → Accessibility → Spoken Content → Voices → English, e.g. "Ava (Premium)"); on Windows use Edge for the "Natural" voices; Chrome has Google voices. BAZINGA! picks the best one automatically.</p>`;
+      })()}
+      ${wakeSupported ? `<label class="toggle"><input type="checkbox" id="set-wake" ${settings.wake ? 'checked' : ''}><span></span><div>Hands-free: say <b>"Hey Bazinga"</b> to start the assistant</div></label>
+      <p class="tiny muted">While BAZINGA! is open on screen, your browser listens for "Hey Bazinga" or "Bazinga" — then just say what you want ("Hey Bazinga, play my liked songs"). Your browser's speech service does the listening; BAZINGA! doesn't record anything. Phones may play a short chime when listening restarts, and iPhones can make music sound thinner while the mic is on — turn it off any time.</p>`
+      : '<p class="tiny muted">Hands-free "Hey Bazinga" needs a browser with speech recognition (Chrome, Edge, Safari or Samsung Internet).</p>'}
+    </div>
+    <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
+      <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
+      ${backup.fsSupported ? `<div class="sub-panel"><b>Auto-updating backup file</b>
+        <p class="tiny muted">Pick a file on this device (e.g. in Documents or a synced folder). BAZINGA! keeps it up to date automatically — it survives even if browser data is cleared.</p>
+        ${fstate2 === 'ok' ? `<p class="ok-line">${icon('check')} Linked and up to date.</p><button class="btn ghost" data-act="bk-unlink">Unlink file</button>`
+          : fstate2 === 'needs-permission' ? `<button class="btn primary" data-act="bk-regrant">Resume auto-backup (allow access)</button>`
+          : `<button class="btn primary" data-act="bk-link">${icon('file')}Choose backup file</button>`}</div>`
+        : `<div class="sub-panel"><b>Backup file</b><p class="tiny muted">This browser can't write to a file automatically, so download a backup now and then (last: ${lastD ? new Date(lastD).toLocaleDateString() : 'never'}). We'll remind you weekly.</p></div>`}
+      <div class="row-btns"><button class="btn" data-act="bk-download">${icon('import')}Download backup now</button><button class="btn" data-act="bk-restore-file">${icon('restore')}Restore from file</button></div>
+      ${snaps.length ? `<details class="howto"><summary>Automatic snapshots on this device (${snaps.length})</summary>${snaps.map(s => `<div class="snap"><span>${new Date(s.ts).toLocaleString()} · ${s.counts.tracks} songs, ${s.counts.playlists} playlists, ${s.counts.albums} albums</span><button class="btn sm ghost" data-act="bk-restore-snap" data-id="${s.id}">Restore</button></div>`).join('')}</details>` : ''}
+      <p class="tiny muted">Backups contain your library, playlists, albums, YouTube matches, profile and settings. Offline music files aren't copied (they're large) — keep the originals and re-add them after a restore.</p>
+    </div>
+
+    <div class="panel support-panel only-d">${supportPanelInner()}</div>
+
+    <div class="panel"><h2>${icon('mic')} Lyrics (Genius)</h2>
+      <p class="muted tiny">Lyrics come from Genius's official lyrics widget. If they don't load, add a free Genius access token: open <a class="lnk" href="https://genius.com/api-clients" target="_blank" rel="noopener">genius.com/api-clients</a> → New API Client (any name, any website) → Generate Access Token → paste it here. It's stored only on this device.</p>
+      <form id="genius-form" class="stack"><label class="fld"><span>Genius access token (optional)</span><input name="geniusToken" value="${esc(settings.geniusToken || '')}" autocomplete="off"></label><button class="btn">Save</button></form>
+    </div>
+
+    <div class="panel"><h2>${icon('yt')} YouTube matching</h2>
+      <p class="muted tiny">By default BAZINGA! finds videos through free public services — no key, no limits, but they're sometimes slow or down. For rock-solid matching add your own free YouTube Data API key (Google Cloud Console → YouTube Data API v3 → Credentials). It's stored only on this device.</p>
+      <form id="yt-form" class="stack">
+        <label class="fld"><span>Your YouTube API key (optional)</span><input name="ytKey" value="${esc(settings.ytKey)}" placeholder="AIza…" autocomplete="off"></label>
+        <label class="fld"><span>Custom Invidious server (optional)</span><input name="customInstance" value="${esc(settings.customInstance)}" placeholder="https://your-invidious.example"></label>
+        <button class="btn">Save</button></form>
+      <button class="btn ghost" data-act="clear-ytcache">Forget all YouTube matches</button>
+    </div>
+
+    <div class="panel"><h2>${icon('sparkle')} Music info</h2>
+      <label class="toggle"><input type="checkbox" id="set-enrich" ${settings.enrich !== false ? 'checked' : ''}><span></span>Automatically fill in genres, release dates & artwork</label>
+      <label class="fld"><span>Music store region (for search & albums)</span><select id="set-country" class="select">${['US', 'GB', 'CA', 'AU', 'DE', 'FR', 'ES', 'IT', 'NL', 'SE', 'BR', 'MX', 'JP', 'KR', 'IN', 'NG', 'ZA', 'KE', 'ET', 'EG', 'AE', 'TR', 'PL', 'IE', 'NZ'].map(c => `<option ${settings.country === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+      <p class="tiny muted" id="enrich-status"></p>
+    </div>
+
+    <div class="panel danger-zone"><h2>${icon('trash')} Delete account</h2>
+      ${cloud.signedIn() ? '<p class="muted"><b>You\'re signed in:</b> this also permanently deletes your BAZINGA! account and your synced music from the cloud, on every device.</p>' : ''}
+      <p class="muted">Erases your profile, library, playlists, albums, offline files and on-device backups from this device. A backup file you saved elsewhere is not touched.</p>
+      <button class="btn danger" data-act="delete-account">Delete my account</button></div>
+    <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a></p>
+  </div>`;
+  $('#pf-file').onchange = async e => { const f = e.target.files[0]; if (!f) return; profile.picture = await imageToDataURL(f, 256); await profileChanged(); rerender(); };
+  $('#gcid-form')?.addEventListener('submit', async e => { e.preventDefault(); await saveSettings({ googleClientId: e.target.cid.value.trim() }); await ya.signOut(); toast('Saved — now sign in with YouTube', 'ok'); rerender(); });
+  wireImport();
+  $$('#set-autoplay input').forEach(i => i.onchange = () => saveSettings({ autoplay: i.value }));
+  $('#set-prefoff').onchange = e => player.setPreferOffline(e.target.checked);
+  $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
+  $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
+  $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
+  $('#set-wake')?.addEventListener('change', e => { saveSettings({ wake: e.target.checked }); setWake(e.target.checked); toast(e.target.checked ? 'Say "Hey Bazinga" any time ⚡' : 'Hands-free listening is off', e.target.checked ? 'ok' : 'info'); });
+  $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); document.getElementById(a.dataset.jump)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+  if (section) requestAnimationFrame(() => document.getElementById(section)?.scrollIntoView({ block: 'start' }));
+  $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
+  $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
+  $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });
+  $('#set-country').onchange = e => saveSettings({ country: e.target.value });
+  const st = () => { const el = $('#enrich-status'); if (el) { const n = store.enrichPending(); el.textContent = n ? `Filling in details for ${n} songs in the background…` : ''; } };
+  st(); on('enrich', st);
+}
+
+// ---------- SHARED LINK ----------
+async function vShared([data]) {
+  let d;
+  try { d = await unpackString(data); } catch { view().innerHTML = empty('This share link is broken', 'Ask your friend to share it again.'); return; }
+  const tracks = (d.t || []).map(x => ({
+    id: trackKey(x[1], x[0]), title: x[0], artist: x[1], artists: x[1].split(/\s*,\s*/), album: x[2] || '', year: x[3] || null, genre: x[4] || '', durationMs: x[5] || 0, artwork: x[6] || '', _yt: [x[7], x[8]]
+  }));
+  for (const t of tracks) { if (t._yt[0] || t._yt[1]) { const c = (await db.get('ytcache', t.id)) || {}; if (!c.video && t._yt[0]) c.video = t._yt[0]; if (!c.audio && t._yt[1]) c.audio = t._yt[1]; await db.put('ytcache', c, t.id); } delete t._yt; }
+  const ts = tracks.map(t => lib.tracks.get(t.id) || store.remember(t));
+  window.__shared = { d, tracks: ts };
+  setTitle(d.n || 'Shared music');
+  view().innerHTML = `<div class="page">${header(esc(d.n || 'Shared music'), `Shared by ${esc(d.by || 'a friend')} · ${ts.length} songs`, cover(d.a || ts[0]?.artwork, d.n), '', d.k === 'album' ? 'Album' : d.k === 'song' ? 'Song' : 'Playlist')}
+    <div class="actions">${playBtns('play-list', 'shared')}<button class="btn primary-o" data-act="save-shared">${icon('plus')}Save to my library</button></div>
+    ${tracksSection('shared', ts, { noFilter: true })}</div>`;
+}
+
+// ---------- LEGAL ----------
+async function vLegal() {
+  view().innerHTML = `<div class="page"><h1 class="page-h">Privacy Policy & Terms</h1><div class="panel legal">${LEGAL_HTML}
+    <p class="ok-line">${icon('check')} You accepted version ${esc(profile.termsAccepted || '')}${profile.termsAcceptedAt ? ' on ' + new Date(profile.termsAcceptedAt).toLocaleDateString() : ''}.</p></div></div>`;
+}
+
+// ---------- QUEUE (full page on phones) ----------
+async function vQueue() { view().innerHTML = `<div class="page"><h1 class="page-h">Queue</h1><div id="queue-page"></div></div>`; renderQueue($('#queue-page')); }
+
+async function notePlaylistPlay(pid) {
+  if (!pid || !lib.playlists.has(pid)) return;
+  const m = (await kv.get('plPlays')) || {};
+  m[pid] = { n: (m[pid]?.n || 0) + 1, at: Date.now() };
+  kv.set('plPlays', m);
+}
+// What to play when the queue runs out (Settings → Playback)
+function queueEnded(ids) {
+  const mode = settings.autoplay || 'liked';
+  if (mode === 'off') return null;
+  const liked = store.saved().filter(t => t.liked).sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id);
+  const wasLiked = ids.length && ids.every(id => lib.tracks.get(id)?.liked) && ids.length >= Math.min(liked.length, 20);
+  if (mode === 'liked' && liked.length && !wasLiked) { nowCtx = { list: null }; return { ids: liked, shuffle: true, msg: 'Queue finished — playing your Liked Songs' }; }
+  return { ids, shuffle: P.shuffle, msg: 'Queue finished — playing it again' };
+}
+
+// ================= PROGRESS HELPER =================
+function progress(label) {
+  const root = $('#toasts');
+  const el = document.createElement('div');
+  el.className = 'toast prog';
+  el.innerHTML = `<div class="pl">${esc(label)}</div><div class="bar"><i style="width:0%"></i></div><button class="ib sm" aria-label="Stop">${icon('close')}</button>`;
+  root.appendChild(el);
+  const ctl = { cancelled: false };
+  el.querySelector('button').onclick = () => { ctl.cancelled = true; el.remove(); };
+  const end = (msg, kind) => { el.remove(); if (msg) toast(msg, kind); };
+  return Object.assign(ctl, {
+    set(n, total) { el.querySelector('i').style.width = total ? (100 * n / total).toFixed(1) + '%' : '30%'; el.querySelector('.pl').textContent = `${label} ${n}${total ? '/' + total : ''}`; },
+    done: m => end(m, 'ok'), fail: m => end(m, 'err'), close: () => end()
+  });
+}
+
+// ================= YOUTUBE BATCH + EXPORT =================
+async function ytMatches() {
+  const keys = await db.keys('ytcache'), vals = await db.all('ytcache');
+  const m = new Map(); keys.forEach((k, i) => m.set(k, vals[i])); return m;
+}
+async function matchList(ids) {
+  const have = await ytMatches();
+  const todo = ids.filter(id => { const c = have.get(id); return !c || (!c.video && !c.audio); }).map(id => lib.tracks.get(id)).filter(Boolean);
+  if (!todo.length) return toast('All songs already have YouTube matches ✓', 'ok');
+  const prog = progress('Finding YouTube versions…');
+  try {
+    const { found } = await yt.matchMany(todo, { onProgress: (n, t) => prog.set(n, t), isCancelled: () => prog.cancelled });
+    if (!prog.cancelled) prog.done(`Matched ${found} of ${todo.length} songs`);
+  } catch (e) { prog.fail(e.message); }
+  emit('dirty', 'yt');
+}
+// Which YouTube playlist a BAZINGA! list was saved to before (so "update" adds only new songs)
+async function ytLinkOf(key) { return lib.playlists.get(key)?.ytPlaylistId || ((await kv.get('ytLinks')) || {})[key] || null; }
+async function setYtLink(key, ytId) {
+  const pl = lib.playlists.get(key);
+  if (pl) { pl.ytPlaylistId = ytId; await store.savePlaylist(pl); return; }
+  const m = (await kv.get('ytLinks')) || {}; m[key] = ytId; await kv.set('ytLinks', m);
+}
+const ytNoSetup = () => `<p class="tiny muted">Creating playlists on your YouTube account needs a one-time Google key for this copy of BAZINGA! (Settings → YouTube backup). Until then, open the songs as a ready-made playlist on YouTube below.</p>`;
+
+async function ytExport(ids, name = 'My BAZINGA! playlist', jobKey = 'list') {
+  ids = ids.filter(id => lib.tracks.has(id));
+  if (!ids.length) return toast('No songs here yet', 'err');
+  const pending = (await ya.pendingJobs())[jobKey];
+  const have = await ytMatches();
+  const missing = ids.filter(id => { const c = have.get(id); return !c?.video && !c?.audio; }).length;
+  const signed = ya.signedIn(), ready = ya.configured();
+  const linked = await ytLinkOf(jobKey);
+  const r = await modal(`<h3>${icon('yt')} Save to YouTube</h3>
+    ${pending ? `<div class="sub-panel"><b>Upload paused — ${pending.videoIds.length - pending.done} songs left</b><p class="tiny muted">"${esc(pending.title)}" stopped at YouTube's daily limit.</p>
+      <div class="row-btns"><button class="btn primary" data-resolve="resume">${icon('upload')}Resume upload</button><button class="btn ghost" data-resolve="drop">Discard</button></div></div>` : ''}
+    ${ready ? `<form class="yt-form">
+      <p class="muted tiny">Creates a real playlist on your YouTube account with ${ids.length === 1 ? 'this song' : `these ${ids.length} songs`}${missing ? ` (BAZINGA! first finds YouTube versions for the ${missing} without one)` : ''}.</p>
+      <label class="fld"><span>Playlist name</span><input name="title" value="${esc(name)}" maxlength="150" required></label>
+      ${ytChoiceFields(!!linked)}
+      <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">${icon('upload')}${signed ? 'Save to YouTube' : 'Sign in & save'}</button></div>
+    </form>` : ytNoSetup()}
+    <details class="howto" ${ready ? '' : 'open'}><summary>No sign-in: open as a playlist on YouTube</summary><div class="yt-links"></div></details>`, {
+    wide: true,
+    onMount: m => {
+      const d = m.querySelector('details');
+      const fill = async () => {
+        if (d.dataset.done) return; d.dataset.done = 1;
+        m.querySelector('.yt-links').innerHTML = await ytLinksHTML([{ title: name, ids }], missing);
+      };
+      d.addEventListener('toggle', () => d.open && fill());
+      if (d.open) fill();
+    }
+  });
+  if (!r) return;
+  if (r === 'resume') return resumeUpload(jobKey);
+  if (r === 'drop') { await ya.dropJob(jobKey); return toast('Discarded'); }
+  try { if (!ya.signedIn()) await ya.signIn(); } catch (e) { return toast(e.message, 'err'); }
+  const res = await uploadList({ ids, title: r.title.trim() || name, jobKey, mode: r.mode, privacy: r.privacy, update: !!r.update });
+  if (res?.url) ytDoneModal([res]);
+}
+const ytChoiceFields = (canUpdate, updateLabel = 'Update the YouTube playlist I made before (adds only new songs)') => `
+  <div class="fld"><span>Which versions?</span><div class="seg big choice">
+    <label><input type="radio" name="mode" value="video" ${P.mode === 'video' ? 'checked' : ''}><span>${icon('video')}Music videos</span></label>
+    <label><input type="radio" name="mode" value="audio" ${P.mode !== 'video' ? 'checked' : ''}><span>${icon('audio')}Audio only</span></label></div></div>
+  <label class="fld"><span>Who can see it on YouTube?</span><select name="privacy" class="select"><option value="private">Only me (private)</option><option value="unlisted">Anyone with the link (unlisted)</option><option value="public">Everyone (public)</option></select></label>
+  ${canUpdate ? `<label class="toggle"><input type="checkbox" name="update" value="1" checked><span></span>${updateLabel}</label>` : ''}
+  <p class="tiny muted">YouTube lets this app add about 200 songs a day for all users together. Bigger uploads pause and you can resume them later.</p>`;
+
+// "Open on YouTube" links (no sign-in needed), 50 songs per link
+async function ytLinksHTML(groups, missing = 0) {
+  const have = await ytMatches();
+  const part = (links, label) => links.map((l, i) => `<a class="btn ${i ? '' : 'primary'} block" href="${l}" target="_blank" rel="noopener">${icon('yt')}${esc(label)}${links.length > 1 ? ` — part ${i + 1}/${links.length}` : ''}</a>`).join('');
+  let html = '';
+  for (const g of groups) {
+    const vids = [], auds = [];
+    g.ids.forEach(id => { const c = have.get(id); if (c?.video || c?.audio) vids.push(c.video || c.audio); if (c?.audio || c?.video) auds.push(c.audio || c.video); });
+    if (!vids.length) continue;
+    html += `${groups.length > 1 ? `<h4>${esc(g.title)}</h4>` : ''}${part(yt.youtubePlaylistLinks(vids), groups.length > 1 ? 'Music videos' : 'Open music videos on YouTube')}${part(yt.youtubePlaylistLinks(auds), groups.length > 1 ? 'Audio versions' : 'Open audio versions on YouTube')}`;
+  }
+  return html ? `<p class="tiny muted">Opens YouTube with the songs lined up as a playlist (50 per link).${missing ? ` ${missing} songs don't have a YouTube match yet — use "Find YouTube matches" first to include them.` : ''}</p>${html}`
+    : '<p class="tiny muted">No YouTube matches yet — tap "Find YouTube matches" first.</p>';
+}
+
+// Make sure every song has a YouTube version, then create/update the playlist on the user's account
+async function uploadList({ ids, title, jobKey, mode, privacy, update, quiet = false }) {
+  let have = await ytMatches();
+  const todo = ids.filter(id => { const c = have.get(id); return !c?.video && !c?.audio; }).map(id => lib.tracks.get(id)).filter(Boolean);
+  if (todo.length) {
+    const pr = progress(`Finding YouTube versions for "${title}"…`);
+    try { await yt.matchMany(todo, { onProgress: (n, t) => pr.set(n, t), isCancelled: () => pr.cancelled }); pr.close(); } catch (e) { pr.fail(e.message); return null; }
+    if (pr.cancelled) return null;
+    have = await ytMatches();
+  }
+  let videoIds = [...new Set(ids.map(id => { const c = have.get(id); return c?.[mode] || c?.video || c?.audio; }).filter(Boolean))];
+  if (!videoIds.length) { toast(`"${title}": no YouTube versions found`, 'err'); return null; }
+  let ytPlaylistId = null;
+  const linked = await ytLinkOf(jobKey);
+  if (update && linked) {
+    try {
+      const existing = await ya.existingVideoIds(linked);
+      if (existing) { ytPlaylistId = linked; videoIds = videoIds.filter(v => !existing.has(v)); }
+    } catch (e) { toast(e.message, 'err'); return null; }
+    if (ytPlaylistId && !videoIds.length) { if (!quiet) toast(`"${title}" is already up to date on YouTube ✓`, 'ok'); return { title, url: 'https://www.youtube.com/playlist?list=' + ytPlaylistId, upToDate: true }; }
+  }
+  const job = { key: jobKey, title, ytPlaylistId, videoIds, done: 0, privacy, created: Date.now() };
+  return runUploadJob(job);
+}
+async function runUploadJob(job) {
+  const pr = progress(`Saving "${job.title}" to YouTube…`);
+  try {
+    const res = await ya.runUpload(job, { onProgress: (n, t) => pr.set(n, t), isCancelled: () => pr.cancelled });
+    if (job.ytPlaylistId) await setYtLink(job.key, job.ytPlaylistId);
+    if (pr.cancelled) { toast('Upload paused — resume it any time from Settings → YouTube backup'); return null; }
+    pr.close();
+    return { title: job.title, url: res.url, skipped: res.skipped };
+  } catch (e) {
+    pr.fail(e.message);
+    if (job.ytPlaylistId) await setYtLink(job.key, job.ytPlaylistId);
+    if (e.quota) modal(`<h3>Daily YouTube limit reached</h3><p class="muted">${esc(e.message)}</p><p class="tiny muted">${job.done} of ${job.videoIds.length} songs of "${esc(job.title)}" are already in the playlist.</p><div class="modal-actions"><button class="btn primary" data-close>OK</button></div>`);
+    return e.quota ? { quota: true } : null;
+  }
+}
+function ytDoneModal(results) {
+  results = results.filter(r => r?.url);
+  if (!results.length) return;
+  modal(`<h3>${icon('check')} Saved to YouTube</h3>
+    <p class="muted">${results.length === 1 ? `"${esc(results[0].title)}" is on your YouTube account${results[0].skipped ? ` (${results[0].skipped} videos YouTube wouldn't allow were skipped)` : ''}.` : `${results.length} playlists are on your YouTube account.`}</p>
+    <div class="pick-list">${results.map(r => `<a class="pick" href="${r.url}" target="_blank" rel="noopener">${cover('', r.title, 'sm')}<span><b>${esc(r.title)}</b><small>${r.upToDate ? 'Already up to date' : 'Open on YouTube'}</small></span>${icon('yt')}</a>`).join('')}</div>
+    <div class="modal-actions"><button class="btn primary" data-close>Done</button></div>`);
+}
+async function resumeUpload(key) {
+  const job = (await ya.pendingJobs())[key];
+  if (!job) return toast('Nothing to resume');
+  try { if (!ya.signedIn()) await ya.signIn(); } catch (e) { return toast(e.message, 'err'); }
+  const res = await runUploadJob(job);
+  if (res?.url) ytDoneModal([res]);
+}
+
+// Settings → YouTube backup: pick any playlists (and Liked Songs) and create them on YouTube in one go
+function backupLists() {
+  const liked = store.saved().filter(t => t.liked).sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id);
+  return [
+    ...(liked.length ? [{ key: 'lib:liked', title: 'Liked Songs (BAZINGA!)', ids: liked, liked: true }] : []),
+    ...[...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name)).filter(p => p.trackIds.length).map(p => ({ key: p.id, title: p.name, ids: p.trackIds.filter(id => lib.tracks.has(id)), img: plCover(p) }))
+  ];
+}
+async function ytBackupPicker() {
+  const all = backupLists();
+  if (!all.length) return toast('Make a playlist or like some songs first', 'err');
+  const ready = ya.configured();
+  const links = await kv.get('ytLinks') || {};
+  const r = await modal(`<h3>${icon('yt')} Save playlists to YouTube</h3>
+    <p class="muted tiny">${ready ? 'Pick what to put on your YouTube account. Each one becomes a YouTube playlist; ones you saved before just get the new songs added.' : 'Pick what to open on YouTube.'}</p>
+    <form><div class="pick-list">${all.map(l => `<label class="pick">${l.liked ? likedCover('sm') : cover(l.img, l.title, 'sm')}<span><b>${esc(l.title)}</b><small>${l.ids.length} songs${(lib.playlists.get(l.key)?.ytPlaylistId || links[l.key]) ? ' · on YouTube' : ''}</small></span><input type="checkbox" name="p" value="${esc(l.key)}" checked></label>`).join('')}</div>
+      ${ready ? ytChoiceFields(true, 'Update playlists I saved before (adds only new songs)') : ytNoSetup()}
+      <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">${icon(ready ? 'upload' : 'yt')}${ready ? (ya.signedIn() ? 'Save to YouTube' : 'Sign in & save') : 'Get YouTube links'}</button></div></form>`, { wide: true });
+  if (!r) return;
+  const pick = [].concat(r.p || []);
+  const chosen = all.filter(l => pick.includes(l.key));
+  if (!chosen.length) return toast('Nothing selected');
+  if (!ready) {
+    const have = await ytMatches();
+    const todo = [...new Set(chosen.flatMap(l => l.ids))].filter(id => { const c = have.get(id); return !c?.video && !c?.audio; }).map(id => lib.tracks.get(id)).filter(Boolean);
+    if (todo.length) {
+      const pr = progress('Finding YouTube versions…');
+      try { await yt.matchMany(todo, { onProgress: (n, t) => pr.set(n, t), isCancelled: () => pr.cancelled }); pr.close(); } catch (e) { pr.fail(e.message); }
+      if (pr.cancelled) return;
+    }
+    return modal(`<h3>${icon('yt')} Open on YouTube</h3><div class="yt-links">${await ytLinksHTML(chosen)}</div>`, { wide: true });
+  }
+  try { if (!ya.signedIn()) await ya.signIn(); } catch (e) { return toast(e.message, 'err'); }
+  const results = [];
+  for (const l of chosen) {
+    const res = await uploadList({ ids: l.ids, title: l.title, jobKey: l.key, mode: r.mode, privacy: r.privacy, update: !!r.update, quiet: true });
+    if (res?.quota) break;
+    if (res) results.push(res);
+  }
+  ytDoneModal(results);
+  if (location.hash.startsWith('#/settings')) rerender();
+}
+async function ytBackupPanel() {
+  const jobs = Object.values(await ya.pendingJobs());
+  const ready = ya.configured(), signed = ya.signedIn();
+  const keyForm = `<form id="gcid-form" class="inline-form"><input name="cid" value="${esc(settings.googleClientId || '')}" placeholder="…apps.googleusercontent.com" autocomplete="off"><button class="btn">Save key</button></form>`;
+  const steps = `<ol class="tiny"><li>Open <a class="lnk" href="https://console.cloud.google.com/" target="_blank" rel="noopener">console.cloud.google.com</a> → create a project → enable <b>YouTube Data API v3</b>.</li>
+      <li>OAuth consent screen → External → add yourself as a test user.</li>
+      <li>Credentials → Create credentials → OAuth client ID → <b>Web application</b>. Under Authorized JavaScript origins add <code class="copy" data-act="copy" data-v="${esc(location.origin)}">${esc(location.origin)}</code></li>
+      <li>Copy the Client ID and paste it here.</li></ol>`;
+  return `<section class="panel yt-panel" id="yt-backup"><h2>${icon('yt', 'brand-yt')} YouTube backup</h2>
+    <p class="muted tiny">Turn your BAZINGA! playlists and Liked Songs into real playlists on your YouTube account, and bring your YouTube playlists back in — a second copy of your music, just in case. The YouTube sign-in stays on this device and expires after about an hour.</p>
+    <div class="yt-two">
+      <div class="sub-panel"><b>${icon('upload')} BAZINGA! → YouTube</b><p class="tiny muted">Pick playlists and they're created on your YouTube account automatically.</p>
+        <button class="btn primary" data-act="yt-backup">${icon('upload')}Save playlists to YouTube</button></div>
+      <div class="sub-panel"><b>${icon('import')} YouTube → BAZINGA!</b><p class="tiny muted">Import your YouTube playlists and Liked videos, or any public playlist link (Import music → From YouTube).</p>
+        ${ready ? `<button class="btn" data-act="yt-import-mine">${icon('yt')}Import my YouTube playlists</button>` : `<a class="btn" href="#/settings/import">${icon('import')}Import a playlist link</a>`}</div>
+    </div>
+    <div class="row-btns">${!ready ? '' : signed ? `<span class="ok-line">${icon('check')} YouTube connected</span><button class="btn ghost" data-act="yt-signout">Disconnect</button>` : `<button class="btn ghost" data-act="yt-signin">${icon('yt')}Connect YouTube account</button>`}</div>
+    ${jobs.length ? `<div class="sub-panel"><b>Paused uploads</b>${jobs.map(j => `<div class="snap"><span>${esc(j.title)} · ${j.videoIds.length - j.done} songs left</span><span><button class="btn sm primary" data-act="yt-resume" data-job="${esc(j.key)}">Resume</button> <button class="btn sm ghost" data-act="yt-drop" data-job="${esc(j.key)}">Discard</button></span></div>`).join('')}</div>` : ''}
+    ${ready ? `<details class="howto"><summary>Use your own Google key (for big uploads)</summary><p class="tiny muted">YouTube lets each Google key add about 200 songs a day. With your own free key you get your own daily allowance:</p>${steps}${keyForm}</details>`
+      : `<details class="howto"><summary>Connect your YouTube account (one-time setup)</summary><p class="tiny muted">Creating playlists on YouTube needs a free Google sign-in key. Without it you can still open any playlist on YouTube as a ready-made playlist and import public playlist links.</p>${steps}${keyForm}</details>`}
+  </section>`;
+}
+
+// ---------- import from YouTube ----------
+async function importVideos(title, videos, { liked = false, source = 'YouTube', ytPlaylistId = null } = {}) {
+  const tracks = [], seen = new Set();
+  for (const v of videos) {
+    const { artist, title: t, artists } = yt.videoToSong(v);
+    if (!artist || !t) continue;
+    const id = trackKey(artist, t);
+    if (seen.has(id)) continue; seen.add(id);
+    tracks.push({ id, title: t, artist, artists, durationMs: (v.seconds || 0) * 1000, addedAt: Date.now() });
+    const c = await db.get('ytcache', id);
+    if (!c?.video && !c?.audio) await db.put('ytcache', { video: v.id, audio: v.id, videoTitle: v.title, audioTitle: v.title, fromYouTube: true }, id);
+  }
+  if (!tracks.length) throw new Error('No playable videos found in that playlist.');
+  const saved = await store.upsertTracks(tracks, liked ? { liked: true } : {});
+  if (liked) return { count: saved.length, liked: true };
+  const ex = [...lib.playlists.values()].find(x => ytPlaylistId && x.ytPlaylistId === ytPlaylistId);
+  if (ex) { ex.trackIds = saved.map(t => t.id); ex.name = title; await store.savePlaylist(ex); return { count: saved.length, playlist: ex }; }
+  const p = await store.createPlaylist(title, saved.map(t => t.id), { source, ytPlaylistId });
+  return { count: saved.length, playlist: p };
+}
+async function ytImportMine() {
+  let lists;
+  const pr = progress('Loading your YouTube playlists…');
+  try { if (!ya.signedIn()) await ya.signIn(); lists = await ya.myPlaylists(); pr.close(); } catch (e) { return pr.fail(e.message); }
+  if (!lists.length) return toast('No playlists on that YouTube account');
+  const r = await modal(`<h3>${icon('yt')} Import from YouTube</h3><form><div class="pick-list">${lists.map(p => `<label class="pick">${p.liked ? likedCover('sm') : cover(p.image, p.title, 'sm')}<span><b>${esc(p.title)}</b><small>${p.count ?? '?'} videos${p.liked ? ' · goes to your Liked Songs' : ''}</small></span><input type="checkbox" name="p" value="${esc(p.id)}" ${p.liked ? '' : 'checked'}></label>`).join('')}</div>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">Import</button></div></form>`, { wide: true });
+  if (!r) return;
+  const pick = [].concat(r.p || []);
+  let n = 0;
+  for (const id of pick) {
+    const p = lists.find(x => x.id === id);
+    const pg = progress(`Importing "${p.title}"…`);
+    try { const vids = await ya.playlistVideos(id); const res = await importVideos(p.title, vids, { liked: !!p.liked, ytPlaylistId: p.liked ? null : id }); pg.done(`"${p.title}" — ${res.count} songs`); n++; }
+    catch (e) { pg.fail(`"${p.title}": ${e.message}`); }
+  }
+  renderSidebarPlaylists();
+  if (n) location.hash = '#/library/playlists';
+}
+async function ytImportLink(link) {
+  const id = yt.parsePlaylistId(link);
+  if (!id) return toast('Paste a YouTube playlist link (it contains "list=")', 'err');
+  const pr = progress('Reading YouTube playlist…');
+  try {
+    let data;
+    try { data = await yt.publicPlaylist(id); }
+    catch (e) { if (ya.signedIn()) data = { title: 'YouTube playlist', videos: await ya.playlistVideos(id) }; else throw e; }
+    const res = await importVideos(data.title, data.videos, { ytPlaylistId: id });
+    pr.done(`"${data.title}" — ${res.count} songs imported`);
+    renderSidebarPlaylists();
+    location.hash = '#/playlist/' + res.playlist.id;
+  } catch (e) { pr.fail(e.message); }
+}
+
+// ---------- Support (Buy Me a Coffee) ----------
+const supportPanelInner = () => `<h2>${icon('coffee')} Support BAZINGA!</h2><p class="muted tiny">Free, no ads, made by one person. Tips keep it going — and land you on the <a class="lnk" href="#/support">Top tippers board</a>.</p>${coffeeButton()}`;
+const coffeeButton = (label = 'Buy me a coffee', cls = '') => `<a class="coffee-btn ${cls}" href="${BMC_URL}" target="_blank" rel="noopener">
+  <span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>${label}</b><small>buymeacoffee.com/bazinga.app</small></span><span class="cb-shine"></span></a>`;
+async function vSupport() {
+  if (!lbCache) lbCache = await kv.get('lbCache');
+  clearInterval(lbTimer);
+  lbTimer = setInterval(() => { if (location.hash.startsWith('#/support') && !document.hidden) loadLeaderboard(); else clearInterval(lbTimer); }, 60000);
+  setTimeout(loadLeaderboard, 50);
+  setTimeout(async () => { const old = p2Data?.raised || 0; await loadP2(); if ((p2Data?.raised || 0) !== old) refreshP2Everywhere(); else { const sec = $('.p2-sec'); if (sec) animateP2(sec, 0); } }, 60);
+  view().innerHTML = `<div class="page support">
+    <section class="sup-hero">
+      <div class="sup-bg"></div>
+      <div class="sup-txt">
+        <div class="kicker">Support BAZINGA!</div>
+        <h1>Keep the music free ⚡</h1>
+        <p>BAZINGA! has no ads, no subscriptions and no tracking — it's built and kept alive by one person. If it makes your day a little louder, a coffee goes a long way.</p>
+        ${coffeeButton('Buy me a coffee', 'big')}
+        <p class="tiny muted">Payments are handled securely by Buy Me a Coffee. BAZINGA! never sees your card details.</p>
+      </div>
+      <div class="sup-qr"><div class="qr-card"><img src="icons/bmc-qr.png" alt="QR code for buymeacoffee.com/bazinga.app" width="240" height="240"><span>Scan to tip from your phone</span></div></div>
+    </section>
+    <section class="p2-sec" aria-label="Phase 2 goal">
+      <div class="p2-sec-h"><div><div class="kicker">Phase 2 ⚡</div><h2>Lock-screen listening</h2><p class="muted">The license that lets everyone keep their music and streams playing on the lock screen. Every coffee counts toward it.</p></div>
+      <button class="btn primary" data-act="phase2">${icon('coffee')}Support Phase 2</button></div>
+      ${p2GoalHTML()}
+    </section>
+    <section class="lb" id="leaderboard" aria-label="Top tippers">
+      <div class="lb-head"><div><div class="kicker">Hall of fame</div><h2>Top 5 tippers</h2></div>${cloud.configured() ? '<span class="lb-live"><i></i>Live</span>' : ''}</div>
+      <div class="lb-body">${leaderboardHTML(lbCache)}</div>
+      <p class="tiny muted lb-note">Ranked by total tips. Names appear as entered on Buy Me a Coffee — choose to stay anonymous there and you'll show as "Anonymous".</p>
+    </section>
+    <div class="sup-grid">
+      <div class="panel"><h2>${icon('heart')} What your tip does</h2><p class="muted">Keeps the app free for everyone, pays for testing devices and time spent on new features like the voice assistant and YouTube sync.</p></div>
+      <div class="panel"><h2>${icon('share')} Free ways to help</h2><p class="muted">Share a playlist with a friend, follow along, and tell people about BAZINGA!</p>
+        <div class="row-btns"><a class="btn" href="https://www.instagram.com/bazinga.app" target="_blank" rel="noopener">${icon('instagram')}@bazinga.app</a><a class="btn" href="https://x.com/bazinga_app" target="_blank" rel="noopener">${icon('xsocial')}@bazinga_app</a></div></div>
+    </div>
+  </div>`;
+}
+// ---------- Live top-5 tippers leaderboard (Supabase, fed by the Buy Me a Coffee webhook) ----------
+let lbCache = null, lbTimer = null;
+const money = (n, cur = 'USD') => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, maximumFractionDigits: n % 1 ? 2 : 0 }).format(n); } catch { return '$' + n; } };
+function leaderboardHTML(list) {
+  const rows = (list || []).slice(0, 5);
+  const medal = ['gold', 'silver', 'bronze'];
+  const slot = (t, i) => t ? `<li class="lb-row r${i + 1} ${medal[i] || ''}" style="--d:${i * 70}ms">
+      <span class="lb-rank">${i === 0 ? '<span class="lb-crown">👑</span>' : ''}${i + 1}</span>
+      <span class="lb-av" style="--c:${genreColorSafe(t.name)}">${esc((t.name || 'A')[0].toUpperCase())}</span>
+      <span class="lb-name"><b>${esc(t.name || 'Anonymous')}</b><small>${t.coffees ? `${t.coffees} coffee${t.coffees > 1 ? 's' : ''} ☕` : 'Supporter ⚡'}</small></span>
+      <span class="lb-amt">${money(+t.total, t.currency || 'USD')}</span></li>`
+    : `<li class="lb-row open" style="--d:${i * 70}ms"><span class="lb-rank">${i + 1}</span><span class="lb-av">?</span><span class="lb-name"><b>Your name here</b><small>${i === 0 ? 'Claim the crown 👑' : 'Open spot'}</small></span><a class="lb-claim" href="${BMC_URL}" target="_blank" rel="noopener">Tip</a></li>`;
+  return `<ol class="lb-list">${Array.from({ length: 5 }, (_, i) => slot(rows[i], i)).join('')}</ol>
+    ${!rows.length ? `<p class="lb-empty">The board is wide open — be the first legend on it. ⚡</p>` : ''}`;
+}
+const genreColorSafe = n => { let h = 7; for (const c of String(n)) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 45%)`; };
+async function loadLeaderboard() {
+  if (!cloud.configured()) return;
+  try {
+    const list = await cloud.publicRpc('top_tippers');
+    if (!Array.isArray(list)) return;
+    const changed = JSON.stringify(list) !== JSON.stringify(lbCache);
+    lbCache = list; kv.set('lbCache', list);
+    const el = $('#leaderboard .lb-body'); if (el && changed) el.innerHTML = leaderboardHTML(list);
+  } catch (e) { console.warn('leaderboard', e.message); }
+}
+
+// ---------- Phase 2 goal: lock-screen listening ----------
+// Live total of all tips (Supabase, fed by the Buy Me a Coffee webhook) toward the license that lets
+// BAZINGA! keep playing on the lock screen.
+const P2_GOAL = 1500000;
+let p2Data = null;
+async function loadP2() {
+  if (!p2Data) p2Data = (await kv.get('p2Cache')) || { raised: 0, supporters: 0 };
+  if (!cloud.configured()) return p2Data;
+  try {
+    const r = await cloud.publicRpc('phase2_progress');
+    const row = Array.isArray(r) ? r[0] : r;
+    if (row) { p2Data = { raised: +row.raised || 0, supporters: +row.supporters || 0 }; kv.set('p2Cache', p2Data); }
+  } catch (e) { console.warn('phase2', e.message); }
+  return p2Data;
+}
+const usd0 = n => '$' + Math.round(n).toLocaleString('en-US');
+const p2Pct = d => Math.min(100, (d.raised / P2_GOAL) * 100);
+const p2PctTxt = d => { const v = p2Pct(d); return (v && v < 0.01 ? '<0.01' : v < 10 ? v.toFixed(2) : v.toFixed(1)) + '%'; };
+const p2GoalHTML = (d = p2Data || { raised: 0, supporters: 0 }) => `<div class="p2-goal">
+    <div class="p2-amt"><b data-p2-count="${d.raised}">${usd0(d.raised)}</b><span>raised of ${usd0(P2_GOAL)} goal</span></div>
+    <div class="p2-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${P2_GOAL}" aria-valuenow="${Math.round(d.raised)}"><i style="--p:${Math.max(p2Pct(d), 0.6).toFixed(3)}%"></i></div>
+    <div class="p2-meta"><span>${icon('heart')}<b data-p2-sup>${(d.supporters || 0).toLocaleString('en-US')}</b> supporter${d.supporters === 1 ? '' : 's'}</span><span data-p2-pct>${p2PctTxt(d)}</span>${cloud.configured() ? '<span class="lb-live"><i></i>Live</span>' : ''}</div>
+  </div>`;
+// Count the amount up and grow the bar (feels alive; respects reduced motion)
+function animateP2(root, from = 0) {
+  const b = root.querySelector('[data-p2-count]'); if (!b) return;
+  const to = +b.dataset.p2Count || 0;
+  const bar = root.querySelector('.p2-bar i');
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches || to === from) { b.textContent = usd0(to); return; }
+  if (bar) { const w = bar.style.getPropertyValue('--p'); bar.style.setProperty('--p', '0.6%'); requestAnimationFrame(() => requestAnimationFrame(() => bar.style.setProperty('--p', w))); }
+  const t0 = performance.now(), dur = 1400;
+  const step = now => { const k = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - k, 3); b.textContent = usd0(from + (to - from) * e); if (k < 1 && b.isConnected) requestAnimationFrame(step); };
+  requestAnimationFrame(step);
+}
+function refreshP2Everywhere() {
+  for (const g of $$('.p2-goal')) { const old = +g.querySelector('[data-p2-count]')?.dataset.p2Count || 0; const tmp = document.createElement('div'); tmp.innerHTML = p2GoalHTML(); const n = tmp.firstElementChild; g.replaceWith(n); animateP2(n.parentNode, old); }
+}
+
+async function phase2Popup() {
+  const st = (await kv.get('phase2')) || {};
+  st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
+  await loadP2();
+  const ask = () => `
+      <div class="kicker">Phase 2 ⚡ Lock-screen listening</div>
+      <h3>Help unlock music on your lock screen</h3>
+      <p>Right now your phone pauses BAZINGA! when the screen locks or you leave the app. To let everyone enjoy music and streams on the lock screen, BAZINGA! needs a music license — and that's what Phase 2 is for.</p>
+      ${p2GoalHTML()}
+      <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Support Phase 2</b><small>Every coffee counts ☕</small></span><span class="cb-shine"></span></a>
+      <button class="btn ghost p2-later" data-p2="later">Not now</button>`;
+  const later = () => `
+      <div class="p2-icon">${icon('play')}</div>
+      <h3>No worries — enjoy the music 💛</h3>
+      <p>Just so you know: until Phase 2, <b>keep BAZINGA! open</b> to keep your music playing. Locking your phone or switching apps will pause it.</p>
+      <p class="tiny muted">We'll keep your screen awake while you're in the app${settings.keepAwake === false ? ' (turn it on in Settings → Playback)' : ''}. You can support Phase 2 any time from the ☕ button.</p>
+      <button class="btn primary" data-resolve="later">Got it</button>`;
+  const waiting = () => `
+      <div class="p2-icon spin">${icon('coffee')}</div>
+      <h3>Finishing up on Buy Me a Coffee…</h3>
+      <p class="muted">Come back here when you're done.</p>
+      <button class="btn primary" data-p2="thanks">I'm done ✓</button>
+      <button class="btn ghost" data-p2="back">I didn't support this time</button>`;
+  const thanks = () => `
+      <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 28 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['#ffd60a', '#fff', '#ff7a00', '#ffd60a', '#7cf'][i % 5]}"></i>`).join('')}</div>
+      <div class="p2-icon glow">${icon('heartFill')}</div>
+      <h3>Thank you, legend! ⚡</h3>
+      <p>You just helped bring BAZINGA! closer to Phase 2 — lock-screen listening for everyone. It means a lot.</p>
+      ${p2GoalHTML()}
+      <p class="p2-note">${icon('play')}<span>Until we reach the goal, please <b>keep the app open</b> to keep your music playing.</span></p>
+      <button class="btn primary" data-resolve="thanks">Back to my music</button>`;
+  let body = null, state = 'ask', onBack = null;
+  const show = (k, html) => {
+    state = k; body.dataset.step = k; body.innerHTML = html;
+    body.classList.remove('in'); void body.offsetWidth; body.classList.add('in');
+    if (body.querySelector('.p2-goal')) animateP2(body, k === 'thanks' ? Math.max(0, (p2Data?.raised || 0) * 0.97) : 0);
+  };
+  const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
+    locked: true, // no accidental close: you choose "Support" or "Not now"
+    onMount: m => {
+      m.classList.add('p2-modal');
+      body = m.querySelector('.p2-body'); show('ask', ask());
+      m.addEventListener('click', e => {
+        if (e.target.closest('.p2-support')) {
+          st.supportClickedAt = Date.now(); kv.set('phase2', st);
+          setTimeout(() => show('wait', waiting()), 300);
+          // When you come back from Buy Me a Coffee: thank you (and fetch the new total)
+          onBack = () => { if (document.visibilityState === 'visible' && state === 'wait') thank(); };
+          document.addEventListener('visibilitychange', onBack); window.addEventListener('focus', onBack);
+          return;
+        }
+        const b = e.target.closest('[data-p2]'); if (!b) return;
+        if (b.dataset.p2 === 'later') show('later', later());
+        if (b.dataset.p2 === 'thanks') thank();
+        if (b.dataset.p2 === 'back') show('later', later());
+      });
+    }
+  });
+  async function thank() {
+    if (state === 'thanks') return;
+    st.supportedAt = Date.now(); kv.set('phase2', st);
+    show('thanks', thanks());
+    // the tip reaches our server a few seconds later — update the total when it lands
+    for (const ms of [2500, 9000]) setTimeout(async () => { await loadP2(); refreshP2Everywhere(); }, ms);
+  }
+  if (onBack) { document.removeEventListener('visibilitychange', onBack); window.removeEventListener('focus', onBack); }
+  if (state === 'later') { st.declinedAt = Date.now(); kv.set('phase2', st); }
+}
+// Shown once a day, a few seconds after your first song starts (weekly if you've supported recently)
+let p2Armed = false;
+async function maybePhase2() {
+  if (p2Armed) return; p2Armed = true;
+  const st = (await kv.get('phase2')) || {};
+  const today = new Date().toISOString().slice(0, 10);
+  if (st.lastShown === today) return;
+  if (st.supportedAt && Date.now() - st.supportedAt < 7 * 864e5) return;
+  setTimeout(() => {
+    if (document.hidden || document.querySelector('.modal-wrap') || $('#voice:not([hidden])') || !player.current()) { p2Armed = false; return; }
+    phase2Popup();
+  }, 6000);
+}
+on('player', () => { if (P.playing && !p2Armed && profile) maybePhase2(); });
+
+// ================= SHARING =================
+async function shareTracks(kind, name, tracks, artwork) {
+  const t = [];
+  for (const x of tracks.slice(0, 400)) {
+    const c = await db.get('ytcache', x.id) || {};
+    t.push([x.title, x.artist, x.album || '', x.year || yearOf(x.releaseDate) || 0, x.genre || '', x.durationMs || 0, (x.artwork || '').startsWith('data:') ? '' : x.artwork || '', c.video || '', c.audio || '']);
+  }
+  const packed = await packToString({ k: kind, n: name, by: profile.username, a: (artwork || '').startsWith('data:') ? '' : artwork, t });
+  const url = location.href.split('#')[0] + '#/s/' + packed;
+  modal(`<h3>Share "${esc(name)}"</h3><p class="muted tiny">Anyone with this link can open, play and save it in their own BAZINGA! app. The whole ${kind} is packed inside the link — nothing is uploaded anywhere.</p>
+    <div class="copy-box"><input readonly value="${esc(url)}" aria-label="Share link"></div>
+    <button class="btn primary big" data-act="copy" data-v="${esc(url)}">${icon('link')}Copy link</button>`);
+}
+
+// Copy that also works where the Clipboard API isn't available (e.g. opened from a file)
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); return true; } catch { }
+  const ta = document.createElement('textarea'); ta.value = t; ta.setAttribute('readonly', ''); ta.style.cssText = 'position:fixed;opacity:0';
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch { }
+  ta.remove(); return ok;
+}
+
+// ================= TRACK MENU =================
+async function trackMenu(btn, id, plId) {
+  const t = lib.tracks.get(id); if (!t) return;
+  const c = await db.get('ytcache', id) || {};
+  const pls = [...lib.playlists.values()];
+  const k = await menu(btn, [
+    { header: `<b>${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
+    { k: 'next', label: 'Play next', icon: 'play' },
+    { k: 'queue', label: 'Add to queue', icon: 'queue' },
+    { k: 'addpl', label: 'Add to playlist…', icon: 'plus' },
+    { k: 'like', label: t.liked ? 'Remove from Liked' : 'Add to Liked Songs', icon: 'heart' },
+    '-',
+    t.album || t.itunesAlbumId ? { k: 'album', label: 'Go to album', icon: 'disc' } : null,
+    t.album || t.itunesAlbumId ? { k: 'savealbum', label: 'Save full album', icon: 'plus' } : null,
+    { k: 'artist', label: 'Go to artist', icon: 'mic' },
+    { k: 'share', label: 'Share song', icon: 'share' },
+    '-',
+    { k: 'ytv', label: c.video ? 'Change music video link' : 'Set music video link', icon: 'video' },
+    { k: 'yta', label: c.audio ? 'Change audio link' : 'Set audio link', icon: 'audio' },
+    c.video || c.audio ? { k: 'ytopen', label: 'Open on YouTube', icon: 'yt' } : null,
+    { k: 'file', label: t.localFileId ? 'Replace offline file' : 'Attach offline file', icon: 'offline' },
+    t.localFileId ? { k: 'unfile', label: 'Remove offline file', icon: 'cloudOff' } : null,
+    '-',
+    plId ? { k: 'unpl', label: 'Remove from this playlist', icon: 'trash', danger: true } : null,
+    !t.transient ? { k: 'del', label: 'Remove from library', icon: 'trash', danger: true } : null
+  ]);
+  if (!k) return;
+  if (k === 'next' || k === 'queue') player.addToQueue(id, k === 'next');
+  if (k === 'addpl') addToPlaylistDialog([id]);
+  if (k === 'like') likeClick(id);
+  if (k === 'album') gotoAlbum(t);
+  if (k === 'savealbum') saveAlbumOf(t);
+  if (k === 'artist') location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist));
+  if (k === 'share') shareTracks('song', `${t.title} — ${t.artist}`, [t], t.artwork);
+  if (k === 'ytv' || k === 'yta') setYTLink(t, k === 'ytv' ? 'video' : 'audio', c);
+  if (k === 'ytopen') window.open('https://www.youtube.com/watch?v=' + (c[P.mode] || c.video || c.audio), '_blank', 'noopener');
+  if (k === 'file') pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', f => attachFile(t, f));
+  if (k === 'unfile') { await db.del('files', t.localFileId); await store.updateTrack(id, { localFileId: null }); toast('Offline file removed'); }
+  if (k === 'unpl') { const r = await store.removeFromPlaylist(plId, id); toastUndo('Removed from playlist', async () => { await store.undoRemoveFromPlaylist(r); toast('Put back ✓'); }); }
+  if (k === 'del' && await confirmBox('Remove from library?', `"${esc(t.title)}" will be removed from your library and all playlists.`, 'Remove', true)) { await store.deleteTrack(id); toast('Removed'); }
+}
+
+async function attachFile(t, f) {
+  if (t.transient) await store.upsertTracks([t]);
+  const fileId = 'f_' + t.id;
+  await db.put('files', { id: fileId, blob: f, name: f.name, type: f.type, size: f.size, addedAt: Date.now() });
+  await store.updateTrack(t.id, { localFileId: fileId });
+  toast('Available offline ✓');
+}
+
+async function setYTLink(t, mode, c) {
+  const r = await modal(`<h3>${mode === 'video' ? 'Music video' : 'Audio'} for "${esc(t.title)}"</h3>
+    ${c[mode] ? `<p class="muted tiny">Current: ${esc(c[mode + 'Title'] || c[mode])}</p>` : ''}
+    <form><label class="fld"><span>Paste a YouTube link</span><input name="u" placeholder="https://youtube.com/watch?v=…" required></label>
+    <div class="modal-actions"><a class="btn ghost" target="_blank" rel="noopener" href="https://www.youtube.com/results?search_query=${encodeURIComponent(t.artist + ' ' + t.title + (mode === 'audio' ? ' audio' : ' official video'))}">${icon('search')}Search YouTube</a><button class="btn primary">Save</button></div></form>
+    <button class="btn ghost block" data-resolve="research">${icon('restore')}Search again automatically</button>`);
+  if (!r) return;
+  if (r === 'research') {
+    try { await yt.findForTrack(t, { force: true }); toast('Updated'); } catch (e) { toast(e.message, 'err'); }
+  } else {
+    const vid = yt.parseYouTubeId(r.u);
+    if (!vid) return toast('That doesn\'t look like a YouTube link', 'err');
+    await yt.setManual(t.id, mode, vid);
+    toast('Saved ✓');
+  }
+  emit('dirty', 'yt');
+  if (player.current()?.id === t.id && P.mode === mode) player.reloadCurrent();
+}
+
+async function addToPlaylistDialog(ids) {
+  const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const r = await modal(`<h3>Add to playlist</h3><div class="pick-list">
+    <button class="pick" data-resolve="__new">${'<div class="cover sm noimg"><span>+</span></div>'}<span><b>New playlist</b></span></button>
+    ${pls.map(p => `<button class="pick" data-resolve="${p.id}">${cover(plCover(p), p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} songs</small></span></button>`).join('')}</div>`);
+  if (!r) return;
+  for (const id of ids) { const t = lib.tracks.get(id); if (t?.transient) await store.upsertTracks([t]); }
+  if (r === '__new') {
+    const name = await promptText('New playlist', '', 'Name', 'Create'); if (!name) return;
+    await store.createPlaylist(name, ids); toast(`Added to "${name}"`);
+  } else { const n = await store.addToPlaylist(r, ids); toast(n ? `Added to "${lib.playlists.get(r).name}"` : 'Already in that playlist'); }
+  renderSidebarPlaylists();
+}
+
+async function resolveAlbum(t) {
+  if (t.itunesAlbumId) return { href: `#/album/it/${t.itunesAlbumId}`, itunesAlbumId: t.itunesAlbumId };
+  if (t.albumId && lib.albums.has(t.albumId)) return { href: `#/album/${encodeURIComponent(t.albumId)}` };
+  if (!t.album) return null;
+  const a = await meta.findAlbum(t.artist, t.album).catch(() => null);
+  if (a) { store.updateTrack(t.id, { itunesAlbumId: a.itunesAlbumId }); return { href: `#/album/it/${a.itunesAlbumId}`, itunesAlbumId: a.itunesAlbumId }; }
+  return { href: `#/album/${encodeURIComponent(t.albumId || albumKey(t.artist, t.album))}` };
+}
+async function gotoAlbum(t) {
+  const r = await resolveAlbum(t);
+  if (r) location.hash = r.href; else toast('Album not found', 'err');
+}
+async function saveAlbumOf(t) {
+  const r = await resolveAlbum(t);
+  if (!r?.itunesAlbumId) return toast('Couldn\'t find the full album', 'err');
+  const { album, tracks } = await meta.albumTracks(r.itunesAlbumId);
+  if (!album) return toast('Couldn\'t load that album', 'err');
+  await store.saveAlbum(album, tracks.map(x => lib.tracks.get(x.id) ? { ...x, ...stripTransient(lib.tracks.get(x.id)) } : x));
+  toast(`Saved album "${album.title}" (${tracks.length} songs)`);
+}
+const stripTransient = t => { const x = { ...t }; delete x.transient; return x; };
+
+async function playlistMenu(btn, id) {
+  const p = lib.playlists.get(id); if (!p) return;
+  const k = await menu(btn, [
+    { k: 'rename', label: 'Rename', icon: 'edit' },
+    { k: 'cover', label: 'Change cover', icon: 'file' },
+    { k: 'dup', label: 'Duplicate', icon: 'plus' },
+    { k: 'csv', label: 'Export as CSV', icon: 'import' },
+    p.spotifyId ? { k: 'resync', label: 'Re-sync from Spotify', icon: 'restore' } : null,
+    '-', { k: 'del', label: 'Delete playlist', icon: 'trash', danger: true }
+  ]);
+  if (k === 'rename') { const n = await promptText('Rename playlist', p.name); if (n) { p.name = n; await store.savePlaylist(p); renderSidebarPlaylists(); } }
+  if (k === 'cover') pickFile('image/*', async f => { p.image = await imageToDataURL(f, 400); await store.savePlaylist(p); });
+  if (k === 'dup') { const np = await store.createPlaylist(p.name + ' (copy)', p.trackIds); renderSidebarPlaylists(); location.hash = '#/playlist/' + np.id; }
+  if (k === 'csv') {
+    const rows = [['Track Name', 'Artist Name(s)', 'Album Name', 'Release Date', 'Genres', 'Duration (ms)']];
+    for (const tid of p.trackIds) { const t = lib.tracks.get(tid); if (t) rows.push([t.title, t.artist, t.album || '', t.releaseDate || t.year || '', t.genre || '', t.durationMs || '']); }
+    downloadBlob(new Blob([rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\n')], { type: 'text/csv' }), p.name + '.csv');
+  }
+  if (k === 'resync') {
+    const pr = progress(`Syncing "${p.name}"…`);
+    try { const tr = await sp.playlistTracks(p.spotifyId, (n, t) => pr.set(n, t)); const s = await store.upsertTracks(tr); p.trackIds = s.map(t => t.id); await store.savePlaylist(p); pr.done('Synced ✓'); }
+    catch (e) { pr.fail(e.message); }
+  }
+  if (k === 'del' && await confirmBox('Delete playlist?', `"${esc(p.name)}" will be deleted. Songs stay in your library if they're liked or in other playlists/albums.`, 'Delete', true)) {
+    await store.deletePlaylist(id); renderSidebarPlaylists(); location.hash = '#/library/playlists';
+  }
+}
+
+// ================= LIKES =================
+// The heart flips the moment you tap it (no page reload). On the Liked Songs page an un-liked song
+// stays put for a few seconds (dimmed) so you can tap the heart again to keep it.
+const LIKE_GRACE = 6000;
+const likeTimers = new Map();
+function setHeart(b, on) {
+  if (!b) return;
+  b.classList.toggle('on', on);
+  b.innerHTML = icon(on ? 'heartFill' : 'heart');
+  b.setAttribute('aria-pressed', on);
+  b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop');
+}
+function likeClick(id, btn) {
+  const t = lib.tracks.get(id); if (!t) return;
+  const on = !(t.liked && !t.transient);
+  if (btn) setHeart(btn, on);
+  store.setLiked(id, on).catch(e => toast(e.message, 'err'));
+  if (on) toast('Added to Liked Songs');
+  else toastUndo('Removed from Liked Songs', () => store.setLiked(id, true));
+}
+function markUnliked() {
+  for (const id of likeTimers.keys()) $$(`[data-tsec="liked"] .row[data-id="${CSS.escape(id)}"]`).forEach(r => r.classList.add('unliked'));
+}
+function onLikeChanged({ id, liked }) {
+  const sel = CSS.escape(id);
+  $$(`.like[data-id="${sel}"]`).forEach(b => { if (b.classList.contains('on') !== liked) setHeart(b, liked); });
+  if (player.current()?.id === id) $$('#playerbar .like, #np .np-info .like').forEach(b => { if (b.classList.contains('on') !== liked) setHeart(b, liked); });
+  const sec = sections.get('liked');
+  if (sec) {
+    clearTimeout(likeTimers.get(id)); likeTimers.delete(id);
+    $$(`[data-tsec="liked"] .row[data-id="${sel}"]`).forEach(r => r.classList.toggle('unliked', !liked));
+    if (!liked) likeTimers.set(id, setTimeout(() => {
+      likeTimers.delete(id);
+      if (lib.tracks.get(id)?.liked || sections.get('liked') !== sec) return;
+      $$(`[data-tsec="liked"] .row[data-id="${sel}"]`).forEach(r => r.classList.add('leaving'));
+      setTimeout(() => { if (sections.get('liked') !== sec) return; sec.tracks = sec.tracks.filter(t => t.id !== id); refreshSection('liked'); markUnliked(); likedCount(); }, 280);
+    }, LIKE_GRACE));
+    else if (!sec.tracks.some(t => t.id === id) && lib.tracks.get(id)) { sec.tracks = [lib.tracks.get(id), ...sec.tracks]; refreshSection('liked'); markUnliked(); }
+  }
+  likedCount();
+}
+function likedCount() {
+  const n = store.saved().filter(t => t.liked).length;
+  const el = $('.tab[data-tab="liked"] small'); if (el) el.textContent = n;
+}
+
+// ================= GLOBAL EVENTS =================
+function pickFile(accept, cb, { multiple = false, dir = false } = {}) {
+  const i = document.createElement('input');
+  i.type = 'file'; i.accept = accept; i.multiple = multiple;
+  if (dir) i.webkitdirectory = true;
+  i.onchange = () => { const fs = [...i.files]; if (fs.length) cb(multiple || dir ? fs : fs[0]); };
+  i.click();
+}
+
+function idsForPlayAct(el) {
+  const key = el.dataset.id;
+  if (lists.has(key)) return lists.get(key);
+  return [];
+}
+
+function wireGlobal() {
+  document.addEventListener('click', async e => {
+    const a = e.target.closest('[data-act]');
+    if (!a) return;
+    const act = a.dataset.act, id = a.dataset.id;
+    switch (act) {
+      case 'play-row': {
+        if (e.target.closest('a')) return; // artist/album links
+        if (a.dataset.list === 'pl') notePlaylistPlay(location.hash.split('/')[2]);
+        const ids = lists.get(a.dataset.list) || [a.dataset.id];
+        const i = +a.dataset.i;
+        if (player.current()?.id === a.dataset.id && nowCtx.list === a.dataset.list && nowCtx.i === i) { player.toggle(); return; }
+        nowCtx = { list: a.dataset.list, i, id: a.dataset.id };
+        player.playList(ids, Math.min(i, ids.length - 1), { shuffle: false });
+        break;
+      }
+      case 'like': e.stopPropagation(); likeClick(id, a); break;
+      case 'track-menu': e.stopPropagation(); trackMenu(a, id, a.dataset.pl); break;
+      case 'goto-album': e.preventDefault(); e.stopPropagation(); gotoAlbum(lib.tracks.get(id)); break;
+      case 'play-list': {
+        const ids = lists.get(id) || [];
+        if (a.dataset.queue) player.addToQueue(ids);
+        else if (a.dataset.shuffle) { nowCtx = { list: null }; player.playList(ids, a.dataset.shuffle ? Math.floor(Math.random() * ids.length) : 0, { shuffle: !!a.dataset.shuffle }); }
+        else { nowCtx = { list: id, i: 0, id: ids[0] }; player.playList(ids, 0, { shuffle: false }); }
+        if (id === 'pl') notePlaylistPlay(location.hash.split('/')[2]);
+        break;
+      }
+      case 'play-playlist': e.preventDefault(); e.stopPropagation(); notePlaylistPlay(id); player.playList(lib.playlists.get(id)?.trackIds || [], 0, { shuffle: false }); break;
+      case 'play-album': {
+        e.preventDefault(); e.stopPropagation();
+        const al = lib.albums.get(id) || store.implicitAlbums().find(x => x.id === id);
+        player.playList(al?.trackIds || [], 0, { shuffle: false }); break;
+      }
+      case 'play-artist': {
+        e.preventDefault(); e.stopPropagation();
+        const n = norm(a.dataset.name);
+        player.playList(store.saved().filter(t => (t.artists?.length ? t.artists : [t.artist]).some(x => norm(x) === n) || norm(mainArtist(t.artist)) === n).map(t => t.id), 0, { shuffle: true }); break;
+      }
+      case 'toggle-filters': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key].open = !fstate[key].open; refreshSection(key); break; }
+      case 'f-genre': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const g = a.dataset.g; f.genres = f.genres?.includes(g) ? f.genres.filter(x => x !== g) : [...(f.genres || []), g]; refreshSection(key); break; }
+      case 'f-year': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const y = +a.dataset.y; f.years = f.years?.includes(y) ? f.years.filter(x => x !== y) : [...(f.years || []), y]; refreshSection(key); break; }
+      case 'f-flag': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key][a.dataset.k] = !fstate[key][a.dataset.k]; refreshSection(key); break; }
+      case 'f-clear': { const key = a.closest('[data-tsec]').dataset.tsec; Object.assign(fstate[key], { genres: [], years: [], liked: false, offline: false, q: '' }); refreshSection(key); break; }
+      case 'new-playlist': { const n = await promptText('New playlist', '', 'Name', 'Create'); if (n) { const p = await store.createPlaylist(n); renderSidebarPlaylists(); location.hash = '#/playlist/' + p.id; } break; }
+      case 'playlist-menu': playlistMenu(a, id); break;
+      case 'share-playlist': { const p = lib.playlists.get(id); shareTracks('playlist', p.name, p.trackIds.map(x => lib.tracks.get(x)).filter(Boolean), plCover(p)); break; }
+      case 'share-album': { const { album, tracks } = window.__album; shareTracks('album', `${album.title} — ${album.artist}`, tracks, album.artwork); break; }
+      case 'save-album': { const { album, tracks } = window.__album; await store.saveAlbum(album, tracks.map(stripTransient)); toast(`Album saved to your library`); break; }
+      case 'unsave-album': if (await confirmBox('Remove album?', 'The album will be removed from your library. Liked songs and songs in playlists stay.', 'Remove', true)) { await store.removeAlbum(id); toast('Album removed'); } break;
+      case 'album-offline': { const { tracks } = window.__album; pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', fs => addLocalFiles(fs, { albumHint: tracks }), { multiple: true }); break; }
+      case 'save-shared': {
+        const { d, tracks } = window.__shared;
+        const saved = await store.upsertTracks(tracks.map(stripTransient));
+        if (d.k === 'song') { await store.updateTrack(saved[0].id, { liked: true }); toast('Added to Liked Songs'); }
+        else { const p = await store.createPlaylist(d.n, saved.map(t => t.id), { source: 'shared by ' + (d.by || 'friend'), image: d.a || '' }); renderSidebarPlaylists(); location.hash = '#/playlist/' + p.id; }
+        break;
+      }
+      case 'match-list': matchList(lists.get(a.dataset.list) || []); break;
+      case 'yt-export': ytExport(lists.get(a.dataset.list) || [], a.dataset.name, a.dataset.job); break;
+      case 'yt-signin': try { await ya.signIn({ prompt: 'select_account' }); toast('YouTube connected ✓', 'ok'); rerender(); } catch (err) { toast(err.message, 'err'); } break;
+      case 'yt-signout': await ya.signOut(); toast('Disconnected from YouTube'); rerender(); break;
+      case 'yt-import-mine': ytImportMine(); break;
+      case 'yt-resume': resumeUpload(a.dataset.job); break;
+      case 'yt-drop': await ya.dropJob(a.dataset.job); rerender(); break;
+      case 'support': e.preventDefault(); phase2Popup(); break;
+      case 'phase2': e.preventDefault(); phase2Popup(); break;
+      case 'exportify': openExportify(); break;
+      case 'sp-liked': spImportLiked(); break;
+      case 'sp-playlists': spChoosePlaylists(); break;
+      case 'sp-disconnect': await sp.disconnect(); route(); break;
+      case 'add-files': pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', fs => addLocalFiles(fs), { multiple: true }); break;
+      case 'add-folder': pickFile('', fs => addLocalFiles(fs), { dir: true }); break;
+      case 'go-back': goBack(); break;
+      case 'voice': e.preventDefault(); openVoice(); break;
+      case 'play-it-album': {
+        e.preventDefault(); e.stopPropagation();
+        try { const { tracks } = await meta.albumTracks(id); player.playList(tracks.map(t => (lib.tracks.get(t.id) || store.remember(t)).id), 0, { shuffle: false }); }
+        catch { toast('Couldn\'t load that album right now', 'err'); }
+        break;
+      }
+      case 'copy': copyText(a.dataset.v).then(ok => {
+        toast(ok ? 'Link copied ✓' : 'Couldn\'t copy — select the link and copy it', ok ? 'ok' : 'err');
+        if (ok && a.classList.contains('big')) { a.innerHTML = `${icon('check')}Copied!`; setTimeout(() => { if (a.isConnected) a.innerHTML = `${icon('link')}Copy link`; }, 2000); }
+      }); break;
+      case 'az': {
+        e.preventDefault();
+        // The letters always work alphabetically: switch the list to A–Z, then jump
+        if (artistUI.sort !== 'az' || artistUI.q) { artistUI.sort = 'az'; artistUI.q = ''; const qi = $('#art-q'); if (qi) qi.value = ''; }
+        { // make sure that letter is loaded (lists show 100 at a time)
+          const sorted = store.artists().sort((x, y) => x.name.localeCompare(y.name));
+          const idx = sorted.findIndex(x => letterOf(x.name) === a.dataset.l);
+          artistUI.limit = Math.max(PAGE_N, idx + PAGE_N);
+          redrawArtists();
+        }
+        $$('.az a').forEach(x => x.classList.toggle('on', x === a));
+        $(`#artist-list [data-letter="${a.dataset.l}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        break;
+      }
+      case 'retry-route': route(); break;
+      case 'filter-go': { const i = a.closest('.fsearch')?.querySelector('input'); if (i) { if (!i.value) i.focus(); else { i.blur(); const key = a.closest('[data-tsec]')?.dataset.tsec; if (key) { fstate[key].q = i.value; refreshSection(key); } } } break; }
+      case 'a2hs': maybeInstallPrompt(true); break;
+      case 'art-more': artistUI.limit += PAGE_N; redrawArtists(); break;
+      case 'show-more': showMore(a.dataset.pg); break;
+      case 'art-sort': artistUI.sort = a.dataset.v; artistUI.limit = PAGE_N; redrawArtists(); $$('.az a').forEach(x => x.classList.remove('on')); break;
+      case 'yt-backup': ytBackupPicker(); break;
+      case 'yt-more': {
+        const k = await menu(a, [{ k: 'match', label: 'Find YouTube matches', icon: 'yt' }, { k: 'save', label: 'Save to YouTube', icon: 'upload' }]);
+        if (k === 'match') matchList(lists.get(a.dataset.list) || []);
+        if (k === 'save') ytExport(lists.get(a.dataset.list) || [], a.dataset.name, a.dataset.job);
+        break;
+      }
+      case 'rename-user': { const n = await promptText('Change username', profile.username, 'Username'); if (n) { profile.username = n; await profileChanged(); rerender(); } break; }
+      case 'remove-pic': profile.picture = ''; await profileChanged(); rerender(); break;
+      case 'sso': e.preventDefault(); if (a.dataset.p === 'email') openAuth(cloud.signedIn() ? 'login' : 'signup'); else startProvider(a.dataset.p); break;
+      case 'sync-now': sync.syncNow().then(() => { const S = sync.state(); toast(S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.status === 'synced' ? 'ok' : 'err'); }); break;
+      case 'change-pw': setNewPassword(); break;
+      case 'sign-out': signOutFlow(); break;
+      case 'bk-link': try { await backup.linkFile(); rerender(); } catch (err) { if (err.name !== 'AbortError') toast(err.message, 'err'); } break;
+      case 'bk-regrant': await backup.regrant(); rerender(); renderBackupNag(); break;
+      case 'bk-unlink': await backup.unlinkFile(); rerender(); break;
+      case 'bk-download': await backup.download(); toast('Backup downloaded ✓'); renderBackupNag(); break;
+      case 'bk-restore-file': pickFile('.json,application/json', async f => {
+        if (!await confirmBox('Restore this backup?', 'Your current library will be replaced with the one in the backup file.', 'Restore')) return;
+        try { await backup.restoreFromFile(f); toast('Restored ✓'); setTimeout(() => location.reload(), 600); } catch (err) { toast(err.message, 'err'); }
+      }); break;
+      case 'bk-restore-snap': if (await confirmBox('Restore snapshot?', 'Your current library will be replaced with this snapshot.', 'Restore')) { await backup.restoreInternal(id); location.reload(); } break;
+      case 'clear-ytcache': if (await confirmBox('Forget YouTube matches?', 'Songs will be searched again next time they play.', 'Forget', true)) { await db.clear('ytcache'); yt.forget(); toast('Done'); } break;
+      case 'delete-account': deleteAccount(); break;
+      case 'bk-nag-dl': await backup.download(); renderBackupNag(); break;
+      case 'bk-nag-x': await kv.set('lastDownload', Date.now()); renderBackupNag(); break;
+    }
+  });
+  // Faster song switching: look a song up as soon as you rest on it / touch it
+  let hoverT = null;
+  document.addEventListener('pointerover', e => {
+    const r = e.target.closest?.('.row[data-id], .qrow [data-qjump]'); if (!r) return;
+    clearTimeout(hoverT);
+    const id = r.dataset.id || P.queue[+r.dataset.qjump]?.id;
+    if (id) hoverT = setTimeout(() => player.prefetch(id), e.pointerType === 'mouse' ? 220 : 0);
+  }, { passive: true });
+  document.addEventListener('pointerout', e => { if (e.target.closest?.('.row')) clearTimeout(hoverT); }, { passive: true });
+  // Keyboard: Enter on a row plays it; space toggles playback
+  document.addEventListener('keydown', e => {
+    if (e.target.matches('input,textarea,select')) return;
+    if (e.key === 'Enter' && e.target.matches('.row')) e.target.click();
+    if (e.code === 'Space' && !e.target.matches('button,a,.row')) { e.preventDefault(); player.toggle(); }
+  });
+  // Filter inputs
+  document.addEventListener('input', e => {
+    const f = e.target.dataset.f; if (!f) return;
+    const key = e.target.closest('[data-tsec]')?.dataset.tsec; if (!key) return;
+    fstate[key][f] = e.target.value;
+    if (f === 'q' || f === 'from' || f === 'to') debouncedRefresh(key);
+    else refreshSection(key);
+  });
+  document.addEventListener('change', e => {
+    if (e.target.dataset.f === 'sort') { const key = e.target.closest('[data-tsec]').dataset.tsec; fstate[key].sort = e.target.value; refreshSection(key); }
+  });
+  // Drag & drop CSV/audio anywhere
+  document.addEventListener('dragover', e => { if (profile) e.preventDefault(); });
+  document.addEventListener('drop', e => {
+    if (!profile) return; e.preventDefault();
+    const fs = [...e.dataTransfer.files];
+    const csv = fs.filter(f => /\.(csv|zip)$/i.test(f.name)), aud = fs.filter(f => imp.AUDIO_EXT.test(f.name));
+    const apple = fs.filter(f => /\.(xml|txt)$/i.test(f.name));
+    if (csv.length) importCSVFiles(csv);
+    if (apple.length) importAppleFiles(apple);
+    if (aud.length) addLocalFiles(aud);
+  });
+
+  on('library', () => { renderSidebarPlaylists(); if (!document.querySelector('.modal-wrap') && !isTyping()) softRefresh(); });
+  on('player', renderPlayer);
+  on('like', onLikeChanged);
+  on('needs-tap', () => { openNP(); requestAnimationFrame(placeDock); });
+  on('track-art', ({ id, artwork }) => {
+    $$(`.row[data-id="${CSS.escape(id)}"] .row-num .cover`).forEach(c => { c.outerHTML = cover(artwork, lib.tracks.get(id)?.title, 'sm'); });
+    markNow();
+    if (player.current()?.id === id) { renderPlayer(); if (document.body.classList.contains('np-open')) renderNP(true); }
+  });
+  on('time', renderTime);
+  on('video-visible', v => document.body.classList.toggle('has-video', v));
+  on('backup-state', renderBackupNag);
+  window.addEventListener('online', () => document.body.classList.remove('is-offline'));
+  window.addEventListener('offline', () => document.body.classList.add('is-offline'));
+  if (!navigator.onLine) document.body.classList.add('is-offline');
+  // Re-place the video on any size change (window, phone rotation, browser bars)
+  const schedulePlace = () => requestAnimationFrame(() => requestAnimationFrame(placeDock));
+  window.addEventListener('resize', schedulePlace);
+  window.visualViewport?.addEventListener('resize', schedulePlace);
+  if ('ResizeObserver' in window) new ResizeObserver(schedulePlace).observe($('#np'));
+  // Yellow fill on every slider as it moves
+  document.addEventListener('input', e => { const r = e.target; if (r.type === 'range') r.style.setProperty('--p', (100 * (r.value - (r.min || 0)) / ((r.max || 100) - (r.min || 0))).toFixed(2) + '%'); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.body.classList.contains('np-open') && !$('.modal-wrap')) closeNP(); });
+  wirePlayerUI();
+}
+const debouncedRefresh = debounce(k => refreshSection(k, true), 200);
+const isTyping = () => document.activeElement?.matches('input,textarea');
+// Lighter refresh: only re-render sections in place when possible
+function softRefresh() {
+  const h = location.hash;
+  if (/^#\/(search|import|settings|s\/)/.test(h)) return;
+  rerender();
+}
+
+async function deleteAccount() {
+  const ok = await modal(`<h3>Delete your account?</h3>
+    <p class="muted">This permanently erases <b>${esc(profile.username)}</b> and everything BAZINGA! saved on this device: library, playlists, albums, offline files and on-device backups${cloud.signedIn() ? ', <b>plus your online account and synced music on every device</b>' : ''}. This can't be undone.</p>
+    <form><label class="fld"><span>Type your username to confirm</span><input name="u" required autocomplete="off"></label>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn danger">Delete everything</button></div></form>`);
+  if (!ok) return;
+  if (ok.u.trim() !== profile.username) return toast('Username didn\'t match — nothing was deleted', 'err');
+  if (cloud.signedIn()) {
+    try { await sync.deleteCloudData(); await cloud.signOut(); }
+    catch (e) { return toast('Couldn\'t delete your cloud account: ' + e.message + ' — nothing was deleted. Try again when online.', 'err'); }
+  }
+  await wipeDevice();
+}
+
+// ================= SIDEBAR / PROFILE =================
+function renderProfileChip() {
+  const S = sync.state();
+  const dot = cloud.signedIn() ? `<i class="sync-dot ${S.status}" title="${S.status === 'synced' ? 'Synced' : S.status === 'syncing' ? 'Syncing…' : S.status === 'error' ? 'Sync problem' : 'Signed in'}"></i>` : '';
+  const html = `<div class="avatar">${profile.picture ? `<img src="${esc(profile.picture)}" alt="" referrerpolicy="no-referrer">` : esc(profile.username[0].toUpperCase())}${dot}</div><span>${esc(profile.username)}</span>`;
+  $$('.profile-chip').forEach(el => el.innerHTML = html);
+}
+function renderSidebarPlaylists() {
+  const el = $('#side-pl'); if (!el) return;
+  const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
+  el.innerHTML = `<a href="#/library/liked" class="spl">${likedCover('sm')}<span>Liked Songs</span></a>` +
+    pls.map(p => `<a href="#/playlist/${p.id}" class="spl">${cover(plCover(p), p.name, 'sm')}<span>${esc(p.name)}</span></a>`).join('');
+}
+async function renderBackupNag() {
+  const el = $('#nag'); if (!el || !profile) return;
+  const st = backup.linkedFileState();
+  const lastD = await kv.get('lastDownload');
+  const n = store.saved().length;
+  if (st === 'needs-permission') el.innerHTML = `<div class="nag">${icon('restore')}<span>Auto-backup to your file is paused.</span><button class="btn sm primary" data-act="bk-regrant">Resume</button></div>`;
+  else if (!backup.fsSupported && n > 20 && (!lastD || Date.now() - lastD > 7 * 864e5)) el.innerHTML = `<div class="nag">${icon('restore')}<span>Keep your library safe — save a backup file to this device.</span><button class="btn sm primary" data-act="bk-nag-dl">Save backup</button><button class="ib sm" data-act="bk-nag-x" aria-label="Dismiss">${icon('close')}</button></div>`;
+  else el.innerHTML = '';
+}
+
+// ================= PLAYER UI =================
+function wirePlayerUI() {
+  const bar = $('#playerbar'), np = $('#np');
+  const handle = e => {
+    const b = e.target.closest('[data-p]'); if (!b) return;
+    const k = b.dataset.p;
+    if (k === 'toggle') player.toggle();
+    if (k === 'next') player.next();
+    if (k === 'prev') player.prev();
+    if (k === 'shuffle') player.setShuffle(!P.shuffle);
+    if (k === 'repeat') player.cycleRepeat();
+    if (k === 'mode') player.setMode(b.dataset.m);
+    if (k === 'like') { const t = player.current(); if (t) likeClick(t.id, b); }
+    if (k === 'queue') toggleQueue();
+    if (k === 'npq') toggleNPQueue();
+    if (k === 'lyrics') setLyrics(!document.body.classList.contains('np-lyr'));
+    if (k === 'dock-min') { document.body.classList.toggle('dock-min'); dockMinLabel(); try { localStorage.setItem('bz_dock_min', document.body.classList.contains('dock-min') ? '1' : ''); } catch { } placeDock(); }
+    if (k === 'open') openNP();
+    if (k === 'close') closeNP();
+    if (k === 'more') { const t = player.current(); if (t) trackMenu(b, t.id); }
+    if (k === 'mute') player.setVolume(P.volume > 0 ? 0 : 0.8);
+    if (k === 'artist') { const t = player.current(); if (t) { closeNP('nav'); location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist)); } }
+    if (k === 'album') { const t = player.current(); if (t) { closeNP('nav'); gotoAlbum(t); } }
+    if (k === 'dock-size') { document.body.classList.toggle('dock-big'); placeDock(); }
+  };
+  const head = $('#np-head');
+  bar.addEventListener('click', handle); np.addEventListener('click', handle); head.addEventListener('click', handle);
+  $('#yt-dock').addEventListener('click', handle);
+  for (const r of $$('.seek')) {
+    r.addEventListener('input', () => { seeking = true; $$('.t-now').forEach(x => x.textContent = fmtTime(r.value * P.duration / 1000)); });
+    r.addEventListener('change', () => { player.seek(r.value * P.duration / 1000); seeking = false; });
+  }
+  $$('.vol').forEach(v => v.addEventListener('input', () => player.setVolume(+v.value)));
+  // Swipe down to close now-playing on phones
+  let y0 = null;
+  // Scroll from anywhere: a swipe or mouse wheel on the top bar / cover scrolls the page below it.
+  // Swiping DOWN there while the page is at the top closes the player.
+  // The full-screen player scrolls the page itself, so the browser moves the video natively.
+  // Pulling down on the top bar / cover while at the very top closes it.
+  let fwd = false;
+  const tStart = e => { y0 = e.target.closest('.np-top, .np-media.art') && scrollY < 2 ? e.touches[0].clientY : null; fwd = false; };
+  const tMove = e => { if (y0 !== null && e.touches[0].clientY < y0 - 6) fwd = true; };
+  const tEnd = e => { if (y0 !== null && !fwd && scrollY < 2 && e.changedTouches[0].clientY - y0 > 110) closeNP(); y0 = null; };
+  for (const el of [np, head]) { el.addEventListener('touchstart', tStart, { passive: true }); el.addEventListener('touchmove', tMove, { passive: true }); el.addEventListener('touchend', tEnd, { passive: true }); }
+  let headDark = false;
+  window.addEventListener('scroll', () => { const d = scrollY > 8; if (d !== headDark) { headDark = d; head.classList.toggle('scrolled', d); } }, { passive: true });
+  try { history.scrollRestoration = 'manual'; } catch { }
+  try { if (localStorage.getItem('bz_dock_min')) document.body.classList.add('dock-min'); if (localStorage.getItem('bz_npq') !== '0') document.body.classList.add('np-q'); if (localStorage.getItem('bz_lyr')) document.body.classList.add('np-lyr'); } catch { }
+  dockMinLabel();
+  // Buttons outside the player (e.g. "Jump back in" on Home)
+  document.addEventListener('click', e => { const l = e.target.closest('[data-artist-search]'); if (l) { lastSearch.q = l.dataset.artistSearch; } });
+  // About to open an artist? Start fetching their photo now, so it's there when the page opens
+  const warmArtist = e => {
+    const l = e.target.closest?.('a[href^="#/artist/"]'); if (!l) return;
+    let name = ''; try { name = decodeURIComponent(l.getAttribute('href').slice(9)); } catch { return; }
+    if (name && !meta.artistPictureNow(name)) meta.artistPicture(name, true).then(pic => { if (pic) { const i = new Image(); i.src = sized(pic, 600); } });
+  };
+  document.addEventListener('pointerover', warmArtist, { passive: true });
+  document.addEventListener('touchstart', warmArtist, { passive: true });
+  document.addEventListener('click', e => { const b = e.target.closest('[data-p-ext]'); if (!b) return; if (b.dataset.pExt === 'toggle') player.toggle(); if (b.dataset.pExt === 'open') openNP(); });
+}
+let seeking = false;
+// Full-screen player. Opening it adds a history step, so the phone's Back button/gesture closes it
+// instead of leaving the page. Any navigation closes it properly (the video goes back to its corner).
+function openNP() {
+  if (!player.current()) return;
+  const was = document.body.classList.contains('np-open');
+  if (!was) window.scrollTo(0, 0);
+  document.body.classList.add('np-open'); renderNP(true); requestAnimationFrame(placeDock); setTimeout(placeDock, 320);
+  if (!was && !history.state?.bzNP) { try { history.pushState({ bzNP: 1 }, ''); } catch { } }
+  saveSpotSoon();
+}
+function closeNP(how = 'ui') {
+  const was = document.body.classList.contains('np-open');
+  document.body.classList.remove('np-open'); if (was) window.scrollTo(0, 0); placeDock(); saveSpotSoon();
+  if (!was || how === 'pop' || !history.state?.bzNP) return;
+  if (how === 'ui') history.back(); else { try { history.replaceState(null, ''); } catch { } }
+}
+window.addEventListener('popstate', e => { if (document.body.classList.contains('np-open') && !e.state?.bzNP) closeNP('pop'); });
+function toggleQueue() {
+  if (innerWidth < 1000) { location.hash = '#/queue'; return; }
+  document.body.classList.toggle('queue-open');
+  if (document.body.classList.contains('queue-open')) renderQueue($('#queue-panel .qp-body'));
+  placeDock();
+}
+function dockMinLabel() {
+  const b = $('[data-p="dock-min"]'); if (!b) return;
+  const min = document.body.classList.contains('dock-min');
+  b.setAttribute('aria-label', min ? 'Show video' : 'Minimize video'); b.title = min ? 'Show video' : 'Minimize';
+}
+function toggleNPQueue() {
+  const on = !document.body.classList.contains('np-q');
+  document.body.classList.toggle('np-q', on);
+  try { localStorage.setItem('bz_npq', on ? '1' : '0'); } catch { }
+  renderNP();
+  if (on && npNarrow.matches) setTimeout(() => npScrollTo($('#np .np-queue')), 60);
+}
+function closeQueueOnMobile() { if (innerWidth < 1000) document.body.classList.remove('queue-open'); }
+
+let lastPlayedId = null;
+function renderPlayer() {
+  const t = player.current();
+  if (t && P.playing && t.id !== lastPlayedId) { lastPlayedId = t.id; kv.get('plays').then(n => kv.set('plays', (n || 0) + 1)); }
+  document.body.classList.toggle('has-track', !!t);
+  const bar = $('#playerbar');
+  if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; return; }
+  // Play/pause/buffering only touch the play button — the rest of the bar is left alone (instant, no flicker)
+  const key = [t.id, t.artwork, displayTitle(t), t.artist, t.liked && !t.transient, P.error, P.mode, P.source, P.shuffle, P.repeat, document.body.classList.contains('queue-open'), P.volume > 0].join('|');
+  if (bar.dataset.key === key && bar.firstElementChild) { patchPlayButtons(); playerTail(t); return; }
+  bar.dataset.key = key;
+  const modeBtns = `<div class="seg" role="group" aria-label="Playback version">
+    <button data-p="mode" data-m="video" class="${P.mode === 'video' ? 'on' : ''}" title="Music video">${icon('video')}<span>Video</span></button>
+    <button data-p="mode" data-m="audio" class="${P.mode === 'audio' ? 'on' : ''}" title="Audio only">${icon('audio')}<span>Audio</span></button></div>`;
+  bar.innerHTML = `<div class="pb-progress"><i></i></div>
+    <div class="pb-left" data-p="open">
+      ${cover(t.artwork, t.title, 'pb-art')}
+      <div class="pb-meta"><div class="pb-title">${esc(displayTitle(t))}</div><div class="pb-artist">${P.error ? `<span class="err-text">${esc(P.error)}</span>` : esc(t.artist)}</div></div>
+      <button class="ib like ${t.liked && !t.transient ? 'on' : ''}" data-p="like" aria-label="Like">${icon(t.liked && !t.transient ? 'heartFill' : 'heart')}</button>
+    </div>
+    <div class="pb-center">
+      <div class="pb-ctrls">
+        <button class="ib hide-sm ${P.shuffle ? 'on' : ''}" data-p="shuffle" aria-label="Shuffle">${icon('shuffle')}</button>
+        <button class="ib pb-prev" data-p="prev" aria-label="Previous">${icon('prev')}</button>
+        <button class="play-btn ${P.loading ? 'busy' : ''}" data-p="toggle" data-on="${player.isOn() ? 1 : 0}" aria-label="${player.isOn() ? 'Pause' : 'Play'}">${icon(player.isOn() ? 'pause' : 'play')}</button>
+        <button class="ib" data-p="next" aria-label="Next">${icon('next')}</button>
+        <button class="ib hide-sm ${P.repeat !== 'off' ? 'on' : ''}" data-p="repeat" aria-label="Repeat">${icon('repeat')}${P.repeat === 'one' ? '<b class="r1">1</b>' : ''}</button>
+      </div>
+      <div class="pb-seek hide-sm"><span class="t-now">${fmtTime(P.time)}</span><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><span class="t-dur">${fmtTime(P.duration)}</span></div>
+    </div>
+    <div class="pb-right hide-sm">
+      ${P.source === 'local' ? `<span class="badge">${icon('offline')}Offline file</span>` : modeBtns}
+      <button class="ib ${document.body.classList.contains('queue-open') ? 'on' : ''}" data-p="queue" aria-label="Queue">${icon('queue')}</button>
+      <button class="ib" data-p="mute" aria-label="Mute">${icon(P.volume > 0 ? 'volume' : 'mute')}</button>
+      <input type="range" class="vol" min="0" max="1" step="0.01" value="${P.volume}" aria-label="Volume">
+    </div>`;
+  bar.querySelector('.seek')?.addEventListener('input', e => { seeking = true; }, { once: false });
+  const s = bar.querySelector('.seek');
+  if (s) { s.addEventListener('input', () => { seeking = true; bar.querySelector('.t-now').textContent = fmtTime(s.value * P.duration / 1000); }); s.addEventListener('change', () => { player.seek(s.value * P.duration / 1000); seeking = false; }); }
+  bar.querySelector('.vol')?.addEventListener('input', e => player.setVolume(+e.target.value));
+  bar.querySelector('.vol')?.style.setProperty('--p', (P.volume * 100) + '%');
+  renderTime();
+  playerTail(t);
+}
+// Flip every play button in place (player bar + full screen)
+function patchPlayButtons() {
+  const on = player.isOn() ? '1' : '0';
+  for (const b of $$('.play-btn[data-p="toggle"]')) {
+    b.classList.toggle('busy', !!P.loading);
+    if (b.dataset.on !== on) { b.dataset.on = on; b.innerHTML = icon(on === '1' ? 'pause' : 'play'); b.setAttribute('aria-label', on === '1' ? 'Pause' : 'Play'); }
+  }
+}
+function playerTail(t) {
+  markNow();
+  document.body.classList.toggle('is-playing', player.isOn());
+  updateJump();
+  if (document.body.classList.contains('np-open')) renderNP();
+  if (document.body.classList.contains('queue-open')) renderQueue($('#queue-panel .qp-body'));
+  if (location.hash === '#/queue') renderQueue($('#queue-page'));
+  const dt = $('#yt-dock .dock-title'); if (dt) dt.textContent = `${displayTitle(t)} · ${t.artist}`;
+  const da = $('#yt-dock .dock-art'); if (da && da.dataset.src !== (t.artwork || '')) { da.dataset.src = t.artwork || ''; da.innerHTML = cover(t.artwork, t.title, 'sm'); }
+  placeDock();
+}
+// Highlight exactly ONE row for the playing song — the one the user tapped (or the
+// one that follows it in that list), never every copy of the same song on the page.
+let nowCtx = { list: null };
+function markNow() {
+  const cur = player.current();
+  let el = null;
+  if (cur) {
+    const ids = nowCtx.list && lists.get(nowCtx.list);
+    if (ids) {
+      if (ids[nowCtx.i] !== cur.id) {
+        let j = ids.indexOf(cur.id, (nowCtx.i ?? -1) + 1);
+        if (j < 0) j = ids.indexOf(cur.id);
+        nowCtx.i = j;
+      }
+      if (nowCtx.i >= 0) el = document.querySelector(`.row[data-list="${CSS.escape(nowCtx.list)}"][data-i="${nowCtx.i}"]`);
+    }
+    if (!el) el = document.querySelector(`.row[data-id="${CSS.escape(cur.id)}"]`);
+  }
+  $$('.row.now').forEach(r => { if (r !== el) { r.classList.remove('now'); r.querySelector('.eq')?.remove(); } });
+  if (el && (!el.classList.contains('now') || !el.querySelector('.eq'))) { el.classList.add('now'); (el.querySelector('.row-num .cover') || el.querySelector('.row-num')).insertAdjacentHTML('beforeend', '<span class="eq"><i></i><i></i><i></i></span>'); }
+}
+
+function renderTime() {
+  const pct = P.duration ? Math.min(1, P.time / P.duration) : 0;
+  $$('.pb-progress i').forEach(i => i.style.width = (pct * 100) + '%');
+  if (seeking) return;
+  $$('.seek').forEach(s => { s.value = Math.round(pct * 1000); s.style.setProperty('--p', (pct * 100).toFixed(2) + '%'); });
+  $$('.t-now').forEach(x => x.textContent = fmtTime(P.time));
+  $$('.t-dur').forEach(x => x.textContent = fmtTime(P.duration));
+}
+
+let qDragging = false;
+// Full-screen player. The first render builds the page; after that (play/pause, like,
+// shuffle…) only the parts that changed are patched, so the video slot, the lyrics
+// and your scroll position never jump or reload.
+const npLike = t => `<button class="ib lg like ${t.liked && !t.transient ? 'on' : ''}" data-p="like" aria-label="Like">${icon(t.liked && !t.transient ? 'heartFill' : 'heart')}</button>`;
+const npCtrls = () => `
+      <button class="ib lg ${P.shuffle ? 'on' : ''}" data-p="shuffle" aria-label="Shuffle">${icon('shuffle')}</button>
+      <button class="ib xl" data-p="prev" aria-label="Previous">${icon('prev')}</button>
+      <button class="play-btn big ${P.loading ? 'busy' : ''}" data-p="toggle" data-on="${player.isOn() ? 1 : 0}" aria-label="${player.isOn() ? 'Pause' : 'Play'}">${icon(player.isOn() ? 'pause' : 'play')}</button>
+      <button class="ib xl" data-p="next" aria-label="Next">${icon('next')}</button>
+      <button class="ib lg ${P.repeat !== 'off' ? 'on' : ''}" data-p="repeat" aria-label="Repeat">${icon('repeat')}${P.repeat === 'one' ? '<b class="r1">1</b>' : ''}</button>`;
+function npExtra() {
+  const qOn = document.body.classList.contains('np-q'), lOn = document.body.classList.contains('np-lyr');
+  const upNext = Math.max(0, P.queue.length - P.cursor - 1);
+  return `${P.source === 'local' ? `<span class="badge">${icon('offline')}Playing offline file</span>` : `<div class="seg big" role="group">
+        <button data-p="mode" data-m="video" class="${P.mode === 'video' ? 'on' : ''}">${icon('video')}<span>Music video</span></button>
+        <button data-p="mode" data-m="audio" class="${P.mode === 'audio' ? 'on' : ''}">${icon('audio')}<span>Audio only</span></button></div>`}
+      <div class="np-toggles">
+        <button class="chip ${lOn ? 'on' : ''}" data-p="lyrics" aria-pressed="${lOn}">${icon('mic')}${lOn ? 'Hide lyrics' : 'Lyrics'}</button>
+        <button class="chip ${qOn ? 'on' : ''}" data-p="npq" aria-pressed="${qOn}">${icon('queue')}${qOn ? 'Hide queue' : 'Queue'}${upNext ? ` <small>${upNext}</small>` : ''}</button>
+      </div>`;
+}
+// Scroll ONLY the scrolling part of the full-screen player (scrollIntoView would also shift the
+// fixed top bar and video frame, leaving the video floating in the wrong place)
+function npScrollTo(el) {
+  if (!el) return;
+  const headH = $('#np-head')?.offsetHeight || 60;
+  window.scrollTo({ top: Math.max(0, scrollY + el.getBoundingClientRect().top - headH - 8), behavior: 'smooth' });
+}
+const npNarrow = matchMedia('(max-width: 900px)');
+npNarrow.addEventListener?.('change', () => { if (document.body.classList.contains('np-open')) renderNP(true); });
+const npQueueHTML = () => `<aside class="np-queue"><div class="np-q-head"><h3>Up next</h3><span class="muted tiny">Drag ${icon('grip')} to reorder</span><button class="ib sm" data-p="npq" aria-label="Hide queue">${icon('close')}</button></div><div class="np-q-body"></div></aside>`;
+function renderNP(full = false) {
+  if (qDragging) return;
+  const t = player.current(); if (!t) return closeNP('nav');
+  const np = $('#np');
+  const showVid = P.source === 'yt';
+  const qOn = document.body.classList.contains('np-q');
+  const narrow = npNarrow.matches;
+  const key = `${t.id}|${showVid}|${qOn}|${narrow}|${t.artwork || ''}`;
+  if (!full && np.dataset.key === key && np.querySelector('.np-layout')) {
+    // only rewrite what actually changed; play/pause just flips its button
+    const setIf = (el, html) => { if (el && el._html !== html) { el._html = html; el.innerHTML = html; } };
+    const c = np.querySelector('.np-ctrls'), cs = `${P.shuffle}|${P.repeat}`;
+    if (c.dataset.sig !== cs) { c.dataset.sig = cs; c.innerHTML = npCtrls(); }
+    patchPlayButtons();
+    setIf(np.querySelector('.np-extra'), npExtra());
+    const lk = np.querySelector('.np-info .like'), liked = t.liked && !t.transient;
+    if (lk && lk.classList.contains('on') !== !!liked) lk.outerHTML = npLike(t);
+    const err = np.querySelector('.np-err'); err.textContent = P.error || ''; err.hidden = !P.error;
+    const tap = np.querySelector('.np-tap'); if (tap) tap.hidden = !(P.needsTap && showVid);
+    if (qOn) renderQueue(np.querySelector('.np-q-body'));
+    renderTime(); placeDock();
+    return;
+  }
+  np.dataset.key = key;
+  const keep = { sc: scrollY || 0, q: $('.np-q-body')?.scrollTop || 0 };
+  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib" data-p="more" aria-label="More">${icon('more')}</button>`;
+  // Layout: the top bar and the video/cover stay put; everything below scrolls on its own.
+  // On wide screens the queue is a panel on the right with its own scroll.
+  np.innerHTML = `<div class="np-bg ${t.artwork ? '' : 'none'}" ${t.artwork ? `style="background-image:url('${esc(sized(t.artwork, 300))}')"` : ''}></div>
+    <div class="np-layout ${qOn && !narrow ? 'with-q' : ''}">
+    <div class="np-main">
+      <div class="np-scroll"><div class="np-inner">
+        <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
+        <p class="np-tap" ${P.needsTap && showVid ? '' : 'hidden'}>${icon('play')}Tap the video once to start playing</p>
+        <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
+          ${npLike(t)}</div>
+        <p class="err-text np-err" ${P.error ? '' : 'hidden'}>${esc(P.error || '')}</p>
+        <div class="np-seek"><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><div class="np-times"><span class="t-now">0:00</span><span class="t-dur">0:00</span></div></div>
+        <div class="np-ctrls" data-sig="${P.shuffle}|${P.repeat}">${npCtrls()}</div>
+        <div class="np-extra">${npExtra()}</div>
+        <div class="np-tags">${genreOf(t) ? `<span class="pill">${esc(genreOf(t))}</span>` : ''}${t.year ? `<span class="pill">${t.year}</span>` : ''}${t.durationMs ? `<span class="pill">${fmtDur(t.durationMs)}</span>` : ''}</div>
+        ${qOn && narrow ? npQueueHTML() : ''}
+        <section class="np-lyrics" aria-label="Lyrics"></section>
+      </div></div>
+    </div>
+    ${qOn && !narrow ? npQueueHTML() : ''}
+    </div>`;
+  const sk = np.querySelector('.seek');
+  sk.addEventListener('input', () => { seeking = true; np.querySelector('.t-now').textContent = fmtTime(sk.value * P.duration / 1000); });
+  sk.addEventListener('change', () => { player.seek(sk.value * P.duration / 1000); seeking = false; });
+  if (qOn) renderQueue(np.querySelector('.np-q-body'));
+  if (document.body.classList.contains('np-lyr')) showLyrics(t);
+  if (keep.sc) window.scrollTo(0, keep.sc);
+  const qb = np.querySelector('.np-q-body'); if (qb) qb.scrollTop = keep.q;
+  renderTime();
+  placeDock();
+}
+
+// ---------- Lyrics (Genius) ----------
+// Genius's official embed widget shows licensed lyrics. To use it we need the song's Genius id:
+// we try Genius's search (with your free token if you added one). If Genius doesn't allow the
+// lookup from this browser, you get a one-tap "Open lyrics on Genius" button instead.
+const lyricsCache = new Map();
+function setLyrics(on) {
+  document.body.classList.toggle('np-lyr', on);
+  try { localStorage.setItem('bz_lyr', on ? '1' : ''); } catch { }
+  if (!document.body.classList.contains('np-open')) return;
+  renderNP();
+  const t = player.current();
+  if (on && t) { showLyrics(t); setTimeout(() => npScrollTo($('#np .np-lyrics')), 80); }
+  else { const el = $('.np-lyrics'); if (el) { el.innerHTML = ''; el.dataset.tid = ''; } }
+}
+async function geniusFind(t) {
+  const q = `${t.artist} ${t.title.replace(/\s*[\(\[].*?[\)\]]/g, '')}`;
+  const tries = [];
+  if (settings.geniusToken) tries.push(async () => (await (await fetch(`https://api.genius.com/search?q=${encodeURIComponent(q)}&access_token=${encodeURIComponent(settings.geniusToken)}`)).json()).response.hits.map(h => h.result));
+  tries.push(async () => (await (await fetch(`https://genius.com/api/search/song?per_page=5&q=${encodeURIComponent(q)}`)).json()).response.sections.flatMap(s => s.hits).map(h => h.result));
+  for (const go of tries) {
+    try {
+      const res = (await go()).filter(Boolean);
+      const na = norm(mainArtist(t.artist)), nt = norm(t.title.replace(/\s*[\(\[].*?[\)\]]/g, ''));
+      const hit = res.find(r => norm(r.primary_artist?.name).includes(na) && norm(r.title).includes(nt))
+        || res.find(r => norm(r.primary_artist?.name).includes(na) || norm(r.full_title || '').includes(na)) || null;
+      if (hit) return { id: hit.id, url: hit.url };
+      if (res.length) return null;
+    } catch { }
+  }
+  return null;
+}
+async function showLyrics(t) {
+  const el = $('.np-lyrics'); if (!el || !t) return;
+  if (el.dataset.tid === t.id && el.innerHTML) return;
+  el.dataset.tid = t.id;
+  const searchUrl = `https://genius.com/search?q=${encodeURIComponent(`${t.artist} ${t.title}`)}`;
+  el.innerHTML = `<div class="lyr-head"><h3>Lyrics</h3><span class="muted tiny">from Genius</span></div>${loader('Finding lyrics…', 'sm')}`;
+  if (!lyricsCache.has(t.id)) lyricsCache.set(t.id, navigator.onLine ? geniusFind(t) : Promise.resolve(null));
+  const g = await lyricsCache.get(t.id);
+  if (el.dataset.tid !== t.id) return;
+  if (g?.id) {
+    const doc = `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>html,body{margin:0;background:#fff;font-family:system-ui,sans-serif}body{padding:4px}</style></head><body>
+      <div id="rg_embed_link_${g.id}" class="rg_embed_link" data-song-id="${g.id}">Read <a href="${esc(g.url)}">${esc(t.title)}</a> on Genius</div>
+      <script crossorigin src="https://genius.com/songs/${g.id}/embed.js"><\/script></body></html>`;
+    el.innerHTML = `<div class="lyr-head"><h3>Lyrics</h3><a class="lnk tiny" href="${esc(g.url)}" target="_blank" rel="noopener">Open on Genius ↗</a></div>
+      <iframe class="lyr-frame" title="Lyrics from Genius" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>`;
+    el.querySelector('iframe').srcdoc = doc;
+  } else {
+    el.innerHTML = `<div class="lyr-head"><h3>Lyrics</h3></div><div class="lyr-empty">
+      <p class="muted">${navigator.onLine ? 'Genius didn\'t let us load these lyrics here.' : 'Lyrics need an internet connection.'}</p>
+      <a class="btn primary" href="${esc(g?.url || searchUrl)}" target="_blank" rel="noopener">${icon('link')}Open lyrics on Genius</a>
+      ${!settings.geniusToken ? '<p class="tiny muted">Tip: add a free Genius token in Settings → Lyrics to load them right here.</p>' : ''}</div>`;
+  }
+}
+
+// The YouTube player lives in one element at the top of the page (moving an iframe would reload it).
+// In the full-screen player it is placed over the video slot as part of the page, so when the page
+// scrolls the browser moves the video itself — perfectly in step, in every browser, no script per frame.
+// Otherwise it sits in its corner mini-dock.
+function placeDock() {
+  const dock = $('#yt-dock');
+  const vis = P.source === 'yt' && !!player.current();
+  dock.classList.toggle('show', vis);
+  if (!vis) return;
+  const slot = document.body.classList.contains('np-open') ? $('#np-slot') : null;
+  if (slot) {
+    const r = slot.getBoundingClientRect();
+    const st = dock.style, L = Math.round(r.left + scrollX) + 'px', T = Math.round(r.top + scrollY) + 'px', W = r.width + 'px', H = r.height + 'px';
+    if (st.left !== L || st.top !== T || st.width !== W || st.height !== H) Object.assign(st, { left: L, top: T, width: W, height: H, right: 'auto', bottom: 'auto' });
+    dock.classList.add('in-np');
+  } else if (dock.classList.contains('in-np') || dock.hasAttribute('style')) {
+    dock.classList.remove('in-np');
+    dock.removeAttribute('style');
+  }
+  // the back-to-top button sits just above the corner video, on the right
+  if (!slot) requestAnimationFrame(() => { const h = dock.classList.contains('show') ? dock.offsetHeight : 0; document.body.style.setProperty('--dockh', h + 'px'); });
+}
+
+function renderQueue(el, force = false) {
+  if (!el || qDragging) return;
+  const cur = player.current();
+  if (!cur) { el.innerHTML = '<p class="muted pad">Nothing playing. Pick a song to start.</p>'; el.dataset.sig = ''; return; }
+  // Skip the (expensive) rebuild when nothing in the queue changed — play/pause/buffering don't touch it
+  const limit = +el.dataset.limit || 100;
+  const sig = `${cur.id}|${P.cursor}|${P.queue.length}|${limit}|` + P.queue.slice(P.cursor, P.cursor + limit + 1).map(q => q.id + (q.user ? '*' : '')).join(',');
+  if (!force && el.dataset.sig === sig && el.firstChild) return;
+  el.dataset.sig = sig;
+  const total = P.queue.length - P.cursor - 1;
+  const after = P.queue.slice(P.cursor + 1).map((q, j) => ({ ...q, i: P.cursor + 1 + j })).slice(0, limit);
+  const row = q => { const t = lib.tracks.get(q.id); if (!t) return ''; return `<div class="qrow ${q.user ? 'user' : ''}" data-qi="${q.i}">
+      <span class="grip" title="Drag to reorder">${icon('grip')}</span>${cover(t.artwork, t.title, 'sm')}<div class="row-main" data-qjump="${q.i}"><div class="row-title">${esc(displayTitle(t))}${q.user ? '<span class="qtag">queued</span>' : ''}</div><div class="row-sub">${esc(t.artist)}</div></div>
+      <button class="ib sm" data-qrm="${q.i}" aria-label="Remove from queue" title="Remove">${icon('close')}</button></div>`; };
+  el.innerHTML = `<div class="q-h">Now playing</div><div class="qrow now">${cover(cur.artwork, cur.title, 'sm')}<div class="row-main"><div class="row-title">${esc(displayTitle(cur))}</div><div class="row-sub">${esc(cur.artist)}</div></div></div>
+    ${after.length ? `<div class="q-h">Next up <span>${after.some(q => q.user) ? '<button class="lnk" data-qclear>Clear queued</button>' : ''}</span></div><div class="qlist">${after.map(row).join('')}</div>`
+      : `<p class="muted tiny pad">Nothing after this song. ${settings.autoplay === 'off' ? 'Use ⋯ → "Add to queue" on any song.' : 'Autoplay picks up from here.'}</p>`}
+    ${total > after.length ? `<button class="more-btn" data-qmore>Show more <small>${total - after.length} more</small></button>` : ''}`;
+  el.onclick = e => {
+    if (el._dragged) { el._dragged = false; return; }
+    if (e.target.closest('[data-qmore]')) { el.dataset.limit = limit + 100; renderQueue(el, true); return; }
+    const j = e.target.closest('[data-qjump]'); if (j) player.jumpTo(+j.dataset.qjump);
+    const r = e.target.closest('[data-qrm]'); if (r) player.removeFromQueue(+r.dataset.qrm);
+    if (e.target.closest('[data-qclear]')) player.clearUserQueue();
+  };
+  // Drag to reorder — pointer events, so it works with mouse AND touch
+  el.onpointerdown = e => {
+    const g = e.target.closest('.grip'); if (!g) return;
+    const rowEl = g.closest('.qrow'), list = el.querySelector('.qlist'); if (!rowEl || !list) return;
+    e.preventDefault();
+    const from = +rowEl.dataset.qi;
+    const startOrder = [...list.children].map(r => +r.dataset.qi);
+    rowEl.classList.add('dragging'); qDragging = true;
+    g.setPointerCapture(e.pointerId);
+    const scroller = el.closest('.np-q-body, .qp-body, #main, .np-scroll') || el;
+    let raf = null, lastY = e.clientY;
+    const autoscroll = () => {
+      const r = scroller.getBoundingClientRect();
+      if (lastY < r.top + 50) scroller.scrollTop -= 10; else if (lastY > r.bottom - 50) scroller.scrollTop += 10;
+      raf = requestAnimationFrame(autoscroll);
+    };
+    raf = requestAnimationFrame(autoscroll);
+    const move = ev => {
+      lastY = ev.clientY;
+      const sibs = [...list.children].filter(r => r !== rowEl);
+      const before = sibs.find(r => { const b = r.getBoundingClientRect(); return ev.clientY < b.top + b.height / 2; });
+      if (before) { if (rowEl.nextSibling !== before) list.insertBefore(rowEl, before); }
+      else if (list.lastElementChild !== rowEl) list.appendChild(rowEl);
+    };
+    const up = () => {
+      cancelAnimationFrame(raf);
+      g.removeEventListener('pointermove', move); g.removeEventListener('pointerup', up); g.removeEventListener('pointercancel', up);
+      rowEl.classList.remove('dragging'); qDragging = false;
+      const newPos = [...list.children].indexOf(rowEl);
+      const to = startOrder[newPos];
+      if (to !== from) { el._dragged = true; player.moveInQueue(from, to); } else emit('player', P);
+    };
+    g.addEventListener('pointermove', move); g.addEventListener('pointerup', up); g.addEventListener('pointercancel', up);
+  };
+}
+
+boot().catch(e => { console.error(e); const f = document.getElementById('boot-fail'); if (f) { f.hidden = false; f.style.display = 'grid'; f.querySelector('code').textContent = e.message; } });
+
+return { APP_VERSION };
+})();
+})();

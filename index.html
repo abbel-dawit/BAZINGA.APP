@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>BAZINGA! - Music Made For You</title>
+  <meta name="description" content="BAZINGA — turn your Spotify Liked Songs and playlists into YouTube music video & audio playlists. A full music player that keeps everything on your device.">
+  <meta name="theme-color" content="#0c0c0e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="icon" href="favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="BAZINGA!">
+  <meta property="og:title" content="BAZINGA! ⚡">
+  <meta property="og:description" content="Your music, as YouTube videos or audio. Free, private, on your device.">
+  <meta property="og:image" content="icons/app-512.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <!-- Fonts load without blocking the first paint -->
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&family=Bungee&display=swap">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Figtree:wght@400;500;600;700&family=Bungee&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  <link rel="preconnect" href="https://is1-ssl.mzstatic.com">
+  <link rel="preconnect" href="https://i.ytimg.com">
+  <link rel="preconnect" href="https://cdn-images.dzcdn.net">
+  <link rel="preconnect" href="https://e-cdns-images.dzcdn.net">
+  <link rel="preconnect" href="https://api.deezer.com">
+  <link rel="preconnect" href="https://itunes.apple.com">
+  <link rel="preconnect" href="https://www.youtube.com">
+  <script>try{if(/Apple/.test(navigator.vendor||""))document.documentElement.classList.add("webkit")}catch(e){}</script>
+  <link rel="stylesheet" href="css/app.css?v=e0bf03beae">
+</head>
+<body>
+  <div id="onboarding" hidden></div>
+
+  <div id="app" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#/home" aria-label="BAZINGA! home"><span class="brand-row"><span class="logo-mark"><img src="icons/icon-192.png" alt=""></span><span class="wordmark">BAZINGA!</span></span></a>
+      <nav class="nav">
+        <a href="#/home" data-r="home"><span class="ni ni-home"></span>Home</a>
+        <a href="#/search" data-r="search"><span class="ni ni-search"></span>Search</a>
+        <a href="#/library/songs" data-r="library"><span class="ni ni-library"></span>Library</a>
+        <a href="#/offline" data-r="offline"><span class="ni ni-offline"></span>Offline</a>
+        <a href="#/settings" data-r="settings"><span class="ni ni-settings"></span>Settings</a>
+        <a href="#/support" data-r="support"><span class="ni ni-coffee"></span>Support</a>
+        <button class="ask-btn" data-act="voice"><span class="ni ni-mic"></span>Ask BAZINGA!</button>
+      </nav>
+      <div class="side-h"><span>Playlists</span><button class="ib sm" data-act="new-playlist" aria-label="New playlist">+</button></div>
+      <div id="side-pl" class="side-pl"></div>
+      <a href="#/settings" class="profile-chip"></a>
+    </aside>
+
+    <main id="main">
+      <div class="topbar">
+        <a class="brand-m" href="#/home" aria-label="BAZINGA! home"><span class="brand-row"><span class="logo-mark"><img src="icons/icon-192.png" alt=""></span><span class="wordmark">BAZINGA!</span></span></a>
+        <span class="offline-pill">Offline</span>
+        <a class="ib mic-top coffee-top" href="#/support" aria-label="Support BAZINGA!"><span class="ni ni-coffee"></span></a>
+        <button class="ib mic-top" data-act="voice" aria-label="Ask BAZINGA!"><span class="ni ni-mic"></span></button>
+        <a href="#/settings" class="profile-chip compact"></a>
+      </div>
+      <div id="nag"></div>
+      <div id="view"></div>
+      <footer class="app-foot">
+        <div class="foot-social">
+          <a class="soc" href="https://www.instagram.com/bazinga.app" target="_blank" rel="noopener" aria-label="BAZINGA! on Instagram"><span class="ni ni-instagram"></span><span><b>Instagram</b><small>@bazinga.app</small></span></a>
+          <a class="soc" href="https://x.com/bazinga_app" target="_blank" rel="noopener" aria-label="BAZINGA! on X (Twitter)"><span class="ni ni-xsocial"></span><span><b>X / Twitter</b><small>@bazinga_app</small></span></a>
+          <a class="soc coffee" href="#/support" aria-label="Support BAZINGA!"><span class="ni ni-coffee"></span><span><b>Buy me a coffee</b><small>Keep BAZINGA! free</small></span></a>
+        </div>
+        <div>© 2026 Abbel Dawit · BAZINGA! · <a href="#/legal">Privacy &amp; Terms</a></div>
+      </footer>
+    </main>
+
+    <aside id="queue-panel"><div class="qp-head"><h3>Queue</h3><button class="ib" data-p="queue" onclick="document.body.classList.remove('queue-open')" aria-label="Close">✕</button></div><div class="qp-body"></div></aside>
+
+    <footer id="playerbar"></footer>
+
+    <nav class="tabbar">
+      <a href="#/home" data-r="home"><span class="ni ni-home"></span>Home</a>
+      <a href="#/search" data-r="search"><span class="ni ni-search"></span>Search</a>
+      <a href="#/library/songs" data-r="library"><span class="ni ni-library"></span>Library</a>
+      <a href="#/offline" data-r="offline"><span class="ni ni-offline"></span>Offline</a>
+      <a href="#/settings" data-r="settings"><span class="ni ni-settings"></span>You</a>
+    </nav>
+  </div>
+
+  <section id="np" aria-label="Now playing"></section>
+  <div id="np-head" class="np-top"></div>
+
+  <div id="yt-dock">
+    <div class="dock-bar"><span class="dock-art" aria-hidden="true"></span><span class="dock-title">YouTube</span>
+      <button class="dock-btn" data-p="dock-min" aria-label="Minimize video" title="Minimize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14"/><path class="pv" d="M12 5v14"/></svg></button>
+      <button class="dock-btn" data-p="dock-size" aria-label="Bigger / smaller video" title="Resize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></button>
+      <button class="dock-btn" data-p="open" aria-label="Full screen player" title="Full screen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 15l6-6 6 6"/></svg></button></div>
+    <div class="dock-frame"><div id="yt-player"></div></div>
+  </div>
+
+  <button id="to-top" type="button" aria-label="Back to top" title="Back to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+  <div id="toasts" aria-live="polite"></div>
+  <div id="modal-root"></div>
+  <div id="menu-root"></div>
+  <noscript>BAZINGA needs JavaScript turned on.</noscript>
+  <div id="boot-fail" hidden style="position:fixed;inset:0;place-items:center;z-index:999;padding:24px;text-align:center;font-family:system-ui;color:#f5f2e8;background:#0c0c0e">
+    <div style="max-width:440px"><img src="icons/icon-192.png" alt="" width="72"><h2>BAZINGA! couldn't start</h2>
+    <p style="color:#9b988f">Make sure all the files (the <b>js</b>, <b>css</b> and <b>icons</b> folders) were uploaded next to index.html, then reload. Private/incognito mode can also block storage.</p>
+    <code style="color:#ff9500"></code></div></div>
+  <script>
+    /* App owner settings — see README "Set up YouTube account sync". */
+    window.BAZINGA_CONFIG = {
+      googleClientId: '',  /* YouTube sync, e.g. '1234567890-abc123.apps.googleusercontent.com' */
+      youtubeApiKey: '',   /* Backup YouTube search for everyone when the free servers are down (YouTube Data API v3 key, restrict it to your site) */
+      supabaseUrl: '',     /* Accounts & sync, e.g. 'https://abcdefgh.supabase.co' */
+      supabaseAnonKey: ''  /* the project's "anon" / publishable key (safe to publish) */
+    };
+  </script>
+  <script src="js/bazinga.js?v=14c8c635fc" defer></script>
+  <script>setTimeout(function(){ if(!window.__bzStarted){ var f=document.getElementById('boot-fail'); f.hidden=false; f.style.display='grid'; f.querySelector('code').textContent='Script js/bazinga.js did not load.'; } }, 4000);</script>
+</body>
+</html>
