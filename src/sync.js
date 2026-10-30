@@ -73,14 +73,20 @@ async function sealWith(key, obj) { const k0 = keys; keys = { key }; try { retur
 // ---------- the relay (ntfy.sh) ----------
 // Only "simple" requests (no custom headers), so browsers don't need a CORS pre-check.
 const topicOf = id => 'bz' + id.slice(0, 40);
+// Progress + cancel for syncs you start yourself (linking, "Sync now")
+let abortCtl = null;
+const sig = () => abortCtl?.signal;
+const step = (label, pct) => emit('sync-progress', { label, pct });
+export function cancel() { abortCtl?.abort(); }
+const isAbort = e => e?.name === 'AbortError' || /abort/i.test(e?.message || '');
 async function relayList(topic, since = 'all') {
-  const r = await fetch(`${RELAY()}/${topic}/json?poll=1&since=${since}`, { cache: 'no-store' });
+  const r = await fetch(`${RELAY()}/${topic}/json?poll=1&since=${since}`, { cache: 'no-store', signal: sig() });
   if (!r.ok) throw new Error(r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
   return (await r.text()).split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } })
     .filter(m => m && m.event === 'message').sort((a, b) => a.time - b.time);
 }
 async function relayPost(topic, body, params) {
-  const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body });
+  const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body, signal: sig() });
   if (!r.ok) throw new Error(r.status === 413 ? 'Your library is too big for the free sync relay.' : r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
   return r.json();
 }
@@ -88,9 +94,18 @@ const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filenam
 const postNote = (topic, text) => relayPost(topic, text, {});
 const liveFile = m => m.attachment?.url && (!m.attachment.expires || m.attachment.expires * 1000 > Date.now() + 30e3);
 async function fetchFile(m) {
-  const r = await fetch(m.attachment.url, { cache: 'no-store' });
+  const r = await fetch(m.attachment.url, { cache: 'no-store', signal: sig() });
   if (!r.ok) throw new Error('Couldn\'t download the synced library — will try again.');
-  return new Uint8Array(await r.arrayBuffer());
+  const total = +r.headers.get('content-length') || m.attachment.size || 0;
+  if (!r.body || !total) return new Uint8Array(await r.arrayBuffer());
+  const reader = r.body.getReader(), chunks = []; let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read(); if (done) break;
+    chunks.push(value); got += value.length;
+    step(`Downloading your music… ${Math.round(got / 1024)} KB`, 15 + 55 * Math.min(1, got / total));
+  }
+  const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
 }
 
 function hash(snap) {
@@ -174,25 +189,29 @@ async function applyLocal(m) {
 
 // ---------- the sync itself ----------
 async function saveLink() { if (link) await kv.set('syncLink', link); else await kv.del('syncLink'); }
-export function syncNow() {
-  if (!link || !available()) return Promise.resolve();
-  if (!navigator.onLine) { setStatus('offline'); return Promise.resolve(); }
-  if (running) { again = true; return running; }
+export async function syncNow({ interactive = false } = {}) {
+  if (!link || !available()) return;
+  if (!navigator.onLine) { setStatus('offline'); return; }
+  if (running) { if (!interactive) { again = true; return running; } await running.catch(() => { }); }
+  if (interactive) abortCtl = new AbortController();
   running = (async () => {
     setStatus('syncing');
     try {
       do { again = false; await once(); } while (again && link);
-      if (link) setStatus('synced');
+      if (link) { setStatus('synced'); step('Done', 100); }
     } catch (e) {
+      if (isAbort(e)) { setStatus(link?.lastId ? 'synced' : 'off'); S.cancelled = true; return; }
       console.warn('sync failed', e);
       setStatus('error', /Failed to fetch|NetworkError|Load failed/.test(e.message) ? 'Couldn\'t reach the sync server.' : e.message);
-    } finally { running = null; }
+    } finally { running = null; if (interactive) abortCtl = null; }
   })();
+  S.cancelled = false;
   return running;
 }
 async function once() {
   keys = keys || await derive(link.secret);
   const topic = topicOf(keys.id);
+  step('Checking for changes…', 6);
   const msgs = (await relayList(topic, link.lastTs ? Math.max(0, link.lastTs - 5) : 'all')).filter(m => m.id !== link.lastId && (!link.seen || !link.seen.includes(m.id)));
   // "Turn off sync everywhere" from another device
   for (const m of msgs) if (!m.attachment && m.message && m.time * 1000 > (link.since || 0)) {
@@ -202,9 +221,17 @@ async function once() {
   const local = await localSnap();
   let base = local;
   if (latest) {
+    step('Downloading your music…', 15);
     const remote = await open(await fetchFile(latest));
+    if (sig()?.aborted) throw new DOMException('cancelled', 'AbortError');
+    step('Merging with this device…', 75);
+    // Joining with "use only the synced library": swap it in now that it has fully arrived
+    // (a cancelled download leaves this device untouched)
+    let replaced = false;
+    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; }
     base = merge(local, remote);
-    if (hash(base) !== hash(local)) await applyLocal(base);
+    step('Saving to this device…', 85);
+    if (replaced || hash(base) !== hash(local)) await applyLocal(base);
     link.hash = hash(remote); link.lastId = latest.id; link.lastTs = latest.time; link.pubTs = Math.max(link.pubTs || 0, latest.time);
   }
   if (msgs.length) { link.seen = msgs.slice(-20).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
@@ -212,6 +239,7 @@ async function once() {
   const h = hash(base);
   const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
   if (h === link.hash && fresh) return;
+  step('Sending your library to your other devices…', 92);
   const res = await postFile(topic, await seal(base));
   link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
   await saveLink();
@@ -223,7 +251,8 @@ export async function create() {
   if (!available()) throw new Error('Device sync needs the online (GitHub Pages) version of BAZINGA!.');
   link = { secret: newSecret(), since: Date.now() }; keys = null;
   await saveLink();
-  await syncNow();
+  await syncNow({ interactive: true });
+  if (S.cancelled) { link = null; keys = null; await saveLink(); setStatus('off'); const e = new Error('Cancelled'); e.cancelled = true; throw e; }
   if (S.status === 'error') { const err = S.error; link = null; keys = null; await saveLink(); setStatus('off'); throw new Error(err); }
   start();
   return link;
@@ -238,16 +267,13 @@ export async function peek(secret) {
 export async function join(secret, mode = 'merge') {
   secret = cleanSecret(secret);
   if (secret.length < 16) throw new Error('That sync link isn\'t complete — copy the whole link and try again.');
-  const found = await peek(secret).catch(() => null);
-  if (mode === 'replace' && found) {
-    for (const s of ['tracks', 'albums', 'playlists']) await db.clear(s);
-    await store.setTombstones({ t: {}, p: {}, a: {} });
-    const p = await kv.get('profile'); if (p) { p.updatedAt = 0; await kv.set('profile', p); }
-    await store.load(); emit('library');
-  }
-  link = { secret, since: Date.now() }; keys = null;
+  abortCtl = new AbortController();
+  step('Looking for your library…', 3);
+  const found = await peek(secret).catch(e => { if (isAbort(e)) throw e; return null; });
+  link = { secret, since: Date.now(), replace: mode === 'replace' && !!found }; keys = null;
   await saveLink();
-  await syncNow();
+  await syncNow({ interactive: true });
+  if (S.cancelled) { await leave(); const e = new Error('Cancelled'); e.cancelled = true; throw e; }
   start();
   return found;
 }

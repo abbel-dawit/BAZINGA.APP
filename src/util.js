@@ -51,7 +51,7 @@ export const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Event bus
 const bus = new EventTarget();
-export const on = (ev, fn) => bus.addEventListener(ev, e => fn(e.detail));
+export const on = (ev, fn) => { const h = e => fn(e.detail); bus.addEventListener(ev, h); return () => bus.removeEventListener(ev, h); };
 export const emit = (ev, detail) => bus.dispatchEvent(new CustomEvent(ev, { detail }));
 export const toast = (msg, kind = 'info') => emit('toast', { msg, kind });
 

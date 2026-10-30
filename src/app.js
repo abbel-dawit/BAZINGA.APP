@@ -118,6 +118,28 @@ function syncLine() {
     : S.status === 'offline' ? `<span class="sync-st">${icon('cloudOff')} Offline — will sync when you're back online</span>`
     : `<span class="sync-st ok">${icon('check')} Synced${ago === null ? '' : ago < 1 ? ' just now' : ` ${ago} min ago`}</span>`;
 }
+// A popup that shows how a sync is going (step + progress bar), with Cancel.
+// Tapping outside or × just hides it — the sync carries on in the background.
+async function withSyncProgress(title, task) {
+  let box = null, closeIt = null;
+  const set = (label, pct) => {
+    if (!box) return;
+    if (label) box.querySelector('.sp-step').textContent = label;
+    if (pct != null) box.querySelector('.sp-bar i').style.width = Math.max(4, Math.min(100, pct)) + '%';
+  };
+  modal(`<div class="sync-prog"><div class="sp-orb">${icon('cloud')}</div><h3>${esc(title)}</h3>
+      <p class="muted sp-step">Starting…</p><div class="sp-bar" role="progressbar"><i></i></div>
+      <div class="modal-actions center"><button type="button" class="btn ghost" data-sp-cancel>Cancel</button></div>
+      <p class="tiny muted">You can close this — syncing carries on in the background.</p></div>`, {
+    onMount: (m, close) => {
+      box = m; closeIt = close;
+      m.querySelector('[data-sp-cancel]').onclick = () => { sync.cancel(); set('Cancelling…'); };
+    }
+  }).then(() => { box = null; });
+  const off = on('sync-progress', ({ label, pct }) => set(label, pct));
+  try { return await task(set); }
+  finally { off(); if (box) { set('Done', 100); setTimeout(() => { if (box) closeIt(null); }, 350); } }
+}
 // Join another device's library (from a link, QR code or short code)
 async function joinFlow(req) {
   if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
@@ -139,13 +161,12 @@ async function joinFlow(req) {
       if (!mode) return;
     }
     if (sync.linked()) await sync.leave();
-    toast('Syncing your music…');
-    await sync.join(secret, mode);
+    await withSyncProgress('Syncing your music', () => sync.join(secret, mode));
     const S = sync.state();
     if (S.status === 'error') throw new Error(S.error);
     toast(found ? `Synced ✓ — ${store.saved().length} songs on this device` : 'Linked ✓ — your music arrives the next time BAZINGA! is open on your other device', 'ok');
     renderProfileChip(); rerender();
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) { if (e.cancelled) toast('Sync cancelled — nothing changed on this device'); else toast(e.message, 'err'); }
 }
 async function enterCodeDialog() {
   const r = await modal(`<h3>${icon('link')} Link this device</h3>
@@ -163,8 +184,8 @@ async function enterCodeDialog() {
 async function linkDeviceDialog() {
   if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
   if (!sync.linked()) {
-    try { await sync.create(); renderProfileChip(); }
-    catch (e) { return toast(e.message, 'err'); }
+    try { await withSyncProgress('Turning on sync', () => sync.create()); renderProfileChip(); }
+    catch (e) { return toast(e.cancelled ? 'Sync cancelled' : e.message, e.cancelled ? 'info' : 'err'); }
   }
   const url = sync.linkURL();
   let timer = null;
@@ -335,6 +356,19 @@ window.visualViewport?.addEventListener('resize', pinSoon);
 window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
 const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
 
+// ---------- Phone top bar: shrink the logo text until everything fits ----------
+// (Fonts and screen widths differ between phones, so measure instead of guessing.)
+function fitTopbar() {
+  const bar = $('.topbar'), wm = $('.brand-m .wordmark');
+  if (!bar || !wm || getComputedStyle(bar).display === 'none') return;
+  document.documentElement.style.removeProperty('--wm-size');
+  let size = parseFloat(getComputedStyle(wm).fontSize) || 22, n = 0;
+  const over = () => bar.scrollWidth > bar.clientWidth + 1 || [...bar.children].some(c => c.offsetParent && c.getBoundingClientRect().right > bar.getBoundingClientRect().right - 4);
+  while (over() && size > 13 && n++ < 20) { size -= 1; document.documentElement.style.setProperty('--wm-size', size + 'px'); }
+}
+window.addEventListener('resize', debounce(fitTopbar, 150));
+document.fonts?.ready?.then(() => fitTopbar());
+
 // ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
 const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 let clockTimer = null;
@@ -382,6 +416,7 @@ async function showApp() {
   wireToTop();
   setTimeout(launchPopups, 3500);
   renderProfileChip(); renderSidebarPlaylists(); renderPlayer();
+  requestAnimationFrame(fitTopbar); setTimeout(fitTopbar, 800);
   initVoice({
     go: h => { location.hash = h; }, back: () => goBack(),
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
@@ -903,9 +938,9 @@ function redrawArtists() {
   fillArtistPics(el);
 }
 // On phones these two fold into a ⋯ menu so the action row stays on one line
-const matchBtn = (key, name = 'My BAZINGA! playlist', job = key) => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
+const matchBtn = (key, name = 'My BAZINGA! playlist', job = key, offline = '') => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
   <button class="btn yt-save" data-act="yt-export" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}">${icon('upload')}Save to YouTube</button></span>
-  <button class="ib lg yt-more" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" aria-label="More options" title="More">${icon('more')}</button>`;
+  <button class="ib lg yt-more ${offline ? 'always' : ''}" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" ${offline ? `data-offline="${esc(offline)}"` : ''} aria-label="More options" title="More">${icon('more')}</button>`;
 
 // ---------- PLAYLIST ----------
 async function vPlaylist([id]) {
@@ -959,10 +994,9 @@ async function vAlbum(arg, my) {
   view().innerHTML = `<div class="page">
     ${header(esc(album.title), `${artistLink} · ${album.year || ''} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${album.genre ? ' · ' + esc(album.genre) : ''}`, cover(album.artwork, album.title), '', 'Album')}
     <div class="actions">${playBtns('play-list', 'album')}
-      ${savedA ? `<button class="btn" data-act="unsave-album" data-id="${esc(album.id)}">${icon('check')}Saved</button>` : `<button class="btn primary-o" data-act="save-album">${icon('plus')}Save album</button>`}
+      ${savedA ? `<button class="btn save-alb" data-act="unsave-album" data-id="${esc(album.id)}">${icon('check')}<span>Saved</span></button>` : `<button class="btn primary-o save-alb" data-act="save-album">${icon('plus')}<span>Save<span class="hide-sm"> album</span></span></button>`}
       <button class="ib lg" data-act="share-album" title="Share">${icon('share')}</button>
-      <button class="btn ghost" data-act="album-offline">${icon('offline')}Offline files${offlineN ? ` (${offlineN}/${tracks.length})` : ''}</button>
-      ${matchBtn('album', `${album.title} — ${album.artist}`, 'album:' + album.id)}</div>
+      ${matchBtn('album', `${album.title} — ${album.artist}`, 'album:' + album.id, `Offline files${offlineN ? ` (${offlineN}/${tracks.length})` : ''}`)}</div>
     ${tracksSection('album', tracks, { noFilter: true, numbered: true })}
     ${album.releaseDate ? `<p class="muted tiny pad">Released ${new Date(album.releaseDate).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</p>` : ''}
   </div>`;
@@ -1238,7 +1272,7 @@ function wireImport() {
     if (fd.get('name')) { const p = await store.createPlaylist(fd.get('name'), saved.map(t => t.id), { source: 'pasted' }); location.hash = '#/playlist/' + p.id; }
     else { await Promise.all(saved.map(t => store.updateTrack(t.id, { liked: true }))); toast(`${saved.length} songs added to Liked`); location.hash = '#/library/liked'; }
   });
-  $('[data-act-change="csv"]').addEventListener('change', e => importCSVFiles([...e.target.files]));
+  $('[data-act-change="csv"]').addEventListener('change', e => { importCSVFiles([...e.target.files]); e.target.value = ''; });
   $$('[data-act-change="exportify-file"]').forEach(i => i.addEventListener('change', e => { exportifyWaiting = false; importCSVFiles([...e.target.files], { source: 'Spotify' }); e.target.value = ''; }));
   $('[data-act-change="apple"]').addEventListener('change', e => importAppleFiles([...e.target.files]));
   $('#ytlink-form').addEventListener('submit', e => { e.preventDefault(); ytImportLink(e.target.u.value.trim()); });
@@ -1257,6 +1291,8 @@ async function importCSVFiles(files, { source = 'CSV' } = {}) {
   if (!csvs.length) { if (items.length) toast('No songs found in that file', 'err'); return; }
   const prog = csvs.length > 1 ? progress(`Importing ${csvs.length} playlists…`) : null;
   let likedN = 0, pls = 0, songs = 0, firstPl = null;
+  const usedNames = new Map(); // each file becomes its own playlist, even if two files share a name
+  const report = [];
   for (let i = 0; i < csvs.length; i++) {
     const f = csvs[i];
     prog?.set(i + 1, csvs.length);
@@ -1264,19 +1300,26 @@ async function importCSVFiles(files, { source = 'CSV' } = {}) {
     try {
       const tracks = imp.tracksFromCSV(f.text);
       if (!tracks.length) continue;
-      const name = f.name.replace(/\.csv$/i, '').replace(/[_]+/g, ' ').trim();
-      if (/^liked( songs)?$|liked.?songs|^liked$/i.test(name)) {
+      const base = (f.name.split('/').pop() || 'Playlist').replace(/\.csv$/i, '').replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Imported playlist';
+      // Only a file that is clearly your Liked Songs export goes into Liked Songs; everything else is a playlist
+      if (/^(your |my )?liked( songs)?$/i.test(base)) {
         await store.upsertTracks(tracks.map(t => ({ ...t, liked: true, likedAt: t.addedAt || Date.now() })));
-        likedN += tracks.length; songs += tracks.length; continue;
+        likedN += tracks.length; songs += tracks.length; report.push(['Liked Songs', tracks.length]); continue;
       }
+      const k = base.toLowerCase(), n = (usedNames.get(k) || 0) + 1; usedNames.set(k, n);
+      const name = n > 1 ? `${base} (${n})` : base;
       const saved = await store.upsertTracks(tracks);
-      const ex = [...lib.playlists.values()].find(x => x.name === name && (x.source === source || x.source === 'CSV' || x.source === 'Spotify'));
-      if (ex) { ex.trackIds = saved.map(t => t.id); await store.savePlaylist(ex); firstPl = firstPl || ex; }
-      else firstPl = firstPl || await store.createPlaylist(name, saved.map(t => t.id), { source });
-      pls++; songs += saved.length;
+      // Re-importing the same playlist file updates it (only the first file with that name in this batch)
+      const ex = n === 1 && [...lib.playlists.values()].find(x => x.name === name && (x.source === source || x.source === 'CSV' || x.source === 'Spotify'));
+      let pl;
+      if (ex) { ex.trackIds = saved.map(t => t.id); await store.savePlaylist(ex); pl = ex; }
+      else pl = await store.createPlaylist(name, saved.map(t => t.id), { source });
+      firstPl = firstPl || pl;
+      pls++; songs += saved.length; report.push([name, saved.length]);
     } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
   }
-  const msg = [likedN ? `${likedN} Liked Songs` : '', pls ? `${pls} playlist${pls > 1 ? 's' : ''}` : ''].filter(Boolean).join(' and ');
+  const msg = [pls ? `${pls} playlist${pls > 1 ? 's' : ''}` : '', likedN ? `${likedN} Liked Songs` : ''].filter(Boolean).join(' and ');
+  if (report.length > 1) setTimeout(() => modal(`<h3>${icon('check')} Imported ${report.length} files</h3><div class="imp-report">${report.map(([n, c]) => `<div><span>${esc(n)}</span><b>${c} song${c === 1 ? "" : "s"}</b></div>`).join('')}</div><div class="modal-actions center"><button class="btn primary" data-close>Done</button></div>`), 400);
   if (prog) prog.done(msg ? `Imported ${msg} ✓` : 'Nothing to import'); else if (msg) toast(`Imported ${msg} ✓`, 'ok'); else toast('No songs found in that file', 'err');
   renderSidebarPlaylists();
   if (pls === 1 && !likedN && firstPl) location.hash = '#/playlist/' + firstPl.id;
@@ -2316,7 +2359,9 @@ function wireGlobal() {
       case 'art-sort': artistUI.sort = a.dataset.v; artistUI.limit = PAGE_N; redrawArtists(); $$('.az a').forEach(x => x.classList.remove('on')); break;
       case 'yt-backup': ytBackupPicker(); break;
       case 'yt-more': {
-        const k = await menu(a, [{ k: 'match', label: 'Find YouTube matches', icon: 'yt' }, { k: 'save', label: 'Save to YouTube', icon: 'upload' }]);
+        const wide = innerWidth > 700; // on computers the YouTube buttons are already on the page
+        const k = await menu(a, [a.dataset.offline ? { k: 'offline', label: a.dataset.offline, icon: 'offline' } : null, wide ? null : { k: 'match', label: 'Find YouTube matches', icon: 'yt' }, wide ? null : { k: 'save', label: 'Save to YouTube', icon: 'upload' }]);
+        if (k === 'offline') { const { tracks } = window.__album; pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', fs => addLocalFiles(fs, { albumHint: tracks }), { multiple: true }); }
         if (k === 'match') matchList(lists.get(a.dataset.list) || []);
         if (k === 'save') ytExport(lists.get(a.dataset.list) || [], a.dataset.name, a.dataset.job);
         break;
@@ -2328,7 +2373,7 @@ function wireGlobal() {
       case 'enter-code': { const req = await enterCodeDialog(); if (req) joinFlow(req); break; }
       case 'sync-leave': syncMenu('leave'); break;
       case 'sync-forget': syncMenu('forget'); break;
-      case 'sync-now': sync.syncNow().then(() => { const S = sync.state(); toast(S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.status === 'synced' ? 'ok' : 'err'); }); break;
+      case 'sync-now': withSyncProgress('Syncing your music', () => sync.syncNow({ interactive: true })).then(() => { const S = sync.state(); toast(S.cancelled ? 'Sync cancelled' : S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.cancelled ? 'info' : S.status === 'synced' ? 'ok' : 'err'); }); break;
       case 'bk-link': try { await backup.linkFile(); rerender(); } catch (err) { if (err.name !== 'AbortError') toast(err.message, 'err'); } break;
       case 'bk-regrant': await backup.regrant(); rerender(); renderBackupNag(); break;
       case 'bk-unlink': await backup.unlinkFile(); rerender(); break;
@@ -2446,7 +2491,7 @@ async function renderBackupNag() {
   const lastD = await kv.get('lastDownload');
   const n = store.saved().length;
   if (st === 'needs-permission') el.innerHTML = `<div class="nag">${icon('restore')}<span>Auto-backup to your file is paused.</span><button class="btn sm primary" data-act="bk-regrant">Resume</button></div>`;
-  else if (!backup.fsSupported && n > 20 && (!lastD || Date.now() - lastD > 7 * 864e5)) el.innerHTML = `<div class="nag">${icon('restore')}<span>Keep your library safe — save a backup file to this device.</span><button class="btn sm primary" data-act="bk-nag-dl">Save backup</button><button class="ib sm" data-act="bk-nag-x" aria-label="Dismiss">${icon('close')}</button></div>`;
+  else if (!backup.fsSupported && n > 20 && (!lastD || Date.now() - lastD > 7 * 864e5)) el.innerHTML = `<div class="nag">${icon('restore')}<span>Keep your library safe — save a backup file to this device.</span><button class="btn sm primary" data-act="bk-nag-dl">Save backup</button><button class="ib sm nag-x" data-act="bk-nag-x" aria-label="Dismiss">${icon('close')}</button></div>`;
   else el.innerHTML = '';
 }
 

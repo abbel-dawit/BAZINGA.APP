@@ -120,7 +120,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Event bus
 const bus = new EventTarget();
-const on = (ev, fn) => bus.addEventListener(ev, e => fn(e.detail));
+const on = (ev, fn) => { const h = e => fn(e.detail); bus.addEventListener(ev, h); return () => bus.removeEventListener(ev, h); };
 const emit = (ev, detail) => bus.dispatchEvent(new CustomEvent(ev, { detail }));
 const toast = (msg, kind = 'info') => emit('toast', { msg, kind });
 
@@ -2750,14 +2750,20 @@ async function sealWith(key, obj) { const k0 = keys; keys = { key }; try { retur
 // ---------- the relay (ntfy.sh) ----------
 // Only "simple" requests (no custom headers), so browsers don't need a CORS pre-check.
 const topicOf = id => 'bz' + id.slice(0, 40);
+// Progress + cancel for syncs you start yourself (linking, "Sync now")
+let abortCtl = null;
+const sig = () => abortCtl?.signal;
+const step = (label, pct) => emit('sync-progress', { label, pct });
+function cancel() { abortCtl?.abort(); }
+const isAbort = e => e?.name === 'AbortError' || /abort/i.test(e?.message || '');
 async function relayList(topic, since = 'all') {
-  const r = await fetch(`${RELAY()}/${topic}/json?poll=1&since=${since}`, { cache: 'no-store' });
+  const r = await fetch(`${RELAY()}/${topic}/json?poll=1&since=${since}`, { cache: 'no-store', signal: sig() });
   if (!r.ok) throw new Error(r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
   return (await r.text()).split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } })
     .filter(m => m && m.event === 'message').sort((a, b) => a.time - b.time);
 }
 async function relayPost(topic, body, params) {
-  const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body });
+  const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body, signal: sig() });
   if (!r.ok) throw new Error(r.status === 413 ? 'Your library is too big for the free sync relay.' : r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
   return r.json();
 }
@@ -2765,9 +2771,18 @@ const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filenam
 const postNote = (topic, text) => relayPost(topic, text, {});
 const liveFile = m => m.attachment?.url && (!m.attachment.expires || m.attachment.expires * 1000 > Date.now() + 30e3);
 async function fetchFile(m) {
-  const r = await fetch(m.attachment.url, { cache: 'no-store' });
+  const r = await fetch(m.attachment.url, { cache: 'no-store', signal: sig() });
   if (!r.ok) throw new Error('Couldn\'t download the synced library — will try again.');
-  return new Uint8Array(await r.arrayBuffer());
+  const total = +r.headers.get('content-length') || m.attachment.size || 0;
+  if (!r.body || !total) return new Uint8Array(await r.arrayBuffer());
+  const reader = r.body.getReader(), chunks = []; let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read(); if (done) break;
+    chunks.push(value); got += value.length;
+    step(`Downloading your music… ${Math.round(got / 1024)} KB`, 15 + 55 * Math.min(1, got / total));
+  }
+  const out = new Uint8Array(got); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
 }
 
 function hash(snap) {
@@ -2851,25 +2866,29 @@ async function applyLocal(m) {
 
 // ---------- the sync itself ----------
 async function saveLink() { if (link) await kv.set('syncLink', link); else await kv.del('syncLink'); }
-function syncNow() {
-  if (!link || !available()) return Promise.resolve();
-  if (!navigator.onLine) { setStatus('offline'); return Promise.resolve(); }
-  if (running) { again = true; return running; }
+async function syncNow({ interactive = false } = {}) {
+  if (!link || !available()) return;
+  if (!navigator.onLine) { setStatus('offline'); return; }
+  if (running) { if (!interactive) { again = true; return running; } await running.catch(() => { }); }
+  if (interactive) abortCtl = new AbortController();
   running = (async () => {
     setStatus('syncing');
     try {
       do { again = false; await once(); } while (again && link);
-      if (link) setStatus('synced');
+      if (link) { setStatus('synced'); step('Done', 100); }
     } catch (e) {
+      if (isAbort(e)) { setStatus(link?.lastId ? 'synced' : 'off'); S.cancelled = true; return; }
       console.warn('sync failed', e);
       setStatus('error', /Failed to fetch|NetworkError|Load failed/.test(e.message) ? 'Couldn\'t reach the sync server.' : e.message);
-    } finally { running = null; }
+    } finally { running = null; if (interactive) abortCtl = null; }
   })();
+  S.cancelled = false;
   return running;
 }
 async function once() {
   keys = keys || await derive(link.secret);
   const topic = topicOf(keys.id);
+  step('Checking for changes…', 6);
   const msgs = (await relayList(topic, link.lastTs ? Math.max(0, link.lastTs - 5) : 'all')).filter(m => m.id !== link.lastId && (!link.seen || !link.seen.includes(m.id)));
   // "Turn off sync everywhere" from another device
   for (const m of msgs) if (!m.attachment && m.message && m.time * 1000 > (link.since || 0)) {
@@ -2879,9 +2898,17 @@ async function once() {
   const local = await localSnap();
   let base = local;
   if (latest) {
+    step('Downloading your music…', 15);
     const remote = await open(await fetchFile(latest));
+    if (sig()?.aborted) throw new DOMException('cancelled', 'AbortError');
+    step('Merging with this device…', 75);
+    // Joining with "use only the synced library": swap it in now that it has fully arrived
+    // (a cancelled download leaves this device untouched)
+    let replaced = false;
+    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; }
     base = merge(local, remote);
-    if (hash(base) !== hash(local)) await applyLocal(base);
+    step('Saving to this device…', 85);
+    if (replaced || hash(base) !== hash(local)) await applyLocal(base);
     link.hash = hash(remote); link.lastId = latest.id; link.lastTs = latest.time; link.pubTs = Math.max(link.pubTs || 0, latest.time);
   }
   if (msgs.length) { link.seen = msgs.slice(-20).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
@@ -2889,6 +2916,7 @@ async function once() {
   const h = hash(base);
   const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
   if (h === link.hash && fresh) return;
+  step('Sending your library to your other devices…', 92);
   const res = await postFile(topic, await seal(base));
   link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
   await saveLink();
@@ -2900,7 +2928,8 @@ async function create() {
   if (!available()) throw new Error('Device sync needs the online (GitHub Pages) version of BAZINGA!.');
   link = { secret: newSecret(), since: Date.now() }; keys = null;
   await saveLink();
-  await syncNow();
+  await syncNow({ interactive: true });
+  if (S.cancelled) { link = null; keys = null; await saveLink(); setStatus('off'); const e = new Error('Cancelled'); e.cancelled = true; throw e; }
   if (S.status === 'error') { const err = S.error; link = null; keys = null; await saveLink(); setStatus('off'); throw new Error(err); }
   start();
   return link;
@@ -2915,16 +2944,13 @@ async function peek(secret) {
 async function join(secret, mode = 'merge') {
   secret = cleanSecret(secret);
   if (secret.length < 16) throw new Error('That sync link isn\'t complete — copy the whole link and try again.');
-  const found = await peek(secret).catch(() => null);
-  if (mode === 'replace' && found) {
-    for (const s of ['tracks', 'albums', 'playlists']) await db.clear(s);
-    await store.setTombstones({ t: {}, p: {}, a: {} });
-    const p = await kv.get('profile'); if (p) { p.updatedAt = 0; await kv.set('profile', p); }
-    await store.load(); emit('library');
-  }
-  link = { secret, since: Date.now() }; keys = null;
+  abortCtl = new AbortController();
+  step('Looking for your library…', 3);
+  const found = await peek(secret).catch(e => { if (isAbort(e)) throw e; return null; });
+  link = { secret, since: Date.now(), replace: mode === 'replace' && !!found }; keys = null;
   await saveLink();
-  await syncNow();
+  await syncNow({ interactive: true });
+  if (S.cancelled) { await leave(); const e = new Error('Cancelled'); e.cancelled = true; throw e; }
   start();
   return found;
 }
@@ -2983,7 +3009,7 @@ function start() {
   setInterval(() => { if (document.visibilityState === 'visible' && link) syncNow(); }, 90e3);
 }
 
-return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
+return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, cancel, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
 })();
 // ---------- voice.js ----------
 const __m_voice = (() => {
@@ -3979,6 +4005,28 @@ function syncLine() {
     : S.status === 'offline' ? `<span class="sync-st">${icon('cloudOff')} Offline — will sync when you're back online</span>`
     : `<span class="sync-st ok">${icon('check')} Synced${ago === null ? '' : ago < 1 ? ' just now' : ` ${ago} min ago`}</span>`;
 }
+// A popup that shows how a sync is going (step + progress bar), with Cancel.
+// Tapping outside or × just hides it — the sync carries on in the background.
+async function withSyncProgress(title, task) {
+  let box = null, closeIt = null;
+  const set = (label, pct) => {
+    if (!box) return;
+    if (label) box.querySelector('.sp-step').textContent = label;
+    if (pct != null) box.querySelector('.sp-bar i').style.width = Math.max(4, Math.min(100, pct)) + '%';
+  };
+  modal(`<div class="sync-prog"><div class="sp-orb">${icon('cloud')}</div><h3>${esc(title)}</h3>
+      <p class="muted sp-step">Starting…</p><div class="sp-bar" role="progressbar"><i></i></div>
+      <div class="modal-actions center"><button type="button" class="btn ghost" data-sp-cancel>Cancel</button></div>
+      <p class="tiny muted">You can close this — syncing carries on in the background.</p></div>`, {
+    onMount: (m, close) => {
+      box = m; closeIt = close;
+      m.querySelector('[data-sp-cancel]').onclick = () => { sync.cancel(); set('Cancelling…'); };
+    }
+  }).then(() => { box = null; });
+  const off = on('sync-progress', ({ label, pct }) => set(label, pct));
+  try { return await task(set); }
+  finally { off(); if (box) { set('Done', 100); setTimeout(() => { if (box) closeIt(null); }, 350); } }
+}
 // Join another device's library (from a link, QR code or short code)
 async function joinFlow(req) {
   if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
@@ -4000,13 +4048,12 @@ async function joinFlow(req) {
       if (!mode) return;
     }
     if (sync.linked()) await sync.leave();
-    toast('Syncing your music…');
-    await sync.join(secret, mode);
+    await withSyncProgress('Syncing your music', () => sync.join(secret, mode));
     const S = sync.state();
     if (S.status === 'error') throw new Error(S.error);
     toast(found ? `Synced ✓ — ${store.saved().length} songs on this device` : 'Linked ✓ — your music arrives the next time BAZINGA! is open on your other device', 'ok');
     renderProfileChip(); rerender();
-  } catch (e) { toast(e.message, 'err'); }
+  } catch (e) { if (e.cancelled) toast('Sync cancelled — nothing changed on this device'); else toast(e.message, 'err'); }
 }
 async function enterCodeDialog() {
   const r = await modal(`<h3>${icon('link')} Link this device</h3>
@@ -4024,8 +4071,8 @@ async function enterCodeDialog() {
 async function linkDeviceDialog() {
   if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
   if (!sync.linked()) {
-    try { await sync.create(); renderProfileChip(); }
-    catch (e) { return toast(e.message, 'err'); }
+    try { await withSyncProgress('Turning on sync', () => sync.create()); renderProfileChip(); }
+    catch (e) { return toast(e.cancelled ? 'Sync cancelled' : e.message, e.cancelled ? 'info' : 'err'); }
   }
   const url = sync.linkURL();
   let timer = null;
@@ -4196,6 +4243,19 @@ window.visualViewport?.addEventListener('resize', pinSoon);
 window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
 const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
 
+// ---------- Phone top bar: shrink the logo text until everything fits ----------
+// (Fonts and screen widths differ between phones, so measure instead of guessing.)
+function fitTopbar() {
+  const bar = $('.topbar'), wm = $('.brand-m .wordmark');
+  if (!bar || !wm || getComputedStyle(bar).display === 'none') return;
+  document.documentElement.style.removeProperty('--wm-size');
+  let size = parseFloat(getComputedStyle(wm).fontSize) || 22, n = 0;
+  const over = () => bar.scrollWidth > bar.clientWidth + 1 || [...bar.children].some(c => c.offsetParent && c.getBoundingClientRect().right > bar.getBoundingClientRect().right - 4);
+  while (over() && size > 13 && n++ < 20) { size -= 1; document.documentElement.style.setProperty('--wm-size', size + 'px'); }
+}
+window.addEventListener('resize', debounce(fitTopbar, 150));
+document.fonts?.ready?.then(() => fitTopbar());
+
 // ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
 const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 let clockTimer = null;
@@ -4243,6 +4303,7 @@ async function showApp() {
   wireToTop();
   setTimeout(launchPopups, 3500);
   renderProfileChip(); renderSidebarPlaylists(); renderPlayer();
+  requestAnimationFrame(fitTopbar); setTimeout(fitTopbar, 800);
   initVoice({
     go: h => { location.hash = h; }, back: () => goBack(),
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
@@ -4764,9 +4825,9 @@ function redrawArtists() {
   fillArtistPics(el);
 }
 // On phones these two fold into a ⋯ menu so the action row stays on one line
-const matchBtn = (key, name = 'My BAZINGA! playlist', job = key) => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
+const matchBtn = (key, name = 'My BAZINGA! playlist', job = key, offline = '') => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
   <button class="btn yt-save" data-act="yt-export" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}">${icon('upload')}Save to YouTube</button></span>
-  <button class="ib lg yt-more" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" aria-label="More options" title="More">${icon('more')}</button>`;
+  <button class="ib lg yt-more ${offline ? 'always' : ''}" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" ${offline ? `data-offline="${esc(offline)}"` : ''} aria-label="More options" title="More">${icon('more')}</button>`;
 
 // ---------- PLAYLIST ----------
 async function vPlaylist([id]) {
@@ -4820,10 +4881,9 @@ async function vAlbum(arg, my) {
   view().innerHTML = `<div class="page">
     ${header(esc(album.title), `${artistLink} · ${album.year || ''} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${album.genre ? ' · ' + esc(album.genre) : ''}`, cover(album.artwork, album.title), '', 'Album')}
     <div class="actions">${playBtns('play-list', 'album')}
-      ${savedA ? `<button class="btn" data-act="unsave-album" data-id="${esc(album.id)}">${icon('check')}Saved</button>` : `<button class="btn primary-o" data-act="save-album">${icon('plus')}Save album</button>`}
+      ${savedA ? `<button class="btn save-alb" data-act="unsave-album" data-id="${esc(album.id)}">${icon('check')}<span>Saved</span></button>` : `<button class="btn primary-o save-alb" data-act="save-album">${icon('plus')}<span>Save<span class="hide-sm"> album</span></span></button>`}
       <button class="ib lg" data-act="share-album" title="Share">${icon('share')}</button>
-      <button class="btn ghost" data-act="album-offline">${icon('offline')}Offline files${offlineN ? ` (${offlineN}/${tracks.length})` : ''}</button>
-      ${matchBtn('album', `${album.title} — ${album.artist}`, 'album:' + album.id)}</div>
+      ${matchBtn('album', `${album.title} — ${album.artist}`, 'album:' + album.id, `Offline files${offlineN ? ` (${offlineN}/${tracks.length})` : ''}`)}</div>
     ${tracksSection('album', tracks, { noFilter: true, numbered: true })}
     ${album.releaseDate ? `<p class="muted tiny pad">Released ${new Date(album.releaseDate).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</p>` : ''}
   </div>`;
@@ -5099,7 +5159,7 @@ function wireImport() {
     if (fd.get('name')) { const p = await store.createPlaylist(fd.get('name'), saved.map(t => t.id), { source: 'pasted' }); location.hash = '#/playlist/' + p.id; }
     else { await Promise.all(saved.map(t => store.updateTrack(t.id, { liked: true }))); toast(`${saved.length} songs added to Liked`); location.hash = '#/library/liked'; }
   });
-  $('[data-act-change="csv"]').addEventListener('change', e => importCSVFiles([...e.target.files]));
+  $('[data-act-change="csv"]').addEventListener('change', e => { importCSVFiles([...e.target.files]); e.target.value = ''; });
   $$('[data-act-change="exportify-file"]').forEach(i => i.addEventListener('change', e => { exportifyWaiting = false; importCSVFiles([...e.target.files], { source: 'Spotify' }); e.target.value = ''; }));
   $('[data-act-change="apple"]').addEventListener('change', e => importAppleFiles([...e.target.files]));
   $('#ytlink-form').addEventListener('submit', e => { e.preventDefault(); ytImportLink(e.target.u.value.trim()); });
@@ -5118,6 +5178,8 @@ async function importCSVFiles(files, { source = 'CSV' } = {}) {
   if (!csvs.length) { if (items.length) toast('No songs found in that file', 'err'); return; }
   const prog = csvs.length > 1 ? progress(`Importing ${csvs.length} playlists…`) : null;
   let likedN = 0, pls = 0, songs = 0, firstPl = null;
+  const usedNames = new Map(); // each file becomes its own playlist, even if two files share a name
+  const report = [];
   for (let i = 0; i < csvs.length; i++) {
     const f = csvs[i];
     prog?.set(i + 1, csvs.length);
@@ -5125,19 +5187,26 @@ async function importCSVFiles(files, { source = 'CSV' } = {}) {
     try {
       const tracks = imp.tracksFromCSV(f.text);
       if (!tracks.length) continue;
-      const name = f.name.replace(/\.csv$/i, '').replace(/[_]+/g, ' ').trim();
-      if (/^liked( songs)?$|liked.?songs|^liked$/i.test(name)) {
+      const base = (f.name.split('/').pop() || 'Playlist').replace(/\.csv$/i, '').replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Imported playlist';
+      // Only a file that is clearly your Liked Songs export goes into Liked Songs; everything else is a playlist
+      if (/^(your |my )?liked( songs)?$/i.test(base)) {
         await store.upsertTracks(tracks.map(t => ({ ...t, liked: true, likedAt: t.addedAt || Date.now() })));
-        likedN += tracks.length; songs += tracks.length; continue;
+        likedN += tracks.length; songs += tracks.length; report.push(['Liked Songs', tracks.length]); continue;
       }
+      const k = base.toLowerCase(), n = (usedNames.get(k) || 0) + 1; usedNames.set(k, n);
+      const name = n > 1 ? `${base} (${n})` : base;
       const saved = await store.upsertTracks(tracks);
-      const ex = [...lib.playlists.values()].find(x => x.name === name && (x.source === source || x.source === 'CSV' || x.source === 'Spotify'));
-      if (ex) { ex.trackIds = saved.map(t => t.id); await store.savePlaylist(ex); firstPl = firstPl || ex; }
-      else firstPl = firstPl || await store.createPlaylist(name, saved.map(t => t.id), { source });
-      pls++; songs += saved.length;
+      // Re-importing the same playlist file updates it (only the first file with that name in this batch)
+      const ex = n === 1 && [...lib.playlists.values()].find(x => x.name === name && (x.source === source || x.source === 'CSV' || x.source === 'Spotify'));
+      let pl;
+      if (ex) { ex.trackIds = saved.map(t => t.id); await store.savePlaylist(ex); pl = ex; }
+      else pl = await store.createPlaylist(name, saved.map(t => t.id), { source });
+      firstPl = firstPl || pl;
+      pls++; songs += saved.length; report.push([name, saved.length]);
     } catch (e) { toast(`${f.name}: ${e.message}`, 'err'); }
   }
-  const msg = [likedN ? `${likedN} Liked Songs` : '', pls ? `${pls} playlist${pls > 1 ? 's' : ''}` : ''].filter(Boolean).join(' and ');
+  const msg = [pls ? `${pls} playlist${pls > 1 ? 's' : ''}` : '', likedN ? `${likedN} Liked Songs` : ''].filter(Boolean).join(' and ');
+  if (report.length > 1) setTimeout(() => modal(`<h3>${icon('check')} Imported ${report.length} files</h3><div class="imp-report">${report.map(([n, c]) => `<div><span>${esc(n)}</span><b>${c} song${c === 1 ? "" : "s"}</b></div>`).join('')}</div><div class="modal-actions center"><button class="btn primary" data-close>Done</button></div>`), 400);
   if (prog) prog.done(msg ? `Imported ${msg} ✓` : 'Nothing to import'); else if (msg) toast(`Imported ${msg} ✓`, 'ok'); else toast('No songs found in that file', 'err');
   renderSidebarPlaylists();
   if (pls === 1 && !likedN && firstPl) location.hash = '#/playlist/' + firstPl.id;
@@ -6177,7 +6246,9 @@ function wireGlobal() {
       case 'art-sort': artistUI.sort = a.dataset.v; artistUI.limit = PAGE_N; redrawArtists(); $$('.az a').forEach(x => x.classList.remove('on')); break;
       case 'yt-backup': ytBackupPicker(); break;
       case 'yt-more': {
-        const k = await menu(a, [{ k: 'match', label: 'Find YouTube matches', icon: 'yt' }, { k: 'save', label: 'Save to YouTube', icon: 'upload' }]);
+        const wide = innerWidth > 700; // on computers the YouTube buttons are already on the page
+        const k = await menu(a, [a.dataset.offline ? { k: 'offline', label: a.dataset.offline, icon: 'offline' } : null, wide ? null : { k: 'match', label: 'Find YouTube matches', icon: 'yt' }, wide ? null : { k: 'save', label: 'Save to YouTube', icon: 'upload' }]);
+        if (k === 'offline') { const { tracks } = window.__album; pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', fs => addLocalFiles(fs, { albumHint: tracks }), { multiple: true }); }
         if (k === 'match') matchList(lists.get(a.dataset.list) || []);
         if (k === 'save') ytExport(lists.get(a.dataset.list) || [], a.dataset.name, a.dataset.job);
         break;
@@ -6189,7 +6260,7 @@ function wireGlobal() {
       case 'enter-code': { const req = await enterCodeDialog(); if (req) joinFlow(req); break; }
       case 'sync-leave': syncMenu('leave'); break;
       case 'sync-forget': syncMenu('forget'); break;
-      case 'sync-now': sync.syncNow().then(() => { const S = sync.state(); toast(S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.status === 'synced' ? 'ok' : 'err'); }); break;
+      case 'sync-now': withSyncProgress('Syncing your music', () => sync.syncNow({ interactive: true })).then(() => { const S = sync.state(); toast(S.cancelled ? 'Sync cancelled' : S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.cancelled ? 'info' : S.status === 'synced' ? 'ok' : 'err'); }); break;
       case 'bk-link': try { await backup.linkFile(); rerender(); } catch (err) { if (err.name !== 'AbortError') toast(err.message, 'err'); } break;
       case 'bk-regrant': await backup.regrant(); rerender(); renderBackupNag(); break;
       case 'bk-unlink': await backup.unlinkFile(); rerender(); break;
@@ -6307,7 +6378,7 @@ async function renderBackupNag() {
   const lastD = await kv.get('lastDownload');
   const n = store.saved().length;
   if (st === 'needs-permission') el.innerHTML = `<div class="nag">${icon('restore')}<span>Auto-backup to your file is paused.</span><button class="btn sm primary" data-act="bk-regrant">Resume</button></div>`;
-  else if (!backup.fsSupported && n > 20 && (!lastD || Date.now() - lastD > 7 * 864e5)) el.innerHTML = `<div class="nag">${icon('restore')}<span>Keep your library safe — save a backup file to this device.</span><button class="btn sm primary" data-act="bk-nag-dl">Save backup</button><button class="ib sm" data-act="bk-nag-x" aria-label="Dismiss">${icon('close')}</button></div>`;
+  else if (!backup.fsSupported && n > 20 && (!lastD || Date.now() - lastD > 7 * 864e5)) el.innerHTML = `<div class="nag">${icon('restore')}<span>Keep your library safe — save a backup file to this device.</span><button class="btn sm primary" data-act="bk-nag-dl">Save backup</button><button class="ib sm nag-x" data-act="bk-nag-x" aria-label="Dismiss">${icon('close')}</button></div>`;
   else el.innerHTML = '';
 }
 

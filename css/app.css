@@ -1609,3 +1609,59 @@ body:not(.has-track) #toasts { bottom: 18px; }
 @media (max-width: 420px) { .voice-pick { grid-template-columns: minmax(0, 1fr); } .voice-pick .btn { justify-self: start; } }
 .a2-warn { display: flex; gap: 10px; align-items: flex-start; text-align: left; padding: 10px 12px; border-radius: 12px; background: rgb(255 214 10 / .1); border: 1px solid rgb(255 214 10 / .35); font-size: 13.5px; color: var(--text); }
 .a2-warn .ic { flex: none; width: 18px; height: 18px; color: var(--volt); margin-top: 2px; }
+
+/* ================= v1.5.3 ================= */
+/* --- Logo text a little smaller --- */
+.brand .wordmark { font-size: 26px; }
+@media (max-width: 700px) { .brand-m .wordmark { font-size: 22px; } }
+@media (max-width: 360px) { .brand-m .wordmark { font-size: 19px; } }
+.ob-card h1.wordmark { font-size: clamp(42px, 12vw, 64px); }
+
+/* --- Sync progress popup --- */
+.sync-prog { display: grid; gap: 12px; justify-items: center; text-align: center; }
+.sync-prog h3 { margin: 0; }
+.sp-orb { width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center; background: rgb(255 214 10 / .12); border: 2px solid var(--volt); color: var(--volt); animation: breathe 1.6s ease-in-out infinite; }
+.sp-orb .ic { width: 30px; height: 30px; }
+.sp-step { margin: 0; min-height: 1.4em; font-variant-numeric: tabular-nums; }
+.sp-bar { width: 100%; height: 10px; border-radius: 99px; background: var(--surface2); border: 1px solid var(--line); overflow: hidden; }
+.sp-bar i { display: block; height: 100%; width: 4%; background: linear-gradient(90deg, var(--volt), var(--volt-2)); border-radius: 99px; transition: width .35s ease; }
+
+/* --- Import summary --- */
+.imp-report { display: grid; gap: 6px; max-height: 50vh; overflow: auto; margin: 6px 0 4px; }
+.imp-report div { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; border-radius: 10px; background: var(--surface2); }
+.imp-report span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.imp-report b { flex: none; color: var(--volt); font-variant-numeric: tabular-nums; }
+
+/* --- Album / playlist action row: everything fits on a phone; offline files live in ⋯ --- */
+.yt-more.always { display: inline-grid; }
+.actions > * { flex: none; }
+.actions .round-play { aspect-ratio: 1; flex: none; }
+@media (max-width: 700px) {
+  .actions { gap: 6px; flex-wrap: nowrap; max-width: 100%; }
+  .actions .ib.lg { width: 40px; height: 40px; }
+  .actions .round-play { width: 52px; height: 52px; }
+  .actions .save-alb { padding: 0 12px; height: 40px; }
+}
+
+/* --- "Keep your library safe" notice: × in the top-right corner on phones --- */
+.nag { position: relative; }
+@media (max-width: 700px) {
+  .nag { padding-right: 44px; }
+  .nag .nag-x { position: absolute; top: 6px; right: 6px; }
+}
+
+/* ================= v1.5.4 — phone top bar always fits (no cut-off profile picture) ================= */
+@media (max-width: 700px) {
+  .topbar { gap: 2px !important; padding-left: max(12px, env(safe-area-inset-left)) !important; padding-right: max(12px, env(safe-area-inset-right)) !important; }
+  .brand-m { min-width: 0; flex: 0 1 auto !important; margin-right: auto; overflow: visible; }
+  .brand-m .brand-row { gap: 7px !important; min-width: 0; }
+  .brand-m .logo-mark { width: 30px !important; height: 30px !important; }
+  .brand-m .wordmark { font-size: var(--wm-size, clamp(16px, 5.3vw, 22px)) !important; white-space: nowrap; }
+  .topbar .ib { width: 36px !important; height: 36px !important; margin: 0 !important; }
+  .topbar .lock-top { margin-right: -4px !important; }
+  .topbar .profile-chip.compact { flex: none; margin-left: 4px !important; }
+  .topbar .profile-chip.compact .avatar { width: 34px !important; height: 34px !important; }
+  /* the page's scroll bar used to sit on top of the profile picture */
+  #main { scrollbar-width: none; }
+  #main::-webkit-scrollbar { display: none; width: 0; height: 0; }
+}

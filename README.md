@@ -54,6 +54,10 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Safari & blocked networks**: YouTube search no longer depends only on the free Invidious/Piped servers — if they're slow or blocked (e.g. iCloud Private Relay), BAZINGA! reads YouTube's own results page through free public relays.
 - **Search**: results that don't match what you typed are dropped and the best matches come first (one typo allowed); the top results are looked up on YouTube straight away so they start faster.
 - **Voice assistant** always closes itself: right after a finished task, or ~8 s after it couldn't help.
+- **CSV import**: choose several CSV files at once — each becomes its own playlist (same-named files get "(2)"), only a file named "Liked Songs" goes into Liked Songs, and a summary lists every file imported.
+- **Sync progress popup** with a progress bar and **Cancel** (linking, "Sync now"); cancelling leaves the device untouched.
+- **Album pages on phones** fit on one line; **Offline files** moved into the ⋯ menu.
+- Smaller logo text; the backup notice's × sits top-right on phones.
 - Removed the "Tap the video once to start" notice and the Siri voice explanation text. Bigger bolt on the Home Screen app icon.
 
 ### New in v1.3
