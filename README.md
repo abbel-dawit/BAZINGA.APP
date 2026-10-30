@@ -49,6 +49,11 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Popups**: "Add to Home Screen" on the first visit, then every 5th visit until installed or *Don't show this again*. Buy Me a Coffee every 10th visit until *Don't show this again*. Both close with the × or by tapping outside.
 - **Auto-update on launch** (see below). **Account card**: the four counters are smaller and on one line (2×2 on very narrow phones). **Logo glow** sized so it's never cut off.
 - **Removed**: the Top 5 tippers board and live Phase 2 totals (they needed a database).
+- **Android / Samsung Internet**: its installer makes an app Google Play Protect blocks, so the Add-to-Home-Screen popup there suggests installing from another browser (Chrome, Firefox, Edge, Brave or Opera) with a *Copy link* button.
+- **iPhone Home Screen app (iOS 26)**: fixed the gap / cut-off bottom menu (WebKit bug where the page gets a too-short viewport).
+- **Safari & blocked networks**: YouTube search no longer depends only on the free Invidious/Piped servers — if they're slow or blocked (e.g. iCloud Private Relay), BAZINGA! reads YouTube's own results page through free public relays.
+- **Search**: results that don't match what you typed are dropped and the best matches come first (one typo allowed); the top results are looked up on YouTube straight away so they start faster.
+- **Voice assistant** always closes itself: right after a finished task, or ~8 s after it couldn't help.
 - Removed the "Tap the video once to start" notice and the Siri voice explanation text. Bigger bolt on the Home Screen app icon.
 
 ### New in v1.3

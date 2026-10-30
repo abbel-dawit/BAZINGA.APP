@@ -335,29 +335,6 @@ window.visualViewport?.addEventListener('resize', pinSoon);
 window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
 const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
 
-// ---------- Installed iPhone app: fill the screen right to the bottom edge ----------
-// In some iOS versions a Home Screen web app reports a layout height shorter than the real screen
-// (by about the status-bar height), so everything pinned to the bottom floats with a gap under it.
-// Measure the missing strip and push the bottom bars (and the page) down by exactly that much.
-function fitStandalone() {
-  const ios = /iphone|ipod|ipad/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
-  let gap = 0;
-  if (ios && standalone) {
-    const portrait = matchMedia('(orientation: portrait)').matches;
-    const full = portrait ? Math.max(screen.width, screen.height) : Math.min(screen.width, screen.height);
-    const have = Math.max(window.innerHeight, document.documentElement.clientHeight);
-    gap = Math.round(full - have);
-    if (gap < 4 || gap > 140) gap = 0; // only the known bug, never something else (keyboard, split view)
-  }
-  document.documentElement.style.setProperty('--pwa-gap', gap + 'px');
-  document.body.classList.toggle('pwa-gap', gap > 0);
-}
-fitStandalone();
-window.addEventListener('resize', () => setTimeout(fitStandalone, 120));
-window.addEventListener('orientationchange', () => setTimeout(fitStandalone, 350));
-window.addEventListener('pageshow', fitStandalone);
-
 // ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
 const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 let clockTimer = null;
@@ -462,21 +439,27 @@ async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
   const st = (await kv.get('a2hs')) || {};
   const ios = isIOS(), ua = navigator.userAgent;
+  // Samsung Internet wraps installed sites in its own outdated Android package, which Google Play
+  // Protect blocks ("Unsafe app blocked"). Nothing on our side can change that package, so on
+  // Samsung Internet we never use its installer and send people to Chrome to install instead.
+  const samsung = /SamsungBrowser/i.test(ua) && /android/i.test(ua);
+  const canPrompt = installEvt && !samsung;
+  const chromeIntent = `intent://${location.host}${location.pathname}#Intent;scheme=https;package=com.android.chrome;end`;
   const shareIc = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>';
   const dots = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="19" r="1.8" fill="currentColor"/></svg>';
-  const steps = installEvt ? '' : ios ? `<ol class="a2-steps"><li>Tap the <b>Share</b> button <span class="a2-ic">${shareIc}</span> ${/CriOS|FxiOS|EdgiOS/.test(ua) ? '(top or bottom of the screen)' : 'in the toolbar'}.</li><li>Scroll and tap <b>Add to Home Screen</b> <span class="a2-ic">${icon('plus')}</span>.</li><li>Tap <b>Add</b>. Done — BAZINGA! opens like an app.</li></ol>`
+  const steps = canPrompt ? '' : samsung ? `<p class="a2-warn">${icon('shield')}<span>Samsung Internet's installer makes an app that Google Play Protect blocks. Install BAZINGA! from another browser instead — <b>Chrome, Firefox, Microsoft Edge, Brave or Opera</b> all work.</span></p>
+      <ol class="a2-steps"><li>Tap <b>Copy link</b>, open one of those browsers (get one free from the Play Store if you need to) and paste the link.</li><li>In that browser, open its menu <span class="a2-ic">${dots}</span> and tap <b>Install</b> or <b>Add to Home screen</b>.</li><li>Bring your music along: here, <b>Settings → Sync your devices → Link a device</b>, then open that link in the new browser.</li></ol>` : ios ? `<ol class="a2-steps"><li>Tap the <b>Share</b> button <span class="a2-ic">${shareIc}</span> ${/CriOS|FxiOS|EdgiOS/.test(ua) ? '(top or bottom of the screen)' : 'in the toolbar'}.</li><li>Scroll and tap <b>Add to Home Screen</b> <span class="a2-ic">${icon('plus')}</span>.</li><li>Tap <b>Add</b>. Done — BAZINGA! opens like an app.</li></ol>`
     : /Firefox/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install</b> (or <b>Add to Home screen</b>).</li></ol>`
-    : /SamsungBrowser/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">≡</span>.</li><li>Tap <b>Add page to</b> → <b>Home screen</b>.</li></ol>`
     : `<ol class="a2-steps"><li>Open your browser menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install app</b> or <b>Add to Home screen</b>.</li></ol>`;
   const r = await modal(`<div class="a2hs">
       <div class="a2-icon"><img src="icons/app-192.png" alt="BAZINGA! app icon" width="96" height="96"></div>
       <h3>Add BAZINGA! to your Home Screen</h3>
       <p class="muted">One tap away, full screen like a real app, and music keeps going better in the background.</p>
       ${steps}
-      <div class="modal-actions center">${installEvt ? `<button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : `<button class="btn primary" data-resolve="later">Got it</button>`}</div>
+      <div class="modal-actions center">${canPrompt ? `<button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : samsung ? `<button class="btn primary" type="button" data-copy-app>${icon('link')}Copy link</button><a class="btn" href="${esc(chromeIntent)}">Open in Chrome</a>` : `<button class="btn primary" data-resolve="later">Got it</button>`}</div>
       <button class="lnk tiny a2-never" data-resolve="never">Don't show this again</button>
-    </div>`);
-  if (r === 'install' && installEvt) {
+    </div>`, { onMount: m => { const c = m.querySelector('[data-copy-app]'); if (c) c.onclick = async () => toast(await copyText(location.origin + location.pathname) ? 'Link copied — paste it into your other browser' : location.origin + location.pathname, 'ok'); } });
+  if (r === 'install' && canPrompt) {
     installEvt.prompt();
     try { const c = await installEvt.userChoice; if (c.outcome === 'accepted') st.done = true; } catch { }
     installEvt = null;
@@ -1079,6 +1062,48 @@ async function ytResultsToTracks(results) {
   }
   return out;
 }
+// ---------- Search relevance ----------
+// Only keep results that actually match what was typed: every word must appear (as the start of a
+// word in the title / artist / album), with one typo allowed in longer words. Best matches first.
+const STOP = new Set(['the', 'a', 'an', 'by', 'and', 'of', 'feat', 'ft', 'with', 'x']);
+function near(a, b) { // edit distance <= 1
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, d = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++d > 1) return false;
+    if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+  }
+  return d + (a.length - i) + (b.length - j) <= 1;
+}
+function relevance(q) {
+  const nq = norm(q);
+  const toks = nq.split(' ').filter(t => t && !STOP.has(t));
+  const words = toks.length ? toks : nq.split(' ').filter(Boolean);
+  return (...fields) => {
+    const text = norm(fields.filter(Boolean).join(' '));
+    if (!words.length) return 1;
+    const tw = text.split(' ');
+    let hits = 0, exact = 0;
+    for (const t of words) {
+      if (tw.some(w => w === t)) { hits++; exact++; }
+      else if (tw.some(w => w.startsWith(t) || (t.length >= 5 && w.length >= 4 && near(t, w.slice(0, t.length + 1)) ) || (t.length >= 5 && near(t, w)))) hits++;
+      else if (t.length >= 3 && text.replace(/ /g, '').includes(t)) hits += 0.8; // "acdc" vs "ac dc"
+    }
+    const need = words.length >= 4 ? words.length - 1 : words.length;
+    if (hits < need) return null;
+    let sc = hits + exact * 0.5;
+    if (text.includes(nq)) sc += 3;
+    if (norm(fields[0] || '').startsWith(nq)) sc += 2;
+    return sc;
+  };
+}
+function keepRelevant(list, q, fieldsOf) {
+  const rel = relevance(q);
+  return list.map((x, i) => ({ x, i, s: rel(...fieldsOf(x)) })).filter(o => o.s !== null)
+    .sort((a, b) => (b.s - a.s) || (a.i - b.i)).map(o => o.x);
+}
+
 let searchSeq = 0;
 async function doSearch(q, tab) {
   lastSearch.q = q;
@@ -1094,9 +1119,10 @@ async function doSearch(q, tab) {
   const ytPart = async (target, limit) => {
     if (q.length < 2) return;
     try {
-      const res = await yt.rawSearch(q, { preferFree: true });
+      const res = keepRelevant(await yt.rawSearch(q, { preferFree: true }), q, r => [r.title, r.author]);
       if (!alive()) return;
       const tracks = (await ytResultsToTracks(res)).slice(0, limit);
+      prefetchTop(tracks, 2);
       const el = $(target); if (!el) return;
       el.innerHTML = tracks.length ? `<div class="sec-h"><h2>${icon('yt')} From YouTube</h2>${tab === 'all' && tracks.length >= limit ? '<a class="lnk" href="#/search/youtube">See all</a>' : ''}</div>${rowsFor('s-yt-list', tracks)}` : (tab === 'youtube' ? '<p class="muted">No YouTube results.</p>' : '');
       markNow();
@@ -1123,14 +1149,16 @@ async function doSearch(q, tab) {
     };
     const part = (p, fill) => meta.withTimeout(Promise.resolve(p), 9000, []).then(v => { if (alive()) { fill(v || []); settled++; shown++; paint(); } }, () => { settled++; paint(); });
     await Promise.all([
-      part(artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
-      part(albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
-      part(songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
+      part(artistsP.then?.(v => keepRelevant(v, q, a => [a.name])) ?? artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
+      part(albumsP.then?.(v => keepRelevant(v, q, a => [a.title, a.artist])) ?? albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
+      part(songsP.then?.(v => keepRelevant(v, q, t => [t.title, t.artist, t.album])) ?? songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); prefetchTop(st, 3); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
     ]);
   } catch (e) {
     if (alive()) $('#s-main').innerHTML = '<p class="muted">Music search is unavailable right now. Try again in a moment.</p>';
   }
 }
+// Look up the YouTube version of the top results right away, so tapping one starts instantly
+function prefetchTop(tracks, n) { setTimeout(() => tracks.slice(0, n).forEach((t, k) => setTimeout(() => player.prefetch(t.id), k * 450)), 250); }
 function rowsFor(key, tracks) {
   lists.set(key, tracks.map(t => t.id));
   const cur = player.current()?.id;

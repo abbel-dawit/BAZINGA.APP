@@ -1556,13 +1556,19 @@ body.app-locked { overscroll-behavior: none; }
 .modal-x:hover { opacity: 1; }
 
 /* ================= v1.5.2 ================= */
-/* --- Installed iPhone app: close the strip some iOS versions leave under the bottom bars --- */
-:root { --pwa-gap: 0px; }
-body.pwa-gap #app { bottom: calc(-1 * var(--pwa-gap)); }
-body.pwa-gap .tabbar, body.pwa-gap #playerbar, body.pwa-gap #toasts, body.pwa-gap #to-top.show, body.pwa-gap #yt-dock:not(.in-np) { translate: 0 var(--pwa-gap); }
-body.pwa-gap .modal-wrap, body.pwa-gap #onboarding, body.pwa-gap #lock-layer, body.pwa-gap .menu-back { bottom: calc(-1 * var(--pwa-gap)); }
-body.pwa-gap #onboarding { height: auto; }
-body.pwa-gap .menu.sheet { translate: 0 var(--pwa-gap); }
+/* --- Installed iPhone app (iOS 26): reach the bottom edge ---
+   iOS 26 gives a Home Screen web app a viewport that's shorter than the screen by the status-bar
+   height whenever the page itself is shorter than the screen (WebKit bug 301108, fixed in iOS 26.1),
+   so bottom bars float with a gap — or get cut off if you try to stretch them. Making the page at
+   least screen-tall gives it the full viewport. min() keeps it from scrolling where there's no gap. */
+@media (display-mode: standalone) {
+  html { min-height: min(100lvh, calc(100% + env(safe-area-inset-top))); }
+}
+@media (display-mode: standalone) and (max-width: 700px) {
+  :root { --safe-b: max(env(safe-area-inset-bottom) - 8px, 6px); }
+  .tabbar { height: calc(var(--tab) + var(--safe-b)); padding-bottom: var(--safe-b); }
+  #playerbar { bottom: calc(var(--tab) + var(--safe-b) + 6px); }
+}
 
 /* --- Back-to-top: always above the bottom menu (and the mini player) --- */
 @media (max-width: 700px) {
@@ -1601,3 +1607,5 @@ body:not(.has-track) #toasts { bottom: 18px; }
 .voice-pick .btn { white-space: nowrap; }
 #voice-set .fld { min-width: 0; max-width: 100%; }
 @media (max-width: 420px) { .voice-pick { grid-template-columns: minmax(0, 1fr); } .voice-pick .btn { justify-self: start; } }
+.a2-warn { display: flex; gap: 10px; align-items: flex-start; text-align: left; padding: 10px 12px; border-radius: 12px; background: rgb(255 214 10 / .1); border: 1px solid rgb(255 214 10 / .35); font-size: 13.5px; color: var(--text); }
+.a2-warn .ic { flex: none; width: 18px; height: 18px; color: var(--volt); margin-top: 2px; }

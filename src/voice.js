@@ -135,6 +135,7 @@ export function initVoice(hooks) {
     if (c?.dataset.vc === 'yes' || c?.dataset.vc === 'no') { stopListening(); setHeard(c.dataset.vc === 'yes' ? 'Yes' : 'No'); handle(c.dataset.vc); }
     const s = e.target.closest('[data-vc-say]'); if (s) { setHeard(s.dataset.vcSay); handle(s.dataset.vcSay); }
   });
+  ['focus', 'input'].forEach(ev => wrap.querySelector('.vc-form input').addEventListener(ev, () => clearTimeout(closeTimer)));
   wrap.querySelector('.vc-form').addEventListener('submit', e => {
     e.preventDefault(); const q = e.target.q.value.trim(); if (!q) return;
     e.target.q.value = ''; stopListening(); setHeard(q); handle(q);
@@ -153,6 +154,18 @@ export function openVoice({ listenNow = true, fromWake = false } = {}) {
   try { if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch { }
   if (!listenNow) return;
   if (canListen) listen(); else v.querySelector('input').focus();
+}
+// Close by itself once there's nothing left to do: right after a finished task, or after a short
+// pause when it couldn't help (so you can try again) — it never just sits on screen.
+function scheduleClose(ms) {
+  clearTimeout(closeTimer);
+  closeTimer = setTimeout(() => {
+    const typing = document.activeElement && el()?.contains(document.activeElement) && document.activeElement.matches('input') && document.activeElement.value;
+    if (!open || listening || pending || typing) return;
+    let speaking = false; try { speaking = speechSynthesis.speaking; } catch { }
+    if (speaking) return scheduleClose(600);
+    close();
+  }, ms);
 }
 function close() {
   clearTimeout(closeTimer); pending = null; confirmUI(false);
@@ -190,13 +203,14 @@ function listen() {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setReply('I need microphone access. Allow it in your browser\'s site settings, or type below.');
     else if (e.error === 'no-speech') setReply('I didn\'t hear anything. Tap the orb and try again.');
     else if (e.error === 'network') setReply('Voice recognition needs internet. You can type instead.');
+    scheduleClose(8000);
   };
   rec.onend = () => {
     listening = false; setState('idle'); rec = null;
     player.audioMode('playback'); // release the microphone's audio mode right away
     const alts = [];
     for (let k = 1; k < 5; k++) { const a = finals.map(f => f[k] || f[0]).join(' ').trim(); if (a && a !== final.trim() && !alts.includes(a)) alts.push(a); }
-    if (final.trim()) handle(final.trim(), alts); else restoreAudio();
+    if (final.trim()) handle(final.trim(), alts); else { restoreAudio(); if (!pending) scheduleClose(8000); }
   };
   try { rec.start(); } catch { player.audioMode('playback'); }
 }
@@ -464,7 +478,7 @@ async function handle(raw, alts = []) {
   if (!listening) setState('idle');
   restoreAudio();
   // Task done: close the assistant (stays open if it couldn't help, so you can try again)
-  if (!keep && open && !listening) closeTimer = setTimeout(() => { if (!listening && !keep) close(); }, 700);
+  if (open && !listening && !pending) scheduleClose(keep ? 8000 : 600);
 }
 
 async function run(q, alts = []) {

@@ -117,6 +117,58 @@ async function searchPiped(base, q, ms) {
     id: new URL(v.url, 'https://x.y').searchParams.get('v'), title: v.title, author: (v.uploaderName || '').replace(/\s*-\s*Topic$/, ' - Topic'), seconds: v.duration || 0, views: v.views || 0
   }));
 }
+// Another keyless route that doesn't depend on the Invidious/Piped servers (which some networks —
+// e.g. Safari's iCloud Private Relay — get blocked by): read YouTube's own results page through a
+// free public CORS relay, and take the video list out of it. Several relays race; first answer wins.
+const PROXIES = [
+  u => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+  u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  u => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u)
+];
+const proxyBad = new Map(); // index -> rested until
+const secs = t => String(t || '').split(':').reduce((a, b) => a * 60 + (+b || 0), 0);
+function videosFromYtData(data) {
+  const out = [], seen = new Set();
+  const walk = o => {
+    if (!o || typeof o !== 'object' || out.length >= 25) return;
+    if (Array.isArray(o)) { for (const x of o) walk(x); return; }
+    const v = o.videoRenderer;
+    if (v?.videoId && !seen.has(v.videoId)) {
+      seen.add(v.videoId);
+      out.push({
+        id: v.videoId,
+        title: (v.title?.runs || []).map(r => r.text).join('') || v.title?.simpleText || '',
+        author: (v.ownerText?.runs || v.longBylineText?.runs || [])[0]?.text || '',
+        seconds: secs(v.lengthText?.simpleText),
+        views: +String(v.viewCountText?.simpleText || '').replace(/\D/g, '') || 0
+      });
+      return;
+    }
+    for (const k in o) walk(o[k]);
+  };
+  walk(data);
+  return out;
+}
+export async function proxySearch(q, ms = 8000) {
+  const url = 'https://www.youtube.com/results?hl=en&gl=US&search_query=' + encodeURIComponent(q) + '&sp=EgIQAQ%253D%253D';
+  const now = Date.now();
+  const tries = PROXIES.map((mk, i) => (async () => {
+    if ((proxyBad.get(i) || 0) > now) throw new Error('rested');
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+    try {
+      const r = await fetch(mk(url), { signal: ctl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const html = await r.text();
+      const m = html.match(/ytInitialData\s*=\s*(\{.+?\})\s*;\s*<\/script>/s);
+      if (!m) throw new Error('no data');
+      const list = videosFromYtData(JSON.parse(m[1]));
+      if (!list.length) throw new Error('empty');
+      return list;
+    } catch (e) { proxyBad.set(i, Date.now() + 5 * 60e3); throw e; }
+    finally { clearTimeout(t); }
+  })());
+  return Promise.any(tries).catch(() => { throw new Error('proxy search failed'); });
+}
 function decodeEntities(s) { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
 
 // Fast path for a song you just tapped: ask the best server, and if it hasn't answered within a
@@ -124,12 +176,19 @@ function decodeEntities(s) { const t = document.createElement('textarea'); t.inn
 // never holds the music up. The app's backup key joins in only if the free servers are all slow.
 function raceSearch(q, order) {
   return new Promise((resolve, reject) => {
-    let i = 0, pending = 0, done = false, timer = 0, keyTimer = 0;
-    const win = r => { done = true; clearTimeout(timer); clearTimeout(keyTimer); resolve(r); };
+    let i = 0, pending = 0, done = false, timer = 0, keyTimer = 0, proxyTimer = 0, proxyDone = false;
+    const win = r => { done = true; clearTimeout(timer); clearTimeout(keyTimer); clearTimeout(proxyTimer); resolve(r); };
+    const giveUp = () => { if (!done && !pending && i >= order.length && proxyDone) { done = true; clearTimeout(keyTimer); reject(new Error('none')); } };
+    // If the free servers haven't answered quickly (or all look down), YouTube's own page joins the race
+    const anyGood = order.slice(0, 3).some(b => { const st = pool.get(b); return st && st.ok && st.fail < 2; });
+    proxyTimer = setTimeout(() => {
+      if (done) return; pending++;
+      proxySearch(q).then(r => { pending--; proxyDone = true; if (!done && r.length) win(r); else giveUp(); }, () => { pending--; proxyDone = true; giveUp(); });
+    }, anyGood ? 2200 : 300);
     const launch = () => {
       clearTimeout(timer);
       if (done) return;
-      if (i >= order.length) { if (!pending) { done = true; clearTimeout(keyTimer); reject(new Error('none')); } return; }
+      if (i >= order.length) { giveUp(); return; }
       const base = order[i++], st = pool.get(base); pending++;
       hit(base, q, 5000).then(r => { pending--; if (done) return; if (r.length) win(r); else launch(); }, () => { pending--; if (!done) launch(); });
       const known = st && st.ok && st.ms < 2500;
@@ -161,6 +220,7 @@ export async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
       if (tried.has(base)) continue; tried.add(base);
       try { const r = await hit(base, q); if (r.length) return r; } catch { }
     }
+    if (prefer) { try { return await proxySearch(q); } catch { } }
     // Free servers all failed: fall back to your key if we skipped it, then the app's backup key
     if (settings.ytKey && preferFree) { try { return await searchViaKey(q); } catch { } }
     if (settings.ownerKey && settings.ownerKey !== settings.ytKey) { try { return await searchViaKey(q, settings.ownerKey); } catch (e) { console.warn('backup key search failed', e); } }

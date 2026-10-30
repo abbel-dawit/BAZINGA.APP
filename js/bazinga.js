@@ -1223,6 +1223,58 @@ async function searchPiped(base, q, ms) {
     id: new URL(v.url, 'https://x.y').searchParams.get('v'), title: v.title, author: (v.uploaderName || '').replace(/\s*-\s*Topic$/, ' - Topic'), seconds: v.duration || 0, views: v.views || 0
   }));
 }
+// Another keyless route that doesn't depend on the Invidious/Piped servers (which some networks —
+// e.g. Safari's iCloud Private Relay — get blocked by): read YouTube's own results page through a
+// free public CORS relay, and take the video list out of it. Several relays race; first answer wins.
+const PROXIES = [
+  u => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+  u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  u => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u)
+];
+const proxyBad = new Map(); // index -> rested until
+const secs = t => String(t || '').split(':').reduce((a, b) => a * 60 + (+b || 0), 0);
+function videosFromYtData(data) {
+  const out = [], seen = new Set();
+  const walk = o => {
+    if (!o || typeof o !== 'object' || out.length >= 25) return;
+    if (Array.isArray(o)) { for (const x of o) walk(x); return; }
+    const v = o.videoRenderer;
+    if (v?.videoId && !seen.has(v.videoId)) {
+      seen.add(v.videoId);
+      out.push({
+        id: v.videoId,
+        title: (v.title?.runs || []).map(r => r.text).join('') || v.title?.simpleText || '',
+        author: (v.ownerText?.runs || v.longBylineText?.runs || [])[0]?.text || '',
+        seconds: secs(v.lengthText?.simpleText),
+        views: +String(v.viewCountText?.simpleText || '').replace(/\D/g, '') || 0
+      });
+      return;
+    }
+    for (const k in o) walk(o[k]);
+  };
+  walk(data);
+  return out;
+}
+async function proxySearch(q, ms = 8000) {
+  const url = 'https://www.youtube.com/results?hl=en&gl=US&search_query=' + encodeURIComponent(q) + '&sp=EgIQAQ%253D%253D';
+  const now = Date.now();
+  const tries = PROXIES.map((mk, i) => (async () => {
+    if ((proxyBad.get(i) || 0) > now) throw new Error('rested');
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+    try {
+      const r = await fetch(mk(url), { signal: ctl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const html = await r.text();
+      const m = html.match(/ytInitialData\s*=\s*(\{.+?\})\s*;\s*<\/script>/s);
+      if (!m) throw new Error('no data');
+      const list = videosFromYtData(JSON.parse(m[1]));
+      if (!list.length) throw new Error('empty');
+      return list;
+    } catch (e) { proxyBad.set(i, Date.now() + 5 * 60e3); throw e; }
+    finally { clearTimeout(t); }
+  })());
+  return Promise.any(tries).catch(() => { throw new Error('proxy search failed'); });
+}
 function decodeEntities(s) { const t = document.createElement('textarea'); t.innerHTML = s; return t.value; }
 
 // Fast path for a song you just tapped: ask the best server, and if it hasn't answered within a
@@ -1230,12 +1282,19 @@ function decodeEntities(s) { const t = document.createElement('textarea'); t.inn
 // never holds the music up. The app's backup key joins in only if the free servers are all slow.
 function raceSearch(q, order) {
   return new Promise((resolve, reject) => {
-    let i = 0, pending = 0, done = false, timer = 0, keyTimer = 0;
-    const win = r => { done = true; clearTimeout(timer); clearTimeout(keyTimer); resolve(r); };
+    let i = 0, pending = 0, done = false, timer = 0, keyTimer = 0, proxyTimer = 0, proxyDone = false;
+    const win = r => { done = true; clearTimeout(timer); clearTimeout(keyTimer); clearTimeout(proxyTimer); resolve(r); };
+    const giveUp = () => { if (!done && !pending && i >= order.length && proxyDone) { done = true; clearTimeout(keyTimer); reject(new Error('none')); } };
+    // If the free servers haven't answered quickly (or all look down), YouTube's own page joins the race
+    const anyGood = order.slice(0, 3).some(b => { const st = pool.get(b); return st && st.ok && st.fail < 2; });
+    proxyTimer = setTimeout(() => {
+      if (done) return; pending++;
+      proxySearch(q).then(r => { pending--; proxyDone = true; if (!done && r.length) win(r); else giveUp(); }, () => { pending--; proxyDone = true; giveUp(); });
+    }, anyGood ? 2200 : 300);
     const launch = () => {
       clearTimeout(timer);
       if (done) return;
-      if (i >= order.length) { if (!pending) { done = true; clearTimeout(keyTimer); reject(new Error('none')); } return; }
+      if (i >= order.length) { giveUp(); return; }
       const base = order[i++], st = pool.get(base); pending++;
       hit(base, q, 5000).then(r => { pending--; if (done) return; if (r.length) win(r); else launch(); }, () => { pending--; if (!done) launch(); });
       const known = st && st.ok && st.ms < 2500;
@@ -1267,6 +1326,7 @@ async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
       if (tried.has(base)) continue; tried.add(base);
       try { const r = await hit(base, q); if (r.length) return r; } catch { }
     }
+    if (prefer) { try { return await proxySearch(q); } catch { } }
     // Free servers all failed: fall back to your key if we skipped it, then the app's backup key
     if (settings.ytKey && preferFree) { try { return await searchViaKey(q); } catch { } }
     if (settings.ownerKey && settings.ownerKey !== settings.ytKey) { try { return await searchViaKey(q, settings.ownerKey); } catch (e) { console.warn('backup key search failed', e); } }
@@ -1473,7 +1533,7 @@ async function publicPlaylist(listId) {
   throw new Error('Couldn\'t read that playlist. Make sure it\'s public or unlisted, or sign in with YouTube to import your private playlists.');
 }
 
-return { setYTSettings, startInstances, rawSearch, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
+return { setYTSettings, startInstances, proxySearch, rawSearch, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
 })();
 // ---------- ytaccount.js ----------
 const __m_ytaccount = (() => {
@@ -3064,6 +3124,7 @@ function initVoice(hooks) {
     if (c?.dataset.vc === 'yes' || c?.dataset.vc === 'no') { stopListening(); setHeard(c.dataset.vc === 'yes' ? 'Yes' : 'No'); handle(c.dataset.vc); }
     const s = e.target.closest('[data-vc-say]'); if (s) { setHeard(s.dataset.vcSay); handle(s.dataset.vcSay); }
   });
+  ['focus', 'input'].forEach(ev => wrap.querySelector('.vc-form input').addEventListener(ev, () => clearTimeout(closeTimer)));
   wrap.querySelector('.vc-form').addEventListener('submit', e => {
     e.preventDefault(); const q = e.target.q.value.trim(); if (!q) return;
     e.target.q.value = ''; stopListening(); setHeard(q); handle(q);
@@ -3082,6 +3143,18 @@ function openVoice({ listenNow = true, fromWake = false } = {}) {
   try { if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance('')); } catch { }
   if (!listenNow) return;
   if (canListen) listen(); else v.querySelector('input').focus();
+}
+// Close by itself once there's nothing left to do: right after a finished task, or after a short
+// pause when it couldn't help (so you can try again) — it never just sits on screen.
+function scheduleClose(ms) {
+  clearTimeout(closeTimer);
+  closeTimer = setTimeout(() => {
+    const typing = document.activeElement && el()?.contains(document.activeElement) && document.activeElement.matches('input') && document.activeElement.value;
+    if (!open || listening || pending || typing) return;
+    let speaking = false; try { speaking = speechSynthesis.speaking; } catch { }
+    if (speaking) return scheduleClose(600);
+    close();
+  }, ms);
 }
 function close() {
   clearTimeout(closeTimer); pending = null; confirmUI(false);
@@ -3119,13 +3192,14 @@ function listen() {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setReply('I need microphone access. Allow it in your browser\'s site settings, or type below.');
     else if (e.error === 'no-speech') setReply('I didn\'t hear anything. Tap the orb and try again.');
     else if (e.error === 'network') setReply('Voice recognition needs internet. You can type instead.');
+    scheduleClose(8000);
   };
   rec.onend = () => {
     listening = false; setState('idle'); rec = null;
     player.audioMode('playback'); // release the microphone's audio mode right away
     const alts = [];
     for (let k = 1; k < 5; k++) { const a = finals.map(f => f[k] || f[0]).join(' ').trim(); if (a && a !== final.trim() && !alts.includes(a)) alts.push(a); }
-    if (final.trim()) handle(final.trim(), alts); else restoreAudio();
+    if (final.trim()) handle(final.trim(), alts); else { restoreAudio(); if (!pending) scheduleClose(8000); }
   };
   try { rec.start(); } catch { player.audioMode('playback'); }
 }
@@ -3393,7 +3467,7 @@ async function handle(raw, alts = []) {
   if (!listening) setState('idle');
   restoreAudio();
   // Task done: close the assistant (stays open if it couldn't help, so you can try again)
-  if (!keep && open && !listening) closeTimer = setTimeout(() => { if (!listening && !keep) close(); }, 700);
+  if (open && !listening && !pending) scheduleClose(keep ? 8000 : 600);
 }
 
 async function run(q, alts = []) {
@@ -4122,29 +4196,6 @@ window.visualViewport?.addEventListener('resize', pinSoon);
 window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
 const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
 
-// ---------- Installed iPhone app: fill the screen right to the bottom edge ----------
-// In some iOS versions a Home Screen web app reports a layout height shorter than the real screen
-// (by about the status-bar height), so everything pinned to the bottom floats with a gap under it.
-// Measure the missing strip and push the bottom bars (and the page) down by exactly that much.
-function fitStandalone() {
-  const ios = /iphone|ipod|ipad/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
-  let gap = 0;
-  if (ios && standalone) {
-    const portrait = matchMedia('(orientation: portrait)').matches;
-    const full = portrait ? Math.max(screen.width, screen.height) : Math.min(screen.width, screen.height);
-    const have = Math.max(window.innerHeight, document.documentElement.clientHeight);
-    gap = Math.round(full - have);
-    if (gap < 4 || gap > 140) gap = 0; // only the known bug, never something else (keyboard, split view)
-  }
-  document.documentElement.style.setProperty('--pwa-gap', gap + 'px');
-  document.body.classList.toggle('pwa-gap', gap > 0);
-}
-fitStandalone();
-window.addEventListener('resize', () => setTimeout(fitStandalone, 120));
-window.addEventListener('orientationchange', () => setTimeout(fitStandalone, 350));
-window.addEventListener('pageshow', fitStandalone);
-
 // ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
 const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 let clockTimer = null;
@@ -4249,21 +4300,27 @@ async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
   const st = (await kv.get('a2hs')) || {};
   const ios = isIOS(), ua = navigator.userAgent;
+  // Samsung Internet wraps installed sites in its own outdated Android package, which Google Play
+  // Protect blocks ("Unsafe app blocked"). Nothing on our side can change that package, so on
+  // Samsung Internet we never use its installer and send people to Chrome to install instead.
+  const samsung = /SamsungBrowser/i.test(ua) && /android/i.test(ua);
+  const canPrompt = installEvt && !samsung;
+  const chromeIntent = `intent://${location.host}${location.pathname}#Intent;scheme=https;package=com.android.chrome;end`;
   const shareIc = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>';
   const dots = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="19" r="1.8" fill="currentColor"/></svg>';
-  const steps = installEvt ? '' : ios ? `<ol class="a2-steps"><li>Tap the <b>Share</b> button <span class="a2-ic">${shareIc}</span> ${/CriOS|FxiOS|EdgiOS/.test(ua) ? '(top or bottom of the screen)' : 'in the toolbar'}.</li><li>Scroll and tap <b>Add to Home Screen</b> <span class="a2-ic">${icon('plus')}</span>.</li><li>Tap <b>Add</b>. Done — BAZINGA! opens like an app.</li></ol>`
+  const steps = canPrompt ? '' : samsung ? `<p class="a2-warn">${icon('shield')}<span>Samsung Internet's installer makes an app that Google Play Protect blocks. Install BAZINGA! from another browser instead — <b>Chrome, Firefox, Microsoft Edge, Brave or Opera</b> all work.</span></p>
+      <ol class="a2-steps"><li>Tap <b>Copy link</b>, open one of those browsers (get one free from the Play Store if you need to) and paste the link.</li><li>In that browser, open its menu <span class="a2-ic">${dots}</span> and tap <b>Install</b> or <b>Add to Home screen</b>.</li><li>Bring your music along: here, <b>Settings → Sync your devices → Link a device</b>, then open that link in the new browser.</li></ol>` : ios ? `<ol class="a2-steps"><li>Tap the <b>Share</b> button <span class="a2-ic">${shareIc}</span> ${/CriOS|FxiOS|EdgiOS/.test(ua) ? '(top or bottom of the screen)' : 'in the toolbar'}.</li><li>Scroll and tap <b>Add to Home Screen</b> <span class="a2-ic">${icon('plus')}</span>.</li><li>Tap <b>Add</b>. Done — BAZINGA! opens like an app.</li></ol>`
     : /Firefox/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install</b> (or <b>Add to Home screen</b>).</li></ol>`
-    : /SamsungBrowser/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">≡</span>.</li><li>Tap <b>Add page to</b> → <b>Home screen</b>.</li></ol>`
     : `<ol class="a2-steps"><li>Open your browser menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install app</b> or <b>Add to Home screen</b>.</li></ol>`;
   const r = await modal(`<div class="a2hs">
       <div class="a2-icon"><img src="icons/app-192.png" alt="BAZINGA! app icon" width="96" height="96"></div>
       <h3>Add BAZINGA! to your Home Screen</h3>
       <p class="muted">One tap away, full screen like a real app, and music keeps going better in the background.</p>
       ${steps}
-      <div class="modal-actions center">${installEvt ? `<button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : `<button class="btn primary" data-resolve="later">Got it</button>`}</div>
+      <div class="modal-actions center">${canPrompt ? `<button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : samsung ? `<button class="btn primary" type="button" data-copy-app>${icon('link')}Copy link</button><a class="btn" href="${esc(chromeIntent)}">Open in Chrome</a>` : `<button class="btn primary" data-resolve="later">Got it</button>`}</div>
       <button class="lnk tiny a2-never" data-resolve="never">Don't show this again</button>
-    </div>`);
-  if (r === 'install' && installEvt) {
+    </div>`, { onMount: m => { const c = m.querySelector('[data-copy-app]'); if (c) c.onclick = async () => toast(await copyText(location.origin + location.pathname) ? 'Link copied — paste it into your other browser' : location.origin + location.pathname, 'ok'); } });
+  if (r === 'install' && canPrompt) {
     installEvt.prompt();
     try { const c = await installEvt.userChoice; if (c.outcome === 'accepted') st.done = true; } catch { }
     installEvt = null;
@@ -4866,6 +4923,48 @@ async function ytResultsToTracks(results) {
   }
   return out;
 }
+// ---------- Search relevance ----------
+// Only keep results that actually match what was typed: every word must appear (as the start of a
+// word in the title / artist / album), with one typo allowed in longer words. Best matches first.
+const STOP = new Set(['the', 'a', 'an', 'by', 'and', 'of', 'feat', 'ft', 'with', 'x']);
+function near(a, b) { // edit distance <= 1
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, d = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++d > 1) return false;
+    if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+  }
+  return d + (a.length - i) + (b.length - j) <= 1;
+}
+function relevance(q) {
+  const nq = norm(q);
+  const toks = nq.split(' ').filter(t => t && !STOP.has(t));
+  const words = toks.length ? toks : nq.split(' ').filter(Boolean);
+  return (...fields) => {
+    const text = norm(fields.filter(Boolean).join(' '));
+    if (!words.length) return 1;
+    const tw = text.split(' ');
+    let hits = 0, exact = 0;
+    for (const t of words) {
+      if (tw.some(w => w === t)) { hits++; exact++; }
+      else if (tw.some(w => w.startsWith(t) || (t.length >= 5 && w.length >= 4 && near(t, w.slice(0, t.length + 1)) ) || (t.length >= 5 && near(t, w)))) hits++;
+      else if (t.length >= 3 && text.replace(/ /g, '').includes(t)) hits += 0.8; // "acdc" vs "ac dc"
+    }
+    const need = words.length >= 4 ? words.length - 1 : words.length;
+    if (hits < need) return null;
+    let sc = hits + exact * 0.5;
+    if (text.includes(nq)) sc += 3;
+    if (norm(fields[0] || '').startsWith(nq)) sc += 2;
+    return sc;
+  };
+}
+function keepRelevant(list, q, fieldsOf) {
+  const rel = relevance(q);
+  return list.map((x, i) => ({ x, i, s: rel(...fieldsOf(x)) })).filter(o => o.s !== null)
+    .sort((a, b) => (b.s - a.s) || (a.i - b.i)).map(o => o.x);
+}
+
 let searchSeq = 0;
 async function doSearch(q, tab) {
   lastSearch.q = q;
@@ -4881,9 +4980,10 @@ async function doSearch(q, tab) {
   const ytPart = async (target, limit) => {
     if (q.length < 2) return;
     try {
-      const res = await yt.rawSearch(q, { preferFree: true });
+      const res = keepRelevant(await yt.rawSearch(q, { preferFree: true }), q, r => [r.title, r.author]);
       if (!alive()) return;
       const tracks = (await ytResultsToTracks(res)).slice(0, limit);
+      prefetchTop(tracks, 2);
       const el = $(target); if (!el) return;
       el.innerHTML = tracks.length ? `<div class="sec-h"><h2>${icon('yt')} From YouTube</h2>${tab === 'all' && tracks.length >= limit ? '<a class="lnk" href="#/search/youtube">See all</a>' : ''}</div>${rowsFor('s-yt-list', tracks)}` : (tab === 'youtube' ? '<p class="muted">No YouTube results.</p>' : '');
       markNow();
@@ -4910,14 +5010,16 @@ async function doSearch(q, tab) {
     };
     const part = (p, fill) => meta.withTimeout(Promise.resolve(p), 9000, []).then(v => { if (alive()) { fill(v || []); settled++; shown++; paint(); } }, () => { settled++; paint(); });
     await Promise.all([
-      part(artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
-      part(albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
-      part(songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
+      part(artistsP.then?.(v => keepRelevant(v, q, a => [a.name])) ?? artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
+      part(albumsP.then?.(v => keepRelevant(v, q, a => [a.title, a.artist])) ?? albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
+      part(songsP.then?.(v => keepRelevant(v, q, t => [t.title, t.artist, t.album])) ?? songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); prefetchTop(st, 3); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
     ]);
   } catch (e) {
     if (alive()) $('#s-main').innerHTML = '<p class="muted">Music search is unavailable right now. Try again in a moment.</p>';
   }
 }
+// Look up the YouTube version of the top results right away, so tapping one starts instantly
+function prefetchTop(tracks, n) { setTimeout(() => tracks.slice(0, n).forEach((t, k) => setTimeout(() => player.prefetch(t.id), k * 450)), 250); }
 function rowsFor(key, tracks) {
   lists.set(key, tracks.map(t => t.id));
   const cur = player.current()?.id;
