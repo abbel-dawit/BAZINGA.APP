@@ -3215,6 +3215,175 @@ function start() {
 
 return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, cancel, mergeSettings, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
 })();
+// ---------- chromaprint.js ----------
+const __m_chromaprint = (() => {
+// Chromaprint audio fingerprints in plain JavaScript, for AcoustID lookups (acoustid.org).
+// A port of Chromaprint's default algorithm (TEST2 / "algorithm 1"), the same one fpcalc and
+// AcoustID use: 11025 Hz mono → 4096-sample Hamming-windowed FFT frames (hop 1365) → 12 chroma
+// bands (28–3520 Hz) → 5-tap smoothing over time → normalise → 16 image classifiers → 32-bit
+// sub-fingerprints → AcoustID's compressed, URL-safe base64 format.
+// Checked bit-for-bit against libchromaprint 1.5.
+
+const SAMPLE_RATE = 11025;
+const FRAME = 4096, HOP = FRAME - (FRAME - FRAME / 3 | 0); // overlap 2731 → hop 1365
+const MIN_FREQ = 28, MAX_FREQ = 3520, BANDS = 12;
+const FILTER = [0.25, 0.75, 1.0, 0.75, 0.25];
+// [type, y, height, width], [t0, t1, t2]
+const CLASSIFIERS = [
+  [[0, 4, 3, 15], [1.98215, 2.35817, 2.63523]],
+  [[4, 4, 6, 15], [-1.03809, -0.651211, -0.282167]],
+  [[1, 0, 4, 16], [-0.298702, 0.119262, 0.558497]],
+  [[3, 8, 2, 12], [-0.105439, 0.0153946, 0.135898]],
+  [[3, 4, 4, 8], [-0.142891, 0.0258736, 0.200632]],
+  [[4, 0, 3, 5], [-0.826319, -0.590612, -0.368214]],
+  [[1, 2, 2, 9], [-0.557409, -0.233035, 0.0534525]],
+  [[2, 7, 3, 4], [-0.0646826, 0.00620476, 0.0784847]],
+  [[2, 6, 2, 16], [-0.192387, -0.029699, 0.215855]],
+  [[2, 1, 3, 2], [-0.0397818, -0.00568076, 0.0292026]],
+  [[5, 10, 1, 15], [-0.53823, -0.369934, -0.190235]],
+  [[3, 6, 2, 10], [-0.124877, 0.0296483, 0.139239]],
+  [[2, 1, 1, 14], [-0.101475, 0.0225617, 0.231971]],
+  [[3, 5, 6, 4], [-0.0799915, -0.00729616, 0.063262]],
+  [[1, 9, 2, 12], [-0.272556, 0.019424, 0.302559]],
+  [[3, 4, 2, 14], [-0.164292, -0.0321188, 0.0846339]]
+];
+const MAX_WIDTH = 16;
+const GRAY = [0, 1, 3, 2];
+
+// ---------- FFT (radix-2, in place) ----------
+const N = FRAME, LOG = 12;
+const rev = new Uint16Array(N), cosT = new Float64Array(N / 2), sinT = new Float64Array(N / 2), win = new Float64Array(N);
+for (let i = 0; i < N; i++) { let r = 0; for (let b = 0; b < LOG; b++) r |= ((i >> b) & 1) << (LOG - 1 - b); rev[i] = r; }
+for (let i = 0; i < N / 2; i++) { cosT[i] = Math.cos(2 * Math.PI * i / N); sinT[i] = -Math.sin(2 * Math.PI * i / N); }
+for (let i = 0; i < N; i++) win[i] = (0.54 - 0.46 * Math.cos(i * 2 * Math.PI / (N - 1))) / 32767;
+function powerSpectrum(frame, out) {
+  const re = new Float64Array(N), im = new Float64Array(N);
+  for (let i = 0; i < N; i++) re[rev[i]] = frame[i] * win[i];
+  for (let size = 2; size <= N; size <<= 1) {
+    const half = size >> 1, step = N / size;
+    for (let s = 0; s < N; s += size) for (let j = 0; j < half; j++) {
+      const k = j * step, a = s + j, b = a + half;
+      const tr = re[b] * cosT[k] - im[b] * sinT[k], ti = re[b] * sinT[k] + im[b] * cosT[k];
+      re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+    }
+  }
+  for (let i = 0; i <= N / 2; i++) out[i] = re[i] * re[i] + im[i] * im[i];
+}
+
+// ---------- chroma ----------
+const idx = f => Math.round(FRAME * f / SAMPLE_RATE);
+const minIdx = Math.max(1, idx(MIN_FREQ)), maxIdx = Math.min(FRAME / 2, idx(MAX_FREQ));
+const notes = new Int8Array(FRAME);
+for (let i = minIdx; i < maxIdx; i++) {
+  const freq = i * SAMPLE_RATE / FRAME, oct = Math.log(freq / (440 / 16)) / Math.LN2;
+  notes[i] = Math.floor(BANDS * (oct - Math.floor(oct)));
+}
+
+// samples: 16-bit integer values (Int16Array or numbers in -32768..32767) at 11025 Hz, mono
+function rawFingerprint(samples) {
+  const spec = new Float64Array(N / 2 + 1), frame = new Float64Array(N);
+  const chroma = [];
+  for (let start = 0; start + N <= samples.length; start += HOP) {
+    for (let i = 0; i < N; i++) frame[i] = samples[start + i];
+    powerSpectrum(frame, spec);
+    const f = new Float64Array(BANDS);
+    for (let i = minIdx; i < maxIdx; i++) f[notes[i]] += spec[i];
+    chroma.push(f);
+  }
+  // smooth over time, then normalise each frame
+  const rows = [];
+  for (let t = 0; t + FILTER.length <= chroma.length; t++) {
+    const r = new Float64Array(BANDS);
+    for (let k = 0; k < FILTER.length; k++) for (let b = 0; b < BANDS; b++) r[b] += FILTER[k] * chroma[t + k][b];
+    let n = 0; for (let b = 0; b < BANDS; b++) n += r[b] * r[b];
+    n = Math.sqrt(n);
+    if (n < 0.01) r.fill(0); else for (let b = 0; b < BANDS; b++) r[b] /= n;
+    rows.push(r);
+  }
+  // integral image
+  const W = BANDS, I = rows.map(r => Float64Array.from(r));
+  for (let y = 0; y < I.length; y++) for (let x = 0; x < W; x++) {
+    I[y][x] += (x ? I[y][x - 1] : 0) + (y ? I[y - 1][x] : 0) - (x && y ? I[y - 1][x - 1] : 0);
+  }
+  const area = (r1, c1, r2, c2) => {
+    if (r1 === r2 || c1 === c2) return 0;
+    const A = I[r2 - 1][c2 - 1], B = r1 ? I[r1 - 1][c2 - 1] : 0, C = c1 ? I[r2 - 1][c1 - 1] : 0, D = r1 && c1 ? I[r1 - 1][c1 - 1] : 0;
+    return A - B - C + D;
+  };
+  const cmp = (a, b) => Math.log(1 + a) - Math.log(1 + b);
+  const apply = ([type, y, h, w], x) => {
+    switch (type) {
+      case 0: return cmp(area(x, y, x + w, y + h), 0);
+      case 1: { const h2 = h >> 1; return cmp(area(x, y + h2, x + w, y + h), area(x, y, x + w, y + h2)); }
+      case 2: { const w2 = w >> 1; return cmp(area(x + w2, y, x + w, y + h), area(x, y, x + w2, y + h)); }
+      case 3: { const w2 = w >> 1, h2 = h >> 1; return cmp(area(x, y + h2, x + w2, y + h) + area(x + w2, y, x + w, y + h2), area(x, y, x + w2, y + h2) + area(x + w2, y + h2, x + w, y + h)); }
+      case 4: { const h3 = h / 3 | 0; return cmp(area(x, y + h3, x + w, y + 2 * h3), area(x, y, x + w, y + h3) + area(x, y + 2 * h3, x + w, y + h)); }
+      case 5: { const w3 = w / 3 | 0; return cmp(area(x + w3, y, x + 2 * w3, y + h), area(x, y, x + w3, y + h) + area(x + 2 * w3, y, x + w, y + h)); }
+    }
+    return 0;
+  };
+  const out = [];
+  for (let x = 0; x + MAX_WIDTH <= rows.length; x++) {
+    let bits = 0;
+    for (const [flt, [t0, t1, t2]] of CLASSIFIERS) {
+      const v = apply(flt, x);
+      const q = v < t1 ? (v < t0 ? 0 : 1) : (v < t2 ? 2 : 3);
+      bits = ((bits << 2) | GRAY[q]) >>> 0;
+    }
+    out.push(bits);
+  }
+  return out;
+}
+
+// AcoustID's compressed fingerprint format (algorithm 1), URL-safe base64 without padding
+function compress(raw, algorithm = 1) {
+  const bits = [];
+  for (let i = 0; i < raw.length; i++) {
+    let x = (raw[i] ^ (i ? raw[i - 1] : 0)) >>> 0, bit = 1, last = 0;
+    while (x) { if (x & 1) { bits.push(bit - last); last = bit; } x >>>= 1; bit++; }
+    bits.push(0);
+  }
+  const pack = (vals, width) => {
+    const out = new Uint8Array(Math.ceil(vals.length * width / 8));
+    let pos = 0;
+    for (const v of vals) for (let b = 0; b < width; b++, pos++) if ((v >> b) & 1) out[pos >> 3] |= 1 << (pos & 7);
+    return out;
+  };
+  const normal = pack(bits.map(b => Math.min(b, 7)), 3);
+  const exc = pack(bits.filter(b => b >= 7).map(b => b - 7), 5);
+  const n = raw.length;
+  const bytes = new Uint8Array(4 + normal.length + exc.length);
+  bytes.set([algorithm & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]);
+  bytes.set(normal, 4); bytes.set(exc, 4 + normal.length);
+  let s = ''; for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function fingerprint(samples) {
+  const raw = rawFingerprint(samples);
+  return { raw, fp: compress(raw), duration: samples.length / SAMPLE_RATE };
+}
+
+// Float samples at any rate → 16-bit samples at 11025 Hz (windowed-sinc low-pass + resample)
+function to11k(float32, rate) {
+  const ratio = rate / SAMPLE_RATE, outLen = Math.floor(float32.length / ratio);
+  const out = new Int16Array(outLen), cutoff = 0.9 / Math.max(1, ratio), taps = 6;
+  for (let i = 0; i < outLen; i++) {
+    const c = i * ratio, c0 = Math.floor(c);
+    let s = 0, wsum = 0;
+    for (let k = c0 - taps * Math.ceil(ratio) + 1; k <= c0 + taps * Math.ceil(ratio); k++) {
+      if (k < 0 || k >= float32.length) continue;
+      const d = (k - c) * cutoff, sinc = d === 0 ? 1 : Math.sin(Math.PI * d) / (Math.PI * d);
+      const wv = 0.5 + 0.5 * Math.cos(Math.PI * (k - c) / (taps * Math.ceil(ratio) + 1));
+      const w = sinc * wv; s += float32[k] * w; wsum += w;
+    }
+    out[i] = Math.max(-32768, Math.min(32767, Math.round((wsum ? s / wsum : 0) * 32767)));
+  }
+  return out;
+}
+
+return { SAMPLE_RATE, rawFingerprint, compress, fingerprint, to11k };
+})();
 // ---------- voice.js ----------
 const __m_voice = (() => {
 // "Hey BAZINGA!" — voice assistant.
@@ -3228,6 +3397,7 @@ const meta = __m_meta;
 const player = __m_player;
 const { P } = __m_player;
 const { $, esc, norm, mainArtist, displayTitle, emit, trackKey, sleep } = __m_util;
+const cp = __m_chromaprint;
 
 const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
 // Brave ships the speech API but can't reach Google's speech service, so it gets the text box instead
@@ -3831,54 +4001,77 @@ async function run(q, alts = []) {
 }
 const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 
-// ---------- "What song is this?" — music recognition ----------
-// Records a few seconds through the microphone and asks a music-recognition service built for short,
-// noisy phone recordings (AudD, the same kind of fingerprinting Shazam uses). To do well in loud rooms:
+// ---------- "What song is this?" — music recognition with AcoustID (acoustid.org) ----------
+// Records the music around you, makes a Chromaprint fingerprint of it right here in the browser
+// (chromaprint.js) and looks it up in AcoustID's open database.
+// To give it the best chance in a noisy room:
 //  • the browser's speech filters (noise suppression, echo cancelling, auto gain) are switched OFF —
-//    they're made for voices and wipe out exactly the parts of music that identify a song;
+//    they're made for voices and wipe out the parts of the music the fingerprint is built from;
 //  • BAZINGA!'s own music stays muted while it listens;
-//  • it checks after ~6 s, and if there's no match it keeps recording and tries again with a longer,
-//    clearer sample (~11 s, then ~16 s) — longer clips beat background chatter.
-// Needs an AudD key (Settings → Voice assistant, or the app owner's key in index.html).
+//  • it checks after ~10 s and, if there's no match, keeps recording and tries a longer sample (~18 s);
+//  • AcoustID filters matches by the song's full length, which a clip can't know, so each sample is
+//    checked against a spread of typical song lengths (most common first), within AcoustID's 3-per-second limit.
+// Needs an AcoustID application key (free for non-commercial apps): Settings → Voice assistant, or the
+// app owner's key in index.html.
 const IDENTIFY = /\b(identify|recogni[sz]e|shazam|name (this|that) (song|tune)|what song is (playing|this) (around|near|here|in here|right now)|(around|near) me|what('?s| is) (this|that) song (playing|on)|listen to (this|the) (song|music))\b|^what song is that\b/;
+const LENGTHS = [210, 196, 224, 182, 238, 168, 252, 154, 266, 140, 280, 126, 294, 308, 112, 322, 336];
 let ident = null, found = null;
 const sleepOr = (ms, job) => new Promise(r => { const t = setTimeout(r, ms); job.wake = () => { clearTimeout(t); r(); }; });
 function stopIdentify() {
   const j = ident; ident = null; if (!j) return;
   j.stopped = true; j.wake?.();
-  try { if (j.rec?.state !== 'inactive') j.rec.stop(); } catch { }
+  try { j.proc && (j.proc.onaudioprocess = null); j.proc?.disconnect(); j.src?.disconnect(); j.sink?.disconnect(); } catch { }
   try { j.stream?.getTracks().forEach(t => t.stop()); } catch { }
   try { j.meterOff?.(); } catch { }
   el()?.classList.remove('identifying');
   player.audioMode('playback'); micEndedAt = Date.now();
 }
-async function lookupSong(blob, token) {
-  const ext = /mp4|aac|m4a/.test(blob.type) ? 'm4a' : /ogg/.test(blob.type) ? 'ogg' : 'webm';
-  const fd = new FormData();
-  fd.append('api_token', token); fd.append('file', blob, 'sample.' + ext); fd.append('return', 'apple_music,spotify');
-  const url = window.BAZINGA_CONFIG?.recognizeUrl || 'https://api.audd.io/';
-  let r;
-  try { r = await fetch(url, { method: 'POST', body: fd }); }
-  catch { const e = new Error('I couldn\'t reach the song recognition service. Check your connection and try again.'); e.fatal = true; throw e; }
-  const j = await r.json().catch(() => ({}));
-  if (j.status === 'error') {
-    const code = j.error?.error_code;
-    const e = new Error(code === 900 || code === 901 ? 'The song recognition key isn\'t working. Check it in Settings → Voice assistant.' : code === 902 ? 'Song recognition has hit its limit for now. Try again later.' : 'I couldn\'t make out the music. Try again closer to the speaker.');
-    e.fatal = code >= 900 && code < 1000; throw e;
-  }
-  return j.result || null;
+let jsonpN = 0;
+function acoustidCall(params) {
+  return new Promise((resolve, reject) => {
+    const cb = '__bz_acid_' + (++jsonpN), s = document.createElement('script');
+    const timer = setTimeout(() => { done(); reject(new Error('timeout')); }, 9000);
+    function done() { clearTimeout(timer); delete window[cb]; s.remove(); }
+    window[cb] = d => { done(); resolve(d); };
+    s.onerror = () => { done(); reject(new Error('network')); };
+    s.src = 'https://api.acoustid.org/v2/lookup?' + new URLSearchParams({ ...params, format: 'jsonp', jsoncallback: cb });
+    document.head.appendChild(s);
+  });
 }
-function songFrom(res) {
-  const am = res.apple_music, sp = res.spotify;
-  const artwork = am?.artwork?.url ? am.artwork.url.replace('{w}', 600).replace('{h}', 600) : (sp?.album?.images?.[0]?.url || '');
-  return { title: res.title, artist: res.artist, album: res.album || '', releaseDate: res.release_date || '', artwork, link: res.song_link || '' };
+async function lookupSong(fp, key, job, onTry) {
+  let lastCall = 0;
+  for (const [i, duration] of LENGTHS.entries()) {
+    if (job.stopped || !open) return null;
+    const wait = lastCall + 400 - Date.now(); if (wait > 0) await sleep(wait); // AcoustID: max 3 requests a second
+    lastCall = Date.now(); onTry?.(i);
+    let d;
+    try { d = await acoustidCall({ client: key, meta: 'recordings releasegroups compress', duration, fingerprint: fp }); }
+    catch { if (i === 0) { const e = new Error('I couldn\'t reach AcoustID. Check your connection and try again.'); e.fatal = true; throw e; } continue; }
+    if (d?.status === 'error') {
+      const code = d.error?.code, e = new Error(code === 4 ? 'The AcoustID key isn\'t working. Check it in Settings → Voice assistant.' : code === 14 ? 'AcoustID is busy right now. Try again in a moment.' : 'AcoustID couldn\'t read that sample. Try again closer to the speaker.');
+      e.fatal = code === 4 || code === 14; throw e;
+    }
+    const best = (d?.results || []).filter(r => r.recordings?.some(x => x.title)).sort((a, b) => b.score - a.score)[0];
+    if (best && best.score >= 0.35) {
+      const rec = best.recordings.find(x => x.title && x.artists?.length) || best.recordings.find(x => x.title);
+      return { rec, score: best.score };
+    }
+  }
+  return null;
+}
+function songFrom({ rec }) {
+  const rg = (rec.releasegroups || []).find(g => g.type === 'Album') || (rec.releasegroups || [])[0];
+  return {
+    title: rec.title, artist: (rec.artists || []).map(a => a.name + (a.joinphrase || '')).join('').trim() || 'Unknown artist',
+    album: rg?.title || '', artwork: rg?.id ? `https://coverartarchive.org/release-group/${rg.id}/front-250` : '', link: rec.id ? `https://musicbrainz.org/recording/${rec.id}` : ''
+  };
 }
 function songCard(s) {
   const box = el()?.querySelector('.vc-song'); if (!box) return;
   found = s;
   if (!s) { box.hidden = true; box.innerHTML = ''; return; }
   box.hidden = false;
-  box.innerHTML = `${s.artwork ? `<img src="${esc(s.artwork)}" alt="">` : '<div class="vc-song-art"></div>'}
+  box.innerHTML = `${s.artwork ? `<img src="${esc(s.artwork)}" alt="" onerror="this.outerHTML='<div class=&quot;vc-song-art&quot;></div>'">` : '<div class="vc-song-art"></div>'}
     <div class="vc-song-t"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.album ? ' · ' + esc(s.album) : ''}</span></div>
     <div class="vc-song-b"><button type="button" class="btn primary sm" data-vc="song-play">Play it</button><button type="button" class="btn sm" data-vc="song-like">Like</button></div>`;
 }
@@ -3886,8 +4079,8 @@ async function foundTrack() {
   const s = found; if (!s) return null;
   // the catalogue's version (cover, album, genre) when there is one, otherwise what was recognised
   let t = null;
-  try { const res = await meta.withTimeout(meta.searchSongs(`${mainArtist(s.artist)} ${s.title}`, 8), 4000, []); t = res.find(r => norm(r.title) === norm(s.title) && norm(mainArtist(r.artist)) === norm(mainArtist(s.artist))) || null; } catch { }
-  t = t || { id: trackKey(s.artist, s.title), title: s.title, artist: s.artist, artists: [s.artist], album: s.album, artwork: s.artwork, releaseDate: s.releaseDate };
+  try { const res = await meta.withTimeout(meta.searchSongs(`${mainArtist(s.artist)} ${s.title}`, 8), 4000, []); t = res.find(r => norm(r.title) === norm(s.title) && norm(mainArtist(r.artist)) === norm(mainArtist(s.artist))) || res[0] || null; } catch { }
+  t = t || { id: trackKey(s.artist, s.title), title: s.title, artist: s.artist, artists: [s.artist], album: s.album, artwork: s.artwork };
   return lib.tracks.get(t.id) || store.remember(t);
 }
 async function playFound() { const t = await foundTrack(); if (!t) return; player.playList([t.id], 0, { shuffle: false }); found = null; say(`Playing ${t.title}.`); scheduleClose(1200); }
@@ -3897,16 +4090,6 @@ async function likeFound() {
   const b = el()?.querySelector('[data-vc="song-like"]'); if (b) { b.textContent = 'Liked ♥'; b.disabled = true; }
   app?.toast?.('Added to Liked Songs ♥', 'ok');
 }
-function meter(stream) {
-  const ac = unlockChime(); if (!ac) return () => { };
-  try {
-    const src = ac.createMediaStreamSource(stream), an = ac.createAnalyser(); an.fftSize = 512; src.connect(an);
-    const buf = new Uint8Array(an.fftSize); let on = true;
-    const tick = () => { if (!on) return; an.getByteTimeDomainData(buf); let m = 0; for (const v of buf) m = Math.max(m, Math.abs(v - 128)); el()?.style.setProperty('--lvl', Math.min(1, m / 60).toFixed(2)); requestAnimationFrame(tick); };
-    tick();
-    return () => { on = false; try { src.disconnect(); } catch { } el()?.style.setProperty('--lvl', 0); };
-  } catch { return () => { }; }
-}
 async function identifyNow() {
   keep = false; clearTimeout(closeTimer);
   try { await identify(); } catch (e) { console.warn(e); }
@@ -3915,42 +4098,50 @@ async function identifyNow() {
 async function identify() {
   stopIdentify(); stopListening(); songCard(null);
   try { speechSynthesis.cancel(); } catch { }
-  const token = recogKey || window.BAZINGA_CONFIG?.auddToken || '';
-  if (!token) return fail('Song recognition needs an AudD key. Add one in Settings → Voice assistant.');
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return fail('This browser can\'t record audio for song recognition. Try Chrome or Safari.');
+  const key = recogKey || window.BAZINGA_CONFIG?.acoustidKey || '';
+  if (!key) return fail('Song recognition needs an AcoustID key. Add one in Settings → Voice assistant.');
+  const ac = unlockChime();
+  if (!navigator.mediaDevices?.getUserMedia || !ac || !ac.createScriptProcessor) return fail('This browser can\'t record audio for song recognition. Try Chrome or Safari.');
   const job = ident = { stopped: false };
   el()?.classList.add('identifying');
   setState('listening'); setReply('Listening to the music around you 🎶 Hold your phone close to the speaker.');
   duck(true); chime();
   try {
     // raw sound: the voice filters would erase the music's fingerprint
-    job.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 44100 } })
-      .catch(() => navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }));
+    job.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
   } catch {
     stopIdentify();
     return fail('I need microphone access to hear the song. Allow it in your browser\'s site settings.');
   }
   if (job.stopped) { job.stream.getTracks().forEach(t => t.stop()); return; }
   usedMic = true;
-  job.meterOff = meter(job.stream);
-  const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported?.(t)) || '';
-  const chunks = [];
-  job.rec = new MediaRecorder(job.stream, type ? { mimeType: type, audioBitsPerSecond: 128000 } : undefined);
-  job.rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
-  job.rec.start(500);
-  const t0 = Date.now();
+  if (ac.state === 'suspended') { try { await ac.resume(); } catch { } }
+  // capture the raw samples
+  const chunks = []; let total = 0;
+  job.src = ac.createMediaStreamSource(job.stream);
+  job.proc = ac.createScriptProcessor(4096, 1, 1);
+  job.sink = ac.createGain(); job.sink.gain.value = 0; // keeps the processor running without playing the mic back
+  job.proc.onaudioprocess = e => {
+    const d = e.inputBuffer.getChannelData(0); chunks.push(new Float32Array(d)); total += d.length;
+    let m = 0; for (let i = 0; i < d.length; i += 8) m = Math.max(m, Math.abs(d[i]));
+    el()?.style.setProperty('--lvl', Math.min(1, m * 2.2).toFixed(2));
+  };
+  job.src.connect(job.proc); job.proc.connect(job.sink); job.sink.connect(ac.destination);
+  job.meterOff = () => el()?.style.setProperty('--lvl', 0);
+  const rate = ac.sampleRate, t0 = Date.now();
   let res = null, err = null;
-  for (const [i, at] of [6000, 11000, 16000].entries()) {
+  for (const [i, at] of [10000, 18000].entries()) {
     await sleepOr(Math.max(0, at - (Date.now() - t0)), job);
     if (job.stopped || !open) return;
-    try { job.rec.requestData?.(); } catch { }
-    await sleep(120);
     setState('thinking');
-    setReply(i === 0 ? 'Got it, checking… 🔎' : 'Still listening for a clearer sample… 🎧');
-    try { res = await lookupSong(new Blob(chunks, { type: job.rec.mimeType || type || 'audio/webm' }), token); err = null; }
+    setReply(i === 0 ? 'Got it, checking… 🔎' : 'Listening a little longer for a clearer sample… 🎧');
+    const all = new Float32Array(total); let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+    await sleep(30);
+    const { fp } = cp.fingerprint(cp.to11k(all, rate));
+    try { res = await lookupSong(fp, key, job, n => { if (n === 6) setReply('Checking a few more matches… 🔎'); }); err = null; }
     catch (e) { err = e; if (e.fatal) break; }
     if (res || job.stopped || !open) break;
-    setState('listening');
+    setState('listening'); setReply('Still listening… 🎶');
   }
   stopIdentify();
   if (!open) return;
@@ -4547,7 +4738,7 @@ async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('
 
 function applySettings() {
   applyTheme(settings.theme || currentTheme());
-  setVoicePrefs({ recognizeKey: settings.auddToken || window.BAZINGA_CONFIG?.auddToken || '' });
+  setVoicePrefs({ recognizeKey: settings.acoustidKey || window.BAZINGA_CONFIG?.acoustidKey || '' });
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -6103,8 +6294,8 @@ async function vSettings([section] = []) {
       })()}
       <p class="tiny muted">Tap a mic button to talk to BAZINGA!. The microphone is only on while the assistant is open, and the music stays quiet until it closes.</p>
       <div class="sub-panel"><b>🎶 Song recognition</b>
-        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, like Shazam. It uses <a class="lnk" href="https://audd.io" target="_blank" rel="noopener">AudD</a>, a recognition service built for short, noisy phone recordings. ${window.BAZINGA_CONFIG?.auddToken ? 'It\'s already set up. Add your own key below only if you want your own allowance.' : 'Get an API token from AudD\'s dashboard and paste it here. It\'s kept on your devices and synced to your other devices.'}</p>
-        <form id="recog-form" class="stack"><label class="fld"><span>AudD API token</span><input name="auddToken" value="${esc(settings.auddToken || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AudD token"></label><button class="btn">Save</button></form></div>
+        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, fingerprints it on your device and looks it up in <a class="lnk" href="https://acoustid.org" target="_blank" rel="noopener">AcoustID</a>'s open music database. Works best close to the speaker. ${window.BAZINGA_CONFIG?.acoustidKey ? 'It\'s already set up. Add your own key below only if you want to.' : 'Register a free application at <a class="lnk" href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a> and paste its API key here. It\'s kept on your devices and synced to your other devices.'}</p>
+        <form id="recog-form" class="stack"><label class="fld"><span>AcoustID application key</span><input name="acoustidKey" value="${esc(settings.acoustidKey || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AcoustID key"></label><button class="btn">Save</button></form></div>
     </div>
     <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
       <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
@@ -6161,7 +6352,7 @@ async function vSettings([section] = []) {
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
   $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
-  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ auddToken: e.target.auddToken.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
+  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ acoustidKey: e.target.acoustidKey.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });

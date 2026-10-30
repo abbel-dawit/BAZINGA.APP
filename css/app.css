@@ -1843,13 +1843,6 @@ body.np-pulling #np-head::before { opacity: 1; }
 .q-save .ic { width: 18px; height: 18px; stroke-width: 2.8; }
 .q-save:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 #000; }
 
-/* --- Phones in portrait: the video in the full-screen player goes edge to edge (bigger) --- */
-@media (max-width: 700px) and (orientation: portrait) {
-  #np .np-inner > .np-media.vid { margin-left: -16px; margin-right: -16px; width: calc(100% + 32px); }
-  #np .np-media.vid .np-slot { width: 100% !important; border-radius: 0 !important; }
-  #yt-dock.in-np { border-radius: 0 !important; }
-}
-
 /* --- Phones & small tablets turned sideways (short screens) --- */
 @media (max-height: 520px) and (orientation: landscape) {
   /* notch / rounded corners */
@@ -1913,3 +1906,34 @@ body.np-pulling #np-head::before { opacity: 1; }
 .menu-h .ic { width: 16px; height: 16px; vertical-align: -3px; margin-right: 4px; color: var(--volt); }
 .menu-h:has(.ic) { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .menu-h .ic { margin-right: 0; vertical-align: 0; flex: none; }
+
+/* ===== v1.6.4 ===== */
+/* --- Full-screen player, phone turned sideways: video on the left; title, like, artist, timeline and
+       controls on the right, so everything important fits on one screen without scrolling --- */
+@media (max-height: 520px) and (orientation: landscape) {
+  #np .np-scroll { padding-left: max(16px, env(safe-area-inset-left)) !important; padding-right: max(16px, env(safe-area-inset-right)) !important; }
+  #np .np-inner { max-width: none !important; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(250px, 1fr); grid-template-rows: 1fr auto auto auto auto auto 1fr; column-gap: clamp(16px, 3vw, 32px); }
+  #np .np-inner > .np-media { grid-column: 1; grid-row: 1 / 8; margin: 0 !important; padding: 0 !important; align-self: center; justify-self: stretch; width: 100%; }
+  #np .np-inner > .np-info { grid-column: 2; grid-row: 2; margin: 0 0 6px; }
+  #np .np-inner > .np-err { grid-column: 2; grid-row: 3; margin: 0 0 4px; font-size: 13px; }
+  #np .np-inner > .np-seek { grid-column: 2; grid-row: 4; margin: 4px 0 2px; }
+  #np .np-inner > .np-ctrls { grid-column: 2; grid-row: 5; margin: 2px 0 6px; justify-content: space-between; }
+  #np .np-inner > .np-extra { grid-column: 2; grid-row: 6; margin: 0; }
+  #np .np-inner > :not(.np-media):not(.np-info):not(.np-err):not(.np-seek):not(.np-ctrls):not(.np-extra) { grid-column: 1 / -1; }
+  /* the video fills the left side, as tall as the screen allows */
+  #np .np-media.vid .np-slot { width: min(100%, calc((100vh - 72px) * 16 / 9)) !important; width: min(100%, calc((100dvh - 72px - env(safe-area-inset-top)) * 16 / 9)) !important; margin: 0 auto; }
+  #np .np-media.art .np-art { width: min(100%, calc(100vh - 90px), 300px) !important; width: min(100%, calc(100dvh - 90px), 300px) !important; margin: 0 auto; }
+  #np .np-info h2 { font-size: clamp(18px, 2.6vw, 24px) !important; line-height: 1.15; }
+  #np .np-info .np-artist, #np .np-info .np-album { font-size: 14px; }
+  #np .np-ctrls .play-btn { width: 58px; height: 58px; }
+  #np .np-ctrls .ib { width: 42px; height: 42px; }
+  #np .np-extra { gap: 8px; }
+  #np .np-extra .btn, #np .np-extra .seg button { padding: 7px 12px; font-size: 13px; }
+}
+
+/* --- Home card on phones: the clock sits on the same line as the date (at the right edge) --- */
+@media (max-width: 700px) {
+  .home .home-hero .hh-when { display: flex; flex-wrap: nowrap; align-items: center; width: 100%; gap: 8px; }
+  .home .home-hero .hh-when [data-date] { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .home .home-hero .hh-time { position: static !important; margin-left: auto; flex: none; top: auto; right: auto; }
+}

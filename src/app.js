@@ -256,7 +256,7 @@ async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('
 
 function applySettings() {
   applyTheme(settings.theme || currentTheme());
-  setVoicePrefs({ recognizeKey: settings.auddToken || window.BAZINGA_CONFIG?.auddToken || '' });
+  setVoicePrefs({ recognizeKey: settings.acoustidKey || window.BAZINGA_CONFIG?.acoustidKey || '' });
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -1812,8 +1812,8 @@ async function vSettings([section] = []) {
       })()}
       <p class="tiny muted">Tap a mic button to talk to BAZINGA!. The microphone is only on while the assistant is open, and the music stays quiet until it closes.</p>
       <div class="sub-panel"><b>🎶 Song recognition</b>
-        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, like Shazam. It uses <a class="lnk" href="https://audd.io" target="_blank" rel="noopener">AudD</a>, a recognition service built for short, noisy phone recordings. ${window.BAZINGA_CONFIG?.auddToken ? 'It\'s already set up. Add your own key below only if you want your own allowance.' : 'Get an API token from AudD\'s dashboard and paste it here. It\'s kept on your devices and synced to your other devices.'}</p>
-        <form id="recog-form" class="stack"><label class="fld"><span>AudD API token</span><input name="auddToken" value="${esc(settings.auddToken || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AudD token"></label><button class="btn">Save</button></form></div>
+        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, fingerprints it on your device and looks it up in <a class="lnk" href="https://acoustid.org" target="_blank" rel="noopener">AcoustID</a>'s open music database. Works best close to the speaker. ${window.BAZINGA_CONFIG?.acoustidKey ? 'It\'s already set up. Add your own key below only if you want to.' : 'Register a free application at <a class="lnk" href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a> and paste its API key here. It\'s kept on your devices and synced to your other devices.'}</p>
+        <form id="recog-form" class="stack"><label class="fld"><span>AcoustID application key</span><input name="acoustidKey" value="${esc(settings.acoustidKey || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AcoustID key"></label><button class="btn">Save</button></form></div>
     </div>
     <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
       <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
@@ -1870,7 +1870,7 @@ async function vSettings([section] = []) {
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
   $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
-  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ auddToken: e.target.auddToken.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
+  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ acoustidKey: e.target.acoustidKey.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });

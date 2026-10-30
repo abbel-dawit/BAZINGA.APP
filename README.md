@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v34`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v36`) so phones fetch the new version.
 
 ## Features
 
@@ -37,14 +37,14 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 
 ### New in v1.6
 - **Theme colors**: Volt (the original yellow), Mint, Violet, Indigo, Ocean, Cyan, Gold, Sunset, Rose and Crimson. Pick one on the welcome card or in Settings → You. Buttons, glows, the logo bolt, the wordmark shadow, the tab icon and the Home Screen icon all follow it, and it's remembered on the device. (Recolored icons live in `icons/theme/`; `build.py` writes one install manifest per color.)
-- **Splash screen** in your theme color while the app starts, with fun rotating lines ("Charging the lightning ⚡", "Warming up the speakers 🔊"…).
-- **"What song is this?"**: the voice assistant recognises music playing around you, like Shazam (button in the assistant, or just ask). It records with the browser's voice filters switched off, keeps BAZINGA!'s music muted, checks after ~6 s and keeps listening for a longer, clearer sample (~11 s, ~16 s) in noisy rooms. Then you can play or like the song. Powered by [AudD](https://audd.io): put an API token in `index.html` → `auddToken` for everyone, or each user adds one in Settings → Voice assistant. If a browser blocks calling AudD directly, point `recognizeUrl` at a small proxy. (AcoustID can't do this: it only matches whole tracks, not a few seconds recorded in a room.)
+- **Splash screen** in your theme color while the app starts, with fun lines under the logo that change every few seconds ("Charging the lightning ⚡", "Warming up the speakers 🔊"…).
+- **"What song is this?"**: the voice assistant recognises music playing around you (button in the assistant, or just ask), using [AcoustID](https://acoustid.org). BAZINGA! records with the browser's voice filters switched off, keeps its own music muted, makes a Chromaprint fingerprint on the device (`src/chromaprint.js`, a JavaScript port of Chromaprint's default algorithm, checked against libchromaprint), and looks it up. It checks after ~10 s and again with a longer ~18 s sample, and because AcoustID filters by the song's full length, it tries a spread of typical song lengths (staying under AcoustID's 3 requests/second). Put a free AcoustID application key (acoustid.org/new-application) in `index.html` → `acoustidKey` for everyone, or each user adds one in Settings → Voice assistant. Note: AcoustID is built for identifying whole audio files, so a short clip from a noisy room matches far less often than in Shazam-style services.
 - **"When the queue finishes"** options evenly spaced.
 - **Sleep timer**: timer icon in the full-screen player's top bar (left of ⋯). 5 min to 1.5 hours, or the end of this song. The music fades out gently and pauses; the icon lights up while it's set and the menu shows the time left.
 - **BAZINGA! button** on Home (replaces "Ask BAZINGA!" there): builds a fresh "BAZINGA! Mix" playlist of songs you don't have yet from your top 50 artists (taking turns, #1 first), then today's top songs in your top genres. The music starts as soon as the first few artists are in; the rest fills in behind it. New listeners pick favorite genres, then favorite artists (top 10 per genre) first.
 - **Music video is the default** playback version (Audio is still one tap away and remembered).
 - **Video dock (computers)**: the full-screen button uses the expand icon; the resize button is an arrow that points up when the video is small and down when it's big (size remembered). A soft loading veil shows while a song starts. Back to top sits to the left of the video.
-- **Home**: the clock sits in the top-right corner of the card.
+- **Home**: the clock sits in the top-right corner of the card (on phones, on the same line as the date).
 - **Search**: songs are listed first under All.
 - **Sort** opens an on-screen list like Filters instead of the system picker.
 - **"Do you love BAZINGA!?"** popup: every 10th time the app is opened. Thumbs up → a thank you and Buy Me a Coffee (big theme-bordered "Not now"); thumbs down → a sad face and it closes.
@@ -54,7 +54,7 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **No more "Hey Bazinga" background listening**: the microphone is only on while the assistant is open.
 - **Pull down to close** the full-screen player from anywhere at the top of it (top bar, cover, song info, controls, or the top part of the video). It follows your finger and springs back if you don't pull far enough.
 - **Save the queue as a playlist** (+ in the queue card), only for a BAZINGA! mix or a shuffled queue.
-- **Phones turned sideways**: the sidebar scrolls instead of cutting buttons off, a compact home card, a smaller corner video, and a big video (queue below it) in the full-screen player. Phones upright: edge-to-edge video. Smaller clock on small screens; evenly spaced top-bar icons; back to top sits above the corner video again; the BAZINGA! button's bolt stays still.
+- **Phones turned sideways**: the sidebar scrolls instead of cutting buttons off, a compact home card, a smaller corner video, and a full-screen player with the video on the left and the title, like, artist, timeline and controls on the right (no scrolling needed). Phones upright: the normal video size. Smaller clock on small screens; evenly spaced top-bar icons; back to top sits above the corner video again; the BAZINGA! button's bolt stays still.
 - **Sync now includes settings and connections**: API keys, tokens, servers, theme, playback options, Spotify/YouTube connections, YouTube playlist links and your taste picks. Each setting remembers when you changed it and the newest change wins. A device that never set something can't wipe it, and removals only spread when you disconnect on purpose.
 - **Voice assistant**: loud chime when it starts listening; music stays silent until the assistant closes; closes after ~3.5 s if it hears nothing; mic buttons show a theme-colored ring while it's open and go back to normal after. iPhone now speaks with the phone's own (Siri-quality) voice instead of Apple's robotic "compact" voices, in one smooth sentence, after switching audio back from "phone call" mode.
 
