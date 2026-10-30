@@ -14,7 +14,9 @@ const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
 // Brave ships the speech API but can't reach Google's speech service, so it gets the text box instead
 export const canListen = !!Rec && !navigator.brave;
 let app = null;           // hooks from app.js: { go, search, openNP, closeNP, lyrics, back, toast }
-let rec = null, listening = false, open = false, ducked = false, keep = false, closeTimer = null, usedMic = false;
+let rec = null, listening = false, open = false, ducked = false, keep = false, closeTimer = null, usedMic = false, micEndedAt = 0;
+const IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const NO_SPEECH_CLOSE = 3500; // closes this fast when it didn't hear anything
 
 const rand = a => a[Math.floor(Math.random() * a.length)];
 
@@ -24,15 +26,22 @@ let voice = null;
 // (Browsers can't use Siri's own voice, but Apple's Premium/Enhanced voices, Edge's "Natural"
 // voices and Chrome's Google voices sound close to it.)
 const NOVELTY = /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|good news|hysterical|jester|organ|pipe organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|princess|bruce|agnes|vicki|victoria|grandma|grandpa|eddy|flo|reed|rocko|sandy|shelley|espeak|compact|robot|novelty)\b/i;
+// iPhone/iPad: voice NAMES don't say how good a voice is ("Samantha" can be the tiny robotic "compact"
+// voice or the downloaded Enhanced one) — the voiceURI does (com.apple.voice.compact… / .enhanced… /
+// .premium… / …siri…). Eloquence voices (Eddy, Flo, Reed…) are the robotic ones.
+const quality = v => (v.voiceURI || '') + ' ' + v.name;
+const isGreat = v => !!v && /natural|neural|premium|enhanced|siri|^google /i.test(quality(v));
 function voiceScore(v) {
   const lang = (navigator.language || 'en-US').toLowerCase(), base = lang.slice(0, 2);
-  const vl = v.lang.toLowerCase().replace('_', '-'), n = v.name;
+  const vl = v.lang.toLowerCase().replace('_', '-'), n = v.name, q = quality(v);
   let s = 0;
   if (vl === lang) s += 40; else if (vl.startsWith(base)) s += 28; else return -100;
   if (/natural|neural/i.test(n)) s += 60;                          // Edge / Windows "… Online (Natural)"
-  if (/premium/i.test(n)) s += 58;                                 // Apple downloadable Premium voices
-  if (/enhanced/i.test(n)) s += 50;                                // Apple Enhanced
-  if (/siri/i.test(n)) s += 55;
+  if (/premium/i.test(q)) s += 58;                                 // Apple downloadable Premium voices
+  if (/enhanced/i.test(q)) s += 50;                                // Apple Enhanced
+  if (/siri/i.test(q)) s += 55;
+  if (/\.compact\.|compact/i.test(q)) s -= 30;                     // Apple's small built-in voices: robotic
+  if (/eloquence/i.test(q)) s -= 120;
   if (/^google /i.test(n)) s += 34;                                // Chrome network voices
   if (/\b(ava|zoe|evan|nathan|noelle|samantha|allison|susan|serena|karen|moira|tessa|daniel|aria|jenny|michelle|ana|emma|brian|andrew|ava multilingual|libby|sonia|ryan|natasha|william)\b/i.test(n)) s += 14;
   if (NOVELTY.test(n)) s -= 120;
@@ -64,9 +73,33 @@ if ('speechSynthesis' in window) { speechSynthesis.onvoiceschanged = () => { voi
 
 // Dip the music while listening/talking. This never changes your saved volume, so the music
 // always comes back exactly as loud as it was.
+// The music stays silent the whole time the assistant is on screen, and comes back when it closes.
 function duck(on) {
+  if (!on && open) return;
   if (on === ducked) return;
   ducked = on; player.duck(on);
+}
+// A bright, loud three-note chime every time the assistant starts listening
+let actx = null;
+function unlockChime() { try { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; actx = actx || new AC(); if (actx.state === 'suspended') actx.resume(); return actx; } catch { return null; } }
+function chime() {
+  const ac = unlockChime(); if (!ac) return;
+  try {
+    const t = ac.currentTime + 0.02;
+    const out = ac.createDynamicsCompressor ? ac.createDynamicsCompressor() : ac.createGain();
+    const master = ac.createGain(); master.gain.value = 1;
+    master.connect(out); out.connect(ac.destination);
+    [[1046.5, 0], [1318.5, 0.09], [2093, 0.18]].forEach(([f, d]) => {
+      for (const [mult, amp] of [[1, 0.6], [2, 0.18], [3, 0.06]]) {
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.type = 'sine'; o.frequency.value = f * mult;
+        g.gain.setValueAtTime(0.0001, t + d);
+        g.gain.exponentialRampToValueAtTime(amp, t + d + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.6);
+        o.connect(g); g.connect(master); o.start(t + d); o.stop(t + d + 0.65);
+      }
+    });
+  } catch { }
 }
 // After using the microphone, phones keep audio in "phone call" mode (thin, quiet sound).
 // Hand the audio back to music mode and gently restart the output so it sounds right again.
@@ -79,7 +112,11 @@ function fail(text) { keep = true; return say(text); }
 function say(text, { show = true } = {}) {
   if (show) setReply(text);
   if (!('speechSynthesis' in window)) return Promise.resolve();
-  return new Promise(res => {
+  return new Promise(async res => {
+    // Right after the microphone, iPhones still route sound like a phone call (thin, robotic).
+    // Switch back to music audio and give it a moment before talking.
+    player.audioMode('playback');
+    if (IOS && Date.now() - micEndedAt < 700) await new Promise(r => setTimeout(r, 700 - (Date.now() - micEndedAt)));
     let done = false;
     const finish = () => { if (done) return; done = true; clearTimeout(guard); setState(listening ? 'listening' : 'idle'); if (!listening) duck(false); res(); };
     // Some phones never fire "end" for speech — don't leave the music dipped forever
@@ -90,13 +127,16 @@ function say(text, { show = true } = {}) {
       // Speak sentence by sentence with a natural pace: sounds less robotic, and avoids
       // Chrome cutting long speech off
       const spoken = text.replace(/BAZINGA!/g, 'Bazinga').replace(/\s*—\s*/g, ', ');
-      const parts = spoken.match(/[^.!?]+[.!?]*/g) || [spoken];
+      // iPhone: one utterance (natural flow, no gaps between sentences). Chrome cuts long speech off, so it goes sentence by sentence.
+      const parts = IOS ? [spoken] : (spoken.match(/[^.!?]+[.!?]*/g) || [spoken]);
       setState('speaking'); duck(true);
+      // On iPhone a "compact" voice sounds robotic; the phone's own default voice (Settings → Accessibility →
+      // Spoken Content) is usually the Siri-quality one, so use it unless a premium/enhanced voice was found or chosen.
+      const useVoice = voice && (!IOS || isGreat(voice) || voicePref) ? voice : null;
       parts.forEach((part, i) => {
         const u = new SpeechSynthesisUtterance(part.trim());
-        if (voice) { u.voice = voice; u.lang = voice.lang; }
-        const natural = voice && /natural|neural|premium|enhanced|siri/i.test(voice.name);
-        u.rate = (natural ? 1 : 0.97) * rate; u.pitch = 1; u.volume = 1;
+        if (useVoice) { u.voice = useVoice; u.lang = useVoice.lang; } else u.lang = navigator.language || 'en-US';
+        u.rate = (isGreat(useVoice) || !useVoice ? 1 : 0.97) * rate; u.pitch = 1; u.volume = 1;
         if (i === parts.length - 1) { u.onend = finish; }
         u.onerror = finish;
         speechSynthesis.speak(u);
@@ -148,6 +188,9 @@ export function openVoice({ listenNow = true, fromWake = false } = {}) {
   if (!fromWake) stopWake();
   clearTimeout(closeTimer); keep = false;
   open = true; v.hidden = false; requestAnimationFrame(() => v.classList.add('on'));
+  micUI(true);
+  unlockChime();
+  duck(true);
   setHeard('');
   setReply(canListen ? rand(['I\'m listening…', 'Go ahead, I\'m listening.', 'What do you want to hear?']) : 'Type what you\'d like — for example "Play Tapout by Rich Gang"');
   // Unlock speech on iOS: speak an empty utterance inside the tap
@@ -167,12 +210,23 @@ function scheduleClose(ms) {
     close();
   }, ms);
 }
+// Mic buttons go back to normal: no ring, no stuck tap/hover highlight, no focus (Safari keeps these otherwise)
+function micUI(on) {
+  document.body.classList.toggle('voice-on', !!on);
+  if (on) return;
+  try { const a = document.activeElement; if (a && a !== document.body && !el()?.contains(a)) a.blur(); else a?.blur?.(); } catch { }
+  document.querySelectorAll('[data-act="voice"]').forEach(b => { b.classList.remove('on', 'active'); b.removeAttribute('aria-pressed'); });
+}
 function close() {
+  open = false;
+  micUI(false); // first, so nothing below can leave the mic looking active
   clearTimeout(closeTimer); pending = null; confirmUI(false);
   stopListening(); try { speechSynthesis.cancel(); } catch { }
-  restoreAudio();
+  try { restoreAudio(); } catch { }
+  // Safari: make sure the microphone is really released (no recogniser left running unless "Hey Bazinga" is on)
+  if (!wakeOn) stopWake();
   const v = el(); if (!v) return;
-  open = false; v.classList.remove('on'); setTimeout(() => { if (!open) v.hidden = true; }, 220);
+  v.classList.remove('on'); setTimeout(() => { if (!open) v.hidden = true; }, 220);
   scheduleWake(1200);
 }
 
@@ -189,6 +243,7 @@ function listen() {
   rec.interimResults = true; rec.continuous = false; rec.maxAlternatives = 5;
   let final = '', finals = [];
   rec.onstart = () => { listening = true; setState('listening'); duck(true); };
+  chime();
   rec.onresult = e => {
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -203,20 +258,20 @@ function listen() {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setReply('I need microphone access. Allow it in your browser\'s site settings, or type below.');
     else if (e.error === 'no-speech') setReply('I didn\'t hear anything. Tap the orb and try again.');
     else if (e.error === 'network') setReply('Voice recognition needs internet. You can type instead.');
-    scheduleClose(8000);
+    scheduleClose(e.error === 'no-speech' || e.error === 'aborted' ? NO_SPEECH_CLOSE : 8000);
   };
   rec.onend = () => {
-    listening = false; setState('idle'); rec = null;
+    listening = false; setState('idle'); rec = null; micEndedAt = Date.now();
     player.audioMode('playback'); // release the microphone's audio mode right away
     const alts = [];
     for (let k = 1; k < 5; k++) { const a = finals.map(f => f[k] || f[0]).join(' ').trim(); if (a && a !== final.trim() && !alts.includes(a)) alts.push(a); }
-    if (final.trim()) handle(final.trim(), alts); else { restoreAudio(); if (!pending) scheduleClose(8000); }
+    if (final.trim()) handle(final.trim(), alts); else { restoreAudio(); if (!pending) scheduleClose(NO_SPEECH_CLOSE); }
   };
   try { rec.start(); } catch { player.audioMode('playback'); }
 }
 function stopListening() {
   const r = rec; rec = null;
-  if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch { } try { r.stop(); } catch { } player.audioMode('playback'); }
+  if (r) { r.onend = r.onresult = r.onerror = null; try { r.abort(); } catch { } try { r.stop(); } catch { } player.audioMode('playback'); micEndedAt = Date.now(); }
   listening = false;
 }
 
@@ -585,7 +640,7 @@ function startWake() {
         if (!wakeHeard) {               // show the assistant right away…
           wakeHeard = true;
           openVoice({ listenNow: false, fromWake: true }); // keep this listener going to catch the request
-          setState('listening'); setReply('I\'m listening…'); duck(true);
+          setState('listening'); setReply('I\'m listening…'); duck(true); chime();
           clearTimeout(wakeHeardTimer);
           wakeHeardTimer = setTimeout(() => finishWake(''), 3500);
         }
@@ -623,3 +678,6 @@ function finishWake(rest) {
   else { setReply(rand(['Yes?', 'I\'m listening…', 'What do you want to hear?'])); setTimeout(() => { if (open && !listening) listen(); }, 120); }
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopWake(); else scheduleWake(400); });
+// Coming back to the page (Safari restores pages from its back/forward cache): the mic look must match reality
+window.addEventListener('pageshow', () => micUI(open));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) micUI(open); });

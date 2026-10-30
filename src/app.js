@@ -1,7 +1,7 @@
 // BAZINGA — app shell, router and views
 import { db, kv } from './db.js';
 import { $, $$, esc, on, emit, toast, debounce, fmtTime, fmtDur, imageToDataURL, mainArtist, norm, trackKey, albumKey, yearOf, packToString, unpackString, sleep, downloadBlob, uid, displayTitle, genreOf } from './util.js';
-import { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, filterBar, empty, likedCover, loader, sized, toastUndo } from './ui.js';
+import { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, filterBar, empty, likedCover, loader, sized, toastUndo, THEMES, applyTheme, currentTheme, logoSrc } from './ui.js';
 import { initVoice, openVoice, canListen, voiceOptions, setVoicePrefs, previewVoice, setWake, wakeSupported } from './voice.js';
 import * as store from './store.js';
 import { lib } from './store.js';
@@ -31,6 +31,7 @@ let routeToken = 0;
 // ================= BOOT =================
 async function boot() {
   window.__bzStarted = true;
+  setTimeout(hideSplash, 12000); // never leave the splash up if something below goes wrong
   if (location.protocol === 'file:') setTimeout(() => toast('Opened from a file: library & offline files work, but YouTube playback, Spotify and sharing need the GitHub Pages link.', 'err'), 1500);
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').then(r => r.update().catch(() => { })).catch(() => { });
   checkForUpdate(true);
@@ -57,6 +58,12 @@ async function boot() {
   await sync.restore();
   await showApp();
   if (joinReq) joinFlow(joinReq);
+}
+
+// ---------- Splash screen: fades out once the first screen is ready (shown at least ~1 s) ----------
+function hideSplash() {
+  const sp = $('#splash'); if (!sp || sp.classList.contains('out')) return;
+  setTimeout(() => { sp.classList.add('out'); setTimeout(() => sp.remove(), 700); }, Math.max(0, 1100 - performance.now()));
 }
 
 // ---------- Always run the newest version ----------
@@ -245,6 +252,7 @@ async function wipeDevice() {
 async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('profile', profile); emit('dirty', 'profile'); renderProfileChip(); }
 
 function applySettings() {
+  applyTheme(settings.theme || currentTheme());
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -280,10 +288,15 @@ async function keepAwake() {
 document.addEventListener('visibilitychange', () => keepAwake());
 // Some browsers only grant it after a tap — try again on the first touches until it holds
 ['pointerdown', 'keydown'].forEach(ev => document.addEventListener(ev, () => { if (settings.keepAwake !== false && profile && !(wakeLock && !wakeLock.released) && !(awakeVid && !awakeVid.paused)) keepAwake(); }, { passive: true }));
+// Colour swatches (welcome card + Settings → You). Tapping one previews it instantly.
+const themePicker = (cur = currentTheme()) => `<div class="theme-pick" role="radiogroup" aria-label="Theme colour">${THEMES.map(([k, l, c]) =>
+  `<button type="button" class="tp ${k === cur ? 'on' : ''}" data-theme="${k}" role="radio" aria-checked="${k === cur}" aria-label="${l}" title="${l}" style="--c:rgb(${c.join(' ')})"><i>${icon('check')}</i><span>${l}</span></button>`).join('')}</div>`;
+function markThemePicks(name) { $$('.theme-pick .tp').forEach(b => { const on = b.dataset.theme === name; b.classList.toggle('on', on); b.setAttribute('aria-checked', on); }); }
 async function saveSettings(patch) { settings = { ...settings, ...patch }; await kv.set('settings', settings); applySettings(); emit('dirty', 'settings'); }
 
 async function termsGate() {
   while (profile.termsAccepted !== TERMS_VERSION) {
+    hideSplash();
     const r = await modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3>
       <p class="muted tiny">${profile.termsAccepted ? 'Our terms have been updated. ' : ''}Please read and accept to keep using BAZINGA!.</p>
       <div class="legal-box">${LEGAL_HTML}</div>
@@ -422,7 +435,7 @@ async function showApp() {
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
     openNP: () => openNP(), closeNP: () => closeNP(), lyrics: on => setLyrics(on), toast
   });
-  route();
+  route().finally(hideSplash);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
   if (settings.wake && wakeSupported) setWake(true);
@@ -460,15 +473,18 @@ async function countLaunch() {
 }
 const isInstalled = async () => isStandalone() || !!((await kv.get('a2hs')) || {}).done;
 // First visit: "Add to Home Screen". Then every 5th visit until it's installed or "Don't show again".
-// Every 10th visit: Buy Me a Coffee, until "Don't show again" (if both land on the same visit, coffee waits one visit).
+// The "Do you love BAZINGA!?" coffee popup: every 10th time the app is opened, until "Don't show this again"
+// (if it lands on an Add to Home Screen visit, it follows right after that popup).
 async function launchPopups() {
   const { n, fresh } = await countLaunch();
   if (!fresh || !profile || $('.modal-wrap') || document.body.classList.contains('np-open')) return;
   const a2 = (await kv.get('a2hs')) || {}, cof = (await kv.get('phase2')) || {};
   const wantA2 = !a2.never && !(await isInstalled()) && (n === 1 || n % 5 === 0);
   const wantCoffee = !cof.never && (n % 10 === 0 || (cof.pending && n > 1));
-  if (wantA2) { if (wantCoffee) { cof.pending = true; await kv.set('phase2', cof); } return maybeInstallPrompt(); }
-  if (wantCoffee) { cof.pending = false; await kv.set('phase2', cof); phase2Popup(); }
+  if (wantA2) await maybeInstallPrompt();
+  if (!wantCoffee) return;
+  cof.pending = false; await kv.set('phase2', cof);
+  setTimeout(() => { if (!$('.modal-wrap') && !$('#mix-ov')) phase2Popup({ love: true }); else { cof.pending = true; kv.set('phase2', cof); } }, wantA2 ? 700 : 0);
 }
 async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
@@ -487,7 +503,7 @@ async function maybeInstallPrompt(force = false) {
     : /Firefox/i.test(ua) ? `<ol class="a2-steps"><li>Tap the menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install</b> (or <b>Add to Home screen</b>).</li></ol>`
     : `<ol class="a2-steps"><li>Open your browser menu <span class="a2-ic">${dots}</span>.</li><li>Tap <b>Install app</b> or <b>Add to Home screen</b>.</li></ol>`;
   const r = await modal(`<div class="a2hs">
-      <div class="a2-icon"><img src="icons/app-192.png" alt="BAZINGA! app icon" width="96" height="96"></div>
+      <div class="a2-icon"><img src="${logoSrc('app-192')}" alt="BAZINGA! app icon" width="96" height="96"></div>
       <h3>Add BAZINGA! to your Home Screen</h3>
       <p class="muted">One tap away, full screen like a real app, and music keeps going better in the background.</p>
       ${steps}
@@ -509,11 +525,12 @@ function welcome(joinReq = null) {
   const ob = $('#onboarding'); ob.hidden = false;
   const canSync = sync.available();
   ob.innerHTML = `<div class="ob-card">
-    <div class="ob-brand"><span class="logo-mark big"><img src="icons/icon-512.png" class="ob-logo" alt=""></span><h1 class="wordmark">BAZINGA!</h1></div>
-    <p class="muted">${joinReq ? 'Almost there — this browser will sync with your music from your other device.' : 'Your Spotify & Apple Music library as YouTube music videos & audio — with a full player, albums, offline files and backups. No sign-up, no login.'}</p>
+    <div class="ob-brand"><span class="logo-mark big"><img src="${logoSrc('icon-512')}" class="ob-logo" alt=""></span><h1 class="wordmark">BAZINGA!</h1></div>
+    <p class="muted ob-sub">${joinReq ? 'Almost there! This browser will sync with your music from your other device.' : 'All your favorite songs from Spotify and Apple Music, playing as music videos and audio in one free player. No sign up, no login, just press play ⚡'}</p>
     ${!joinReq ? `<form id="ob-form" class="ob-form" novalidate>
       <label class="ob-pic" title="Add a profile picture (optional)"><input type="file" accept="image/*" id="ob-file" hidden><div class="avatar xl" id="ob-avatar">${icon('user')}</div><span>Add photo</span></label>
       <label class="fld"><span>Pick a username</span><input name="username" id="ob-name" maxlength="30" autocomplete="nickname" placeholder="e.g. thunderkid" enterkeyhint="go"></label>
+      <div class="fld ob-theme"><span>Pick your color</span>${themePicker()}</div>
     </form>` : ''}
     <label class="agree ob-terms"><input type="checkbox" id="ob-terms"><span>I agree to the <a class="lnk" href="#" id="ob-legal">Privacy Policy & Terms of Use</a>. BAZINGA! is provided as-is and isn't liable for anything.</span></label>
     <button class="btn primary big" id="ob-go">${joinReq ? `${icon('link')}Sync this browser` : `Let's go ${icon('play')}`}</button>
@@ -523,6 +540,7 @@ function welcome(joinReq = null) {
     <p class="copyright">© 2026 Abbel Dawit · BAZINGA!</p>
   </div>`;
   $('#ob-legal').onclick = e => { e.preventDefault(); showLegal(); };
+  hideSplash();
   const termsOk = () => {
     if ($('#ob-terms').checked) return true;
     $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600);
@@ -538,10 +556,12 @@ function welcome(joinReq = null) {
     toast('Pick a username first', 'err'); return false;
   };
   $('#ob-form')?.addEventListener('submit', e => { e.preventDefault(); $('#ob-go').click(); });
+  ob.addEventListener('click', e => { const b = e.target.closest('[data-theme]'); if (!b) return; applyTheme(b.dataset.theme); markThemePicks(b.dataset.theme); });
   const start = async (req, name = '') => {
     profile = { username: name || 'Listener', picture: name ? pic : '', createdAt: Date.now(), updatedAt: name ? Date.now() : 0, termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
     await kv.set('profile', profile);
     emit('dirty', 'profile');
+    await saveSettings({ theme: currentTheme() });
     location.hash = '#/home';
     await sync.restore();
     await showApp();
@@ -561,10 +581,10 @@ window.addEventListener('hashchange', () => profile && profile.termsAccepted ===
 const showLegal = () => modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3><div class="legal-box">${LEGAL_HTML}</div>`, { wide: true });
 // Browser tab title: "BAZINGA! - <page>"
 const setTitle = x => { document.title = 'BAZINGA! - ' + (x || APP_TAGLINE); };
-const TITLES = { home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
+const TITLES = { new: 'New from your top artists', home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
 const LIB_TABS = { songs: 'Songs', liked: 'Liked Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
 // Where "Back" goes when there's no in-app history (e.g. a shared link opened directly)
-const BACK_TO = { artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
+const BACK_TO = { new: ['#/home', 'Home'], artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
 const navStack = [];
 function goBack() {
   const name = (location.hash.replace(/^#\/?/, '').split('/')[0]);
@@ -589,7 +609,7 @@ async function route() {
   closeQueueOnMobile();
   const v = view();
   v.scrollTop = 0; $('#main').scrollTop = 0;
-  const routes = { home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
+  const routes = { new: vNewReleases, home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
   const fn = routes[name] || vHome;
   v.innerHTML = loader();
   // Back button on detail pages (artist, album, playlist, genre, shared, …) — added as soon as the
@@ -695,13 +715,13 @@ async function vHome(_, my) {
     view().innerHTML = `<div class="page home">
       <section class="home-hero empty-hero"><div class="hh-bg"></div><div class="hh-txt"><div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div><h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
         <p>Bring in your Spotify, Apple Music or YouTube favourites and play them as music videos or audio.</p>
-        <div class="row-btns"><a class="btn primary" href="#/import">${icon('import')}Import music</a><a class="btn" href="#/search">${icon('search')}Search</a><button class="btn" data-act="voice">${icon('mic')}Ask BAZINGA!</button></div>
+        <div class="row-btns">${bzBtn('primary')}<a class="btn" href="#/search">${icon('search')}Search</a><a class="btn" href="#/import">${icon('import')}Import music</a></div>
         <p class="tiny muted hh-note">You can import any time from Settings → Import music.${sync.available() && !sync.linked() ? ' Already using BAZINGA! somewhere else? <button class="lnk" data-act="enter-code">Link this device</button>.' : ''}</p></div></section></div>`;
     startClock();
     return;
   }
   const liked = all.filter(t => t.liked);
-  const recent = [...all].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 12);
+  const recent = all.filter(t => !t.mix || t.liked).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 12);
   // Top playlists: the ones you play most, then the newest
   const plays = (await kv.get('plPlays')) || {};
   if (stale(my)) return;
@@ -722,9 +742,9 @@ async function vHome(_, my) {
         <h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
         <p>${all.length} songs · ${lib.playlists.size} playlists · ${store.artists().length} artists</p>
         <div class="row-btns">
-          ${liked.length ? `<button class="btn primary" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
+          ${bzBtn('primary')}
+          ${liked.length ? `<button class="btn" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
           <button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>
-          <button class="btn glass" data-act="voice">${icon('mic')}Ask BAZINGA!</button>
         </div>
       </div>
       ${collage.length >= 2 ? `<div class="hh-collage">${collage.map((src, i) => `<img src="${esc(sized(src, 300))}" alt="" style="--i:${i}" loading="lazy">`).join('')}</div>` : ''}
@@ -752,6 +772,8 @@ async function vHome(_, my) {
 }
 
 // "Jump back in" — kept in sync with the player instantly (no page reload)
+// The BAZINGA! button: one tap builds a fresh mix of new songs from your top artists and genres
+const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt">BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
 const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
@@ -766,27 +788,36 @@ function updateJump() {
 
 // "New from your artists": latest releases by the artists you listen to most.
 // Cached for 12 hours; uses only a handful of lookups, paced by the rate limiter.
+const releaseCard = a => {
+  const days = a.releaseDate ? Math.round((Date.now() - Date.parse(a.releaseDate)) / 864e5) : 999;
+  const when = days < 0 ? 'Coming soon' : days < 1 ? 'Today' : days < 7 ? `${days} day${days > 1 ? 's' : ''} ago` : days < 60 ? `${Math.round(days / 7)} weeks ago` : (a.year || '');
+  return `<a class="card" href="#/album/it/${a.itunesAlbumId}"><div class="card-art">${cover(a.artwork, a.title)}${days <= 30 ? '<span class="new-badge">NEW</span>' : ''}<button class="fab-play" data-act="play-it-album" data-id="${a.itunesAlbumId}" aria-label="Play">${icon('play')}</button></div>
+    <div class="card-t">${esc(a.title.replace(/ - (Single|EP)$/, ''))}</div><div class="card-s">${esc(a.artist)} · ${/ - Single$/.test(a.title) ? 'Single' : / - EP$/.test(a.title) ? 'EP' : 'Album'} · ${when}</div></a>`;
+};
+const NR_SHELF = 10, NR_PAGE = 25;
+// "New from your top artists": newest albums, EPs and singles from the artists you have the most songs by.
+// Home shows 10 in a sideways-scrolling row; "See more" opens the full list, 25 at a time.
+// Your top 6 artists are looked up first (quick), the next 14 quietly in the background. Cached for 12 hours.
 async function newReleases(my) {
   const box = $('#new-releases'); if (!box) return;
-  const head = `<div class="sec-h"><h2>New from your top artists</h2></div>`;
   const render = items => {
     if (stale(my) || !$('#new-releases')) return;
     if (!items.length) { box.innerHTML = ''; return; }
-    box.innerHTML = head + `<div class="shelf">${items.map(a => {
-      const days = a.releaseDate ? Math.round((Date.now() - Date.parse(a.releaseDate)) / 864e5) : 999;
-      const when = days < 0 ? 'Coming soon' : days < 1 ? 'Today' : days < 7 ? `${days} day${days > 1 ? 's' : ''} ago` : days < 60 ? `${Math.round(days / 7)} weeks ago` : (a.year || '');
-      return `<a class="card" href="#/album/it/${a.itunesAlbumId}"><div class="card-art">${cover(a.artwork, a.title)}${days <= 30 ? '<span class="new-badge">NEW</span>' : ''}<button class="fab-play" data-act="play-it-album" data-id="${a.itunesAlbumId}" aria-label="Play">${icon('play')}</button></div>
-        <div class="card-t">${esc(a.title.replace(/ - (Single|EP)$/, ''))}</div><div class="card-s">${esc(a.artist)} · ${/ - Single$/.test(a.title) ? 'Single' : / - EP$/.test(a.title) ? 'EP' : 'Album'} · ${when}</div></a>`;
-    }).join('')}</div>`;
+    box.innerHTML = `<div class="sec-h"><h2>New from your top artists</h2><a href="#/new" class="lnk">See more</a></div>
+      <div class="shelf">${items.slice(0, NR_SHELF).map(releaseCard).join('')}</div>`;
   };
-  // Your top artists = the ones with the most songs in your library, #1 first
-  const top = store.artists().sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 6);
-  const sig = 'v2|' + top.map(a => a.key).join('|');
+  const items = await loadNewReleases({ onUpdate: render, skeleton: () => { if (!stale(my)) box.innerHTML = `<div class="sec-h"><h2>New from your top artists</h2></div><div class="shelf">${'<div class="card skel"><div class="card-art"><div class="cover"></div></div><div class="card-t"></div><div class="card-s"></div></div>'.repeat(6)}</div>`; } });
+  render(items);
+}
+async function loadNewReleases({ onUpdate = () => { }, skeleton = () => { } } = {}) {
+  const top = store.artists().sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 20);
+  const sig = 'v3|' + top.map(a => a.key).join('|');
   const c = await kv.get('newReleases');
-  if (c?.items?.length && c.sig === sig) render(c.items);
-  if (c && c.sig === sig && Date.now() - c.ts < 12 * 36e5) return;
-  if (!navigator.onLine || !top.length) return;
-  if (!(c?.items?.length && c.sig === sig)) box.innerHTML = head + `<div class="shelf">${'<div class="card skel"><div class="card-art"><div class="cover"></div></div><div class="card-t"></div><div class="card-s"></div></div>'.repeat(6)}</div>`;
+  const fresh = c?.items?.length && c.sig === sig;
+  if (fresh) onUpdate(c.items);
+  if (c && c.sig === sig && Date.now() - c.ts < 12 * 36e5) return c.items || [];
+  if (!navigator.onLine || !top.length) return fresh ? c.items : [];
+  if (!fresh) skeleton();
   const have = new Set([...lib.albums.values()].map(a => a.itunesAlbumId));
   const yearAgo = new Date(Date.now() - 365 * 864e5).toISOString().slice(0, 10);
   const byRank = new Map(), seen = new Set();
@@ -795,26 +826,234 @@ async function newReleases(my) {
     const out = [];
     for (let r = 0; r < top.length; r++) {
       const rel = (byRank.get(r) || []).filter(a => a.itunesAlbumId && !have.has(a.itunesAlbumId)).sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
-      const fresh = rel.filter(a => (a.releaseDate || '') >= yearAgo);
-      out.push(...(fresh.length ? fresh.slice(0, r === 0 ? 5 : 3) : rel.slice(0, r === 0 ? 2 : 1)));
+      const recent = rel.filter(a => (a.releaseDate || '') >= yearAgo);
+      out.push(...(recent.length ? recent.slice(0, 6) : rel.slice(0, 2)));
     }
-    return out.slice(0, 16);
+    return out;
   };
-  let shown = !!(c?.items?.length && c.sig === sig);
-  const take = async (a, rank) => {
+  const take = async (a, rank, o) => {
     try {
-      const id = a.itunesArtistId || await meta.findArtistId(a.name);
+      const id = a.itunesArtistId || await meta.findArtistId(a.name, o);
       if (!id) return;
       const rel = [];
-      for (const al of await meta.artistLatest(id)) if (!seen.has(al.itunesAlbumId)) { seen.add(al.itunesAlbumId); rel.push(al); }
+      for (const al of await meta.artistLatest(id, o)) if (!seen.has(al.itunesAlbumId)) { seen.add(al.itunesAlbumId); rel.push(al); }
       byRank.set(rank, rel);
-      if (!shown && rank === 0) { const items = pickItems(); if (items.length) { render(items); shown = true; } }
+      if (!fresh && rank === 0) { const items = pickItems(); if (items.length) onUpdate(items); }
     } catch { }
   };
-  await Promise.all(top.map(take));
-  const items = pickItems();
+  await Promise.all(top.slice(0, 6).map((a, i) => take(a, i)));
+  let items = pickItems();
+  if (items.length) onUpdate(items);
+  await Promise.all(top.slice(6).map((a, i) => take(a, i + 6, { bg: true })));
+  items = pickItems();
   await kv.set('newReleases', { ts: Date.now(), sig, items });
-  render(items);
+  onUpdate(items);
+  return items;
+}
+// Full list page (See more): 25 at a time, "Show more" until the end
+async function vNewReleases(_, my) {
+  let items = [], shown = NR_PAGE;
+  const draw = () => {
+    if (stale(my)) return;
+    const left = items.length - shown;
+    view().innerHTML = `<div class="page"><h1 class="page-h">New from your top artists</h1>
+      <p class="muted">The latest albums, EPs and singles from the artists you listen to most.</p>
+      ${items.length ? `<div class="cards">${items.slice(0, shown).map(releaseCard).join('')}</div>
+        ${left > 0 ? `<div class="more-wrap"><button class="more-btn" id="nr-more">Show more <small>${left} more</small></button></div>` : ''}`
+      : empty('Nothing new yet', 'New releases from your top artists show up here.')}</div>`;
+    const b = $('#nr-more'); if (b) b.onclick = () => { const y = $('#main').scrollTop; shown += NR_PAGE; draw(); $('#main').scrollTop = y; };
+  };
+  // Shows what's ready straight away; more appears as the rest of your artists are looked up
+  const update = v => { if (v.length === items.length && items.length) return; items = v; const y = $('#main').scrollTop; draw(); $('#main').scrollTop = y; };
+  const got = await loadNewReleases({ onUpdate: update });
+  update(got); if (!got.length && !items.length) draw();
+}
+
+// ================= BAZINGA! MIX =================
+// One tap: a fresh playlist of songs you don't have yet from your top 50 artists (your #1 artist first,
+// taking turns), then today's top songs in your favourite genres. Built for a fast start: the first few
+// artists are fetched together and the music starts as soon as there's something to play; the rest of
+// the mix keeps filling in behind it (queue + playlist).
+const MIX_GENRES = ['Hip-Hop/Rap', 'Pop', 'R&B', 'Afrobeats', 'Rock', 'Electronic', 'Latin', 'Country', 'Soul', 'Reggae', 'Jazz', 'Gospel', 'K-Pop', 'Classical', 'Metal', 'Folk', 'Blues'];
+const mixPlaylist = async () => { const id = await kv.get('mixPl'); return id && lib.playlists.get(id); };
+// Songs that are only in the library because an earlier mix put them there
+const isMixOnly = (t, mixId) => t.mix && !t.liked && ![...lib.playlists.values()].some(p => p.id !== mixId && p.trackIds.includes(t.id));
+function libraryTaste(mixId) {
+  const own = store.saved().filter(t => !isMixOnly(t, mixId));
+  const am = new Map(), gm = new Map();
+  for (const t of own) {
+    const a = mainArtist(t.artist), k = norm(a);
+    if (k) { const e = am.get(k) || { name: a, n: 0 }; e.n += t.liked ? 2 : 1; am.set(k, e); }
+    const g = genreOf(t); if (g) gm.set(g, (gm.get(g) || 0) + 1);
+  }
+  return {
+    artists: [...am.values()].sort((a, b) => b.n - a.n).map(a => a.name),
+    genres: [...gm.entries()].sort((a, b) => b[1] - a[1]).map(x => x[0]),
+    have: new Set(own.map(t => t.id)), haveTitles: new Set(own.map(t => norm(t.title) + '|' + norm(mainArtist(t.artist))))
+  };
+}
+function mixOverlay() {
+  $('#mix-ov')?.remove();
+  const el = document.createElement('div');
+  el.id = 'mix-ov'; el.setAttribute('role', 'status'); el.setAttribute('aria-live', 'polite');
+  el.innerHTML = `<div class="mo-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="mo-arts" aria-hidden="true"></div>
+    <div class="mo-core"><div class="mo-orb"><span></span><span></span><span></span><img src="${logoSrc('icon-512')}" alt=""></div>
+    <h2 class="wordmark">BAZINGA!</h2><p class="mo-step">Reading your vibe…</p><div class="mo-bar"><i></i></div></div>
+    <button class="ib mo-x" type="button" aria-label="Cancel">${icon('close')}</button>`;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('on'));
+  let arts = 0;
+  const api = {
+    cancelled: false,
+    step(t, pct) { const s = el.querySelector('.mo-step'); if (s && s.textContent !== t) { s.textContent = t; s.classList.remove('in'); void s.offsetWidth; s.classList.add('in'); } if (pct != null) el.querySelector('.mo-bar i').style.width = Math.min(100, pct) + '%'; },
+    art(src) {
+      if (!src || arts >= 8) return;
+      const i = arts++, img = new Image(); img.alt = ''; img.src = sized(src, 300); img.style.setProperty('--i', i);
+      // covers float around the edges, never over the bolt in the middle
+      const spots = [[6, 10], [74, 8], [10, 66], [76, 64], [40, 4], [42, 78], [2, 38], [82, 36]];
+      img.style.left = spots[i][0] + '%'; img.style.top = spots[i][1] + '%';
+      img.onload = () => el.querySelector('.mo-arts')?.appendChild(img);
+    },
+    close() { el.classList.remove('on'); el.classList.add('out'); setTimeout(() => el.remove(), 450); }
+  };
+  el.querySelector('.mo-x').onclick = () => { api.cancelled = true; api.close(); };
+  return api;
+}
+// First time, with no music yet: pick favourite genres, then favourite artists in them
+async function tastePicker() {
+  let genres = [], artists = [];
+  return modal(`<div class="taste"><div class="taste-step" data-s="1">
+      <div class="taste-ic"><img src="${logoSrc()}" alt=""></div>
+      <h3>What do you love listening to?</h3><p class="muted">Pick as many genres as you like. Your BAZINGA! mix starts here.</p>
+      <div class="chips taste-genres">${MIX_GENRES.map(g => `<button type="button" class="chip" data-g="${esc(g)}" aria-pressed="false" style="--c:${genreColor(g)}">${esc(g)}</button>`).join('')}</div>
+      <div class="modal-actions center"><button type="button" class="btn primary" data-next disabled>Next ${icon('play')}</button></div></div>
+    <div class="taste-step" data-s="2" hidden>
+      <h3>Now your favorite artists</h3><p class="muted">Top artists in the genres you picked. Choose any you like, or skip.</p>
+      <div class="taste-artists"></div>
+      <div class="modal-actions center"><button type="button" class="btn ghost" data-back>Back</button><button type="button" class="btn primary" data-go>${icon('sparkle')}Make my mix</button></div></div></div>`, {
+    wide: true,
+    onMount: (m, close) => {
+      m.classList.add('taste-modal');
+      const s1 = m.querySelector('[data-s="1"]'), s2 = m.querySelector('[data-s="2"]'), next = m.querySelector('[data-next]');
+      m.querySelector('.taste-genres').onclick = e => {
+        const b = e.target.closest('[data-g]'); if (!b) return;
+        const g = b.dataset.g, on = !genres.includes(g);
+        genres = on ? [...genres, g] : genres.filter(x => x !== g);
+        b.classList.toggle('on', on); b.setAttribute('aria-pressed', on); next.disabled = !genres.length;
+      };
+      next.onclick = async () => {
+        s1.hidden = true; s2.hidden = false;
+        const box = m.querySelector('.taste-artists');
+        box.innerHTML = genres.map(g => `<div class="ta-group"><div class="fp-h">${esc(g)}</div><div class="ta-row" data-genre="${esc(g)}">${loader('', 'sm inline')}</div></div>`).join('');
+        await Promise.all(genres.map(async g => {
+          const list = await meta.deezerGenreArtists(g, 10).catch(() => []);
+          const row = box.querySelector(`[data-genre="${CSS.escape(g)}"]`); if (!row) return;
+          row.innerHTML = list.length ? list.map(a => `<button type="button" class="ta ${artists.includes(a.name) ? 'on' : ''}" data-a="${esc(a.name)}" aria-pressed="${artists.includes(a.name)}">${cover(a.picture, a.name, 'round')}<span>${esc(a.name)}</span><i>${icon('check')}</i></button>`).join('')
+            : '<span class="muted tiny">Couldn\'t load artists for this one, but its top songs still go in your mix.</span>';
+        }));
+      };
+      m.querySelector('.taste-artists').onclick = e => {
+        const b = e.target.closest('[data-a]'); if (!b) return;
+        const a = b.dataset.a, on = !artists.includes(a);
+        artists = on ? [...artists, a] : artists.filter(x => x !== a);
+        $$(`.ta[data-a="${CSS.escape(a)}"]`, m).forEach(x => { x.classList.toggle('on', on); x.setAttribute('aria-pressed', on); });
+      };
+      m.querySelector('[data-back]').onclick = () => { s2.hidden = true; s1.hidden = false; };
+      m.querySelector('[data-go]').onclick = () => close({ genres, artists });
+    }
+  });
+}
+let mixBusy = false;
+async function bazingaMix() {
+  if (mixBusy) return;
+  if (!navigator.onLine) return toast('Your BAZINGA! mix needs an internet connection', 'err');
+  const oldPl = await mixPlaylist();
+  const lt = libraryTaste(oldPl?.id);
+  const saved = (await kv.get('taste')) || {};
+  if (lt.artists.length < 3 && !saved.artists?.length && !saved.genres?.length) {
+    const picked = await tastePicker();
+    if (!picked?.genres?.length) return;
+    Object.assign(saved, picked, { at: Date.now() }); await kv.set('taste', saved);
+  }
+  mixBusy = true;
+  const ov = mixOverlay();
+  try {
+    const uniq = a => [...new Map(a.filter(Boolean).map(x => [norm(x), x])).values()];
+    const libFirst = lt.artists.length >= 3;
+    const artists = uniq(libFirst ? [...lt.artists.slice(0, 50), ...(saved.artists || [])] : [...(saved.artists || []), ...lt.artists]).slice(0, 50);
+    const genres = uniq([...(saved.genres || []), ...lt.genres]).filter(g => MIX_GENRES.includes(g)).slice(0, 5);
+    const per = artists.length > 30 ? 2 : artists.length > 12 ? 3 : 5;
+    const seen = new Set(), seenTitle = new Set();
+    const fresh = s => {
+      const k = norm(s.title) + '|' + norm(mainArtist(s.artist));
+      if (!s.title || !s.artist || lt.have.has(s.id) || lt.haveTitles.has(k) || seen.has(s.id) || seenTitle.has(k)) return false;
+      if (/\b(karaoke|instrumental|8d audio|sped up|slowed)\b/i.test(s.title)) return false;
+      seen.add(s.id); seenTitle.add(k); return true;
+    };
+    // a little shuffle inside each artist's top songs, so every mix feels new
+    const jiggle = list => list.map((x, i) => [x, i + Math.random() * 4]).sort((a, b) => a[1] - b[1]).map(x => x[0]);
+    const picks = new Array(artists.length).fill(null);
+    const fetchArtist = async i => {
+      if (ov.cancelled) return;
+      const top = await meta.withTimeout(meta.deezerArtistTop(artists[i], 12).catch(() => []), 6000, []);
+      picks[i] = jiggle(top).filter(fresh).slice(0, per);
+      if (picks[i][0]?.artwork) ov.art(picks[i][0].artwork);
+    };
+    const roundRobin = () => { const out = [], max = Math.max(0, ...picks.map(p => p?.length || 0)); for (let r = 0; r < max; r++) for (const p of picks) if (p?.[r]) out.push(p[r]); return out; };
+    const save = list => store.upsertTracks(list.map(t => ({ ...t, mix: 1 })));
+
+    // 1) Fast start: your top few artists at once
+    ov.step(artists.length ? `Digging into ${artists[0]}…` : 'Finding the hottest songs in your genres…', 12);
+    const first = Math.min(6, artists.length);
+    await Promise.all([...Array(first).keys()].map(fetchArtist));
+    if (ov.cancelled) return;
+    let startList = roundRobin();
+    let genreSongs = null;
+    const fetchGenres = async () => {
+      const lists = await Promise.all(genres.map(g => meta.withTimeout(meta.deezerGenreTop(g, 30).catch(() => []), 7000, [])));
+      const out = [], n = Math.max(0, ...lists.map(l => l.length));
+      for (let r = 0; r < n && out.length < 45; r++) for (const l of lists) if (l[r] && fresh(l[r])) out.push(l[r]);
+      return out;
+    };
+    if (startList.length < 3) {
+      ov.step('Mixing in the top songs from your genres…', 40);
+      genreSongs = await fetchGenres();
+      if (ov.cancelled) return;
+      startList = [...startList, ...genreSongs.splice(0, 8)];
+    }
+    if (!startList.length) { ov.close(); return toast('Couldn\'t build a mix right now. Try again in a moment', 'err'); }
+    ov.step('Your mix is ready. Here we go ⚡', 70);
+    const firstSaved = await save(startList);
+    const startIds = firstSaved.map(t => t.id);
+    player.prefetch(startIds[0]);
+    let pl = await mixPlaylist();
+    const name = 'BAZINGA! Mix';
+    const meta2 = { source: 'Made for you ⚡', image: startList.find(t => t.artwork)?.artwork || '', mix: 1 };
+    if (pl) { Object.assign(pl, { name, ...meta2 }); await store.replacePlaylistTracks(pl.id, startIds); }
+    else { pl = await store.createPlaylist(name, startIds, meta2); await kv.set('mixPl', pl.id); }
+    renderSidebarPlaylists();
+    nowCtx = { list: null };
+    player.playList(startIds, 0, { shuffle: false });
+    // Keep the overlay up until the music actually starts (or a few seconds pass)
+    const t0 = Date.now();
+    const waitStart = setInterval(() => { if (ov.cancelled || P.playing || P.needsTap || P.error || Date.now() - t0 > 9000) { clearInterval(waitStart); ov.step('Enjoy ⚡', 100); setTimeout(() => ov.close(), 250); } }, 200);
+
+    // 2) The rest of your top artists, then your genres, filled in behind the music
+    const rest = [...Array(artists.length).keys()].slice(first);
+    const queue = rest.slice();
+    await Promise.all([...Array(Math.min(5, queue.length)).keys()].map(async () => { while (queue.length) await fetchArtist(queue.shift()); }));
+    if (!genreSongs) genreSongs = await fetchGenres();
+    const already = new Set(startIds);
+    const more = [...roundRobin().filter(t => !already.has(t.id)).slice(0, 110), ...genreSongs].slice(0, 150);
+    if (!more.length) return;
+    const moreSaved = await save(more);
+    const all = [...startIds, ...moreSaved.map(t => t.id)];
+    await store.replacePlaylistTracks(pl.id, all);
+    // still playing the mix? add the rest to the queue
+    if (P.queue.some(q => q.id === startIds[0])) player.appendToQueue(moreSaved.map(t => t.id));
+    toast(`Your BAZINGA! Mix is ready: ${all.length} songs ⚡`, 'ok');
+  } catch (e) { console.warn(e); ov.close(); toast('Couldn\'t build a mix right now. Try again in a moment', 'err'); }
+  finally { mixBusy = false; }
 }
 
 // Artist card with a real artist photo (loaded lazily from Deezer, cached on the device)
@@ -1177,7 +1416,7 @@ async function doSearch(q, tab) {
     const parts = { artists: '', albums: '', songs: '' };
     const paint = () => {
       if (!alive() || !box()) return;
-      const html = parts.artists + parts.albums + parts.songs;
+      const html = parts.songs + parts.artists + parts.albums;
       if (html) { box().innerHTML = html + (settled < 3 ? `<div class="s-more">${loader('', 'sm inline')}</div>` : ''); fillArtistPics(box()); markNow(); }
       else if (settled === 3) box().innerHTML = `<p class="muted">No results from the music catalogue for "${esc(q)}". Check the spelling, or try the YouTube tab.</p>`;
     };
@@ -1524,6 +1763,7 @@ async function vSettings([section] = []) {
         <h2 class="pf-name">${esc(profile.username)}</h2>
         <div class="ah-stats">${(() => { const all = store.saved(); return [[all.length, 'songs'], [all.filter(t => t.liked).length, 'liked'], [lib.playlists.size, 'playlists'], [store.artists().length, 'artists']].map(([n, l]) => `<span><b>${n}</b>${l}</span>`).join(''); })()}</div>
         <div class="row-btns"><button class="btn" data-act="rename-user">${icon('edit')}Change name</button>${profile.picture ? `<button class="btn ghost" data-act="remove-pic">Remove photo</button>` : ''}</div>
+        <div class="ah-theme"><div class="kicker">Theme color</div>${themePicker(settings.theme || currentTheme())}</div>
       </div>
     </section>
     <div class="panel acct-panel" id="sync"><h2>${icon('link')} Sync your devices</h2>
@@ -1607,6 +1847,10 @@ async function vSettings([section] = []) {
   $('#gcid-form')?.addEventListener('submit', async e => { e.preventDefault(); await saveSettings({ googleClientId: e.target.cid.value.trim() }); await ya.signOut(); toast('Saved — now sign in with YouTube', 'ok'); rerender(); });
   wireImport();
   $$('#set-autoplay input').forEach(i => i.onchange = () => saveSettings({ autoplay: i.value }));
+  $$('.ah-theme [data-theme]').forEach(b => b.onclick = async () => {
+    const k = b.dataset.theme; markThemePicks(k); await saveSettings({ theme: k });
+    toast(`${THEMES.find(t => t[0] === k)[1]} it is ⚡`, 'ok');
+  });
   $('#set-prefoff').onchange = e => player.setPreferOffline(e.target.checked);
   $('#set-lock').onchange = e => { saveSettings({ lockFeature: e.target.checked }); applyLockSetting(); toast(e.target.checked ? 'Screen lock is on — tap 3 times or use the lock button' : 'Screen lock is off', e.target.checked ? 'ok' : 'info'); };
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
@@ -1972,9 +2216,23 @@ async function vSupport() {
 const p2GoalHTML = () => '';
 const animateP2 = () => { };
 
-async function phase2Popup() {
+async function phase2Popup({ love = false } = {}) {
   const st = (await kv.get('phase2')) || {};
   st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
+  // Step 1: a quick "do you love it?" — only people who do are asked for a coffee
+  const loveQ = () => `
+      <div class="love-ic"><img src="${logoSrc()}" alt=""></div>
+      <h3>Do you love BAZINGA!?</h3>
+      <p class="muted">Quick question, be honest!</p>
+      <div class="love-btns"><button type="button" class="love-no" data-p2="no" aria-label="No, not really">${icon('thumbDown')}</button><button type="button" class="love-yes" data-p2="yes" aria-label="Yes, I love it">${icon('thumbUp')}</button></div>`;
+  const yay = () => `
+      <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 24 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['var(--volt)', '#fff', 'var(--volt-2)', 'var(--volt)', '#7cf'][i % 5]}"></i>`).join('')}</div>
+      <div class="p2-icon glow">${icon('heartFill')}</div>
+      <h3>You just made my day! 🥹⚡</h3>
+      <p>Hearing you love BAZINGA! honestly means the world. Want to help make it even better? Every coffee turns into new features, faster fixes and more music magic ⚡</p>
+      <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Buy me a coffee</b><small>Make BAZINGA! even better ☕</small></span><span class="cb-shine"></span></a>
+      <div class="p2-btns"><button class="btn p2-notnow" data-p2="close">Not now</button><button class="btn ghost p2-never" data-p2="never">Don't show this again</button></div>`;
+  const sad = () => `<div class="sad-face" aria-label="Sad face">${icon('sad')}</div>`;
   const ask = () => `
       <div class="kicker">Phase 2 ⚡ Lock-screen listening</div>
       <h3>Help unlock music on your lock screen</h3>
@@ -1995,7 +2253,7 @@ async function phase2Popup() {
       <button class="btn primary" data-p2="thanks">I'm done ✓</button>
       <button class="btn ghost" data-p2="back">I didn't support this time</button>`;
   const thanks = () => `
-      <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 28 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['#ffd60a', '#fff', '#ff7a00', '#ffd60a', '#7cf'][i % 5]}"></i>`).join('')}</div>
+      <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 28 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['var(--volt)', '#fff', 'var(--volt-2)', 'var(--volt)', '#7cf'][i % 5]}"></i>`).join('')}</div>
       <div class="p2-icon glow">${icon('heartFill')}</div>
       <h3>Thank you, legend! ⚡</h3>
       <p>You just helped bring BAZINGA! closer to Phase 2 — lock-screen listening for everyone. It means a lot.</p>
@@ -2008,9 +2266,9 @@ async function phase2Popup() {
     body.classList.remove('in'); void body.offsetWidth; body.classList.add('in');
   };
   const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
-    onMount: m => {
+    onMount: (m, close) => {
       m.classList.add('p2-modal');
-      body = m.querySelector('.p2-body'); show('ask', ask());
+      body = m.querySelector('.p2-body'); if (love) show('love', loveQ()); else show('yay', yay());
       m.addEventListener('click', e => {
         if (e.target.closest('.p2-support')) {
           st.supportClickedAt = Date.now(); kv.set('phase2', st);
@@ -2021,6 +2279,9 @@ async function phase2Popup() {
           return;
         }
         const b = e.target.closest('[data-p2]'); if (!b) return;
+        if (b.dataset.p2 === 'yes') { st.lovedAt = Date.now(); kv.set('phase2', st); show('yay', yay()); }
+        if (b.dataset.p2 === 'no') { st.notLovedAt = Date.now(); kv.set('phase2', st); m.classList.add('sad'); show('sad', sad()); setTimeout(() => close(null), 1700); }
+        if (b.dataset.p2 === 'close') close(null);
         if (b.dataset.p2 === 'later') show('later', later());
         if (b.dataset.p2 === 'never') { st.never = true; kv.set('phase2', st); toast('Got it — you won\'t see this again. The ☕ button is always in the top bar.'); m.closest('.modal-wrap')?.querySelector('[data-close]')?.click(); }
         if (b.dataset.p2 === 'thanks') thank();
@@ -2291,7 +2552,9 @@ function wireGlobal() {
         const n = norm(a.dataset.name);
         player.playList(store.saved().filter(t => (t.artists?.length ? t.artists : [t.artist]).some(x => norm(x) === n) || norm(mainArtist(t.artist)) === n).map(t => t.id), 0, { shuffle: true }); break;
       }
-      case 'toggle-filters': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key].open = !fstate[key].open; refreshSection(key); break; }
+      case 'toggle-filters': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key].open = !fstate[key].open; if (fstate[key].open) fstate[key].sortOpen = false; refreshSection(key); break; }
+      case 'toggle-sort': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key].sortOpen = !fstate[key].sortOpen; if (fstate[key].sortOpen) fstate[key].open = false; refreshSection(key); break; }
+      case 'f-sort': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key].sort = a.dataset.v; fstate[key].sortOpen = false; refreshSection(key); break; }
       case 'f-genre': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const g = a.dataset.g; f.genres = f.genres?.includes(g) ? f.genres.filter(x => x !== g) : [...(f.genres || []), g]; refreshSection(key); break; }
       case 'f-year': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const y = +a.dataset.y; f.years = f.years?.includes(y) ? f.years.filter(x => x !== y) : [...(f.years || []), y]; refreshSection(key); break; }
       case 'f-flag': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key][a.dataset.k] = !fstate[key][a.dataset.k]; refreshSection(key); break; }
@@ -2327,6 +2590,7 @@ function wireGlobal() {
       case 'add-folder': pickFile('', fs => addLocalFiles(fs), { dir: true }); break;
       case 'go-back': goBack(); break;
       case 'voice': e.preventDefault(); openVoice(); break;
+      case 'bz-mix': e.preventDefault(); bazingaMix(); break;
       case 'play-it-album': {
         e.preventDefault(); e.stopPropagation();
         try { const { tracks } = await meta.albumTracks(id); player.playList(tracks.map(t => (lib.tracks.get(t.id) || store.remember(t)).id), 0, { shuffle: false }); }
@@ -2518,7 +2782,7 @@ function wirePlayerUI() {
     if (k === 'mute') player.setVolume(P.volume > 0 ? 0 : 0.8);
     if (k === 'artist') { const t = player.current(); if (t) { closeNP('nav'); location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist)); } }
     if (k === 'album') { const t = player.current(); if (t) { closeNP('nav'); gotoAlbum(t); } }
-    if (k === 'dock-size') { document.body.classList.toggle('dock-big'); placeDock(); }
+    if (k === 'dock-size') { document.body.classList.toggle('dock-big'); dockSizeLabel(); try { localStorage.setItem('bz_dock_big', document.body.classList.contains('dock-big') ? '1' : ''); } catch { } placeDock(); }
   };
   const head = $('#np-head');
   bar.addEventListener('click', handle); np.addEventListener('click', handle); head.addEventListener('click', handle);
@@ -2539,6 +2803,8 @@ function wirePlayerUI() {
   let headDark = false;
   window.addEventListener('scroll', () => { const d = scrollY > 8; if (d !== headDark) { headDark = d; head.classList.toggle('scrolled', d); } }, { passive: true });
   try { history.scrollRestoration = 'manual'; } catch { }
+  try { if (localStorage.getItem('bz_dock_big')) document.body.classList.add('dock-big'); } catch { }
+  dockSizeLabel();
   try { if (localStorage.getItem('bz_dock_min')) document.body.classList.add('dock-min'); if (localStorage.getItem('bz_npq') !== '0') document.body.classList.add('np-q'); if (localStorage.getItem('bz_lyr')) document.body.classList.add('np-lyr'); } catch { }
   dockMinLabel();
   // Buttons outside the player (e.g. "Jump back in" on Home)
@@ -2605,6 +2871,12 @@ function dockMinLabel() {
   const min = document.body.classList.contains('dock-min');
   b.setAttribute('aria-label', min ? 'Show video' : 'Minimize video'); b.title = min ? 'Show video' : 'Minimize';
 }
+// The resize arrow points up while the video is small (make it bigger) and down while it's big
+function dockSizeLabel() {
+  const b = $('[data-p="dock-size"]'); if (!b) return;
+  const big = document.body.classList.contains('dock-big');
+  b.setAttribute('aria-label', big ? 'Smaller video' : 'Bigger video'); b.title = big ? 'Smaller' : 'Bigger';
+}
 function toggleNPQueue() {
   const on = !document.body.classList.contains('np-q');
   document.body.classList.toggle('np-q', on);
@@ -2619,6 +2891,10 @@ function renderPlayer() {
   const t = player.current();
   if (t && P.playing && t.id !== lastPlayedId) { lastPlayedId = t.id; kv.get('plays').then(n => kv.set('plays', (n || 0) + 1)); }
   document.body.classList.toggle('has-track', !!t);
+  // Subtle loading veil over the video / cover while a song is starting
+  document.body.classList.toggle('song-loading', !!t && !!P.loading && !P.error);
+  const dl = $('#yt-dock .dl-art');
+  if (dl && t && dl.dataset.src !== (t.artwork || '')) { dl.dataset.src = t.artwork || ''; dl.style.backgroundImage = t.artwork ? `url("${sized(t.artwork, 300).replace(/"/g, '%22')}")` : ''; }
   const bar = $('#playerbar');
   if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; return; }
   // Play/pause/buffering only touch the play button — the rest of the bar is left alone (instant, no flicker)
@@ -2868,8 +3144,8 @@ function placeDock() {
     dock.classList.remove('in-np');
     dock.removeAttribute('style');
   }
-  // the back-to-top button sits just above the corner video, on the right
-  if (!slot) requestAnimationFrame(() => { const h = dock.classList.contains('show') ? dock.offsetHeight : 0; document.body.style.setProperty('--dockh', h + 'px'); });
+  // the back-to-top button sits just to the left of the corner video (desktop)
+  if (!slot) requestAnimationFrame(() => { const on = dock.classList.contains('show'); document.body.style.setProperty('--dockh', (on ? dock.offsetHeight : 0) + 'px'); document.body.style.setProperty('--dockw', (on ? dock.offsetWidth : 0) + 'px'); });
 }
 
 function renderQueue(el, force = false) {

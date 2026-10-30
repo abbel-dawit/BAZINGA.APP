@@ -122,6 +122,28 @@ export async function deezerArtistTop(name, limit = 10) {
   if (!a) return [];
   return (await deezer(`artist/${a.id}/top`, { limit }, DAY, true)).map(songFromDeezer);
 }
+// ---------- BAZINGA! mix helpers (Deezer: fast, no key) ----------
+// Deezer's own genre list, matched to BAZINGA!'s broad genres by name
+const DZ_GENRE = { 'Hip-Hop/Rap': /rap|hip/i, 'R&B': /r&b|rnb/i, Soul: /soul|funk/i, Afrobeats: /africa/i, Latin: /latin/i, Reggae: /reggae/i, Pop: /^pop$/i,
+  Rock: /^rock$/i, Electronic: /electro|dance/i, Country: /country/i, Jazz: /jazz/i, Blues: /blues/i, Classical: /classical/i, Metal: /metal/i,
+  Folk: /folk/i, Gospel: /christ|gospel/i, 'K-Pop': /asia|k-?pop/i, Soundtrack: /film|game/i, Kids: /kid/i, World: /world|arab|indian|brazil/i };
+export async function deezerGenreId(name) {
+  const re = DZ_GENRE[name]; if (!re) return null;
+  const list = await deezer('genre', {}, 30 * DAY, true).catch(() => []);
+  return list.find(g => g.id && re.test(g.name))?.id ?? null;
+}
+// Top songs in a genre right now
+export async function deezerGenreTop(name, limit = 40) {
+  const id = await deezerGenreId(name); if (id == null) return [];
+  return (await deezer(`chart/${id}/tracks`, { limit }, DAY, true).catch(() => [])).map(songFromDeezer);
+}
+// Most popular artists in a genre (for the "pick your favourites" prompt)
+export async function deezerGenreArtists(name, limit = 10) {
+  const id = await deezerGenreId(name); if (id == null) return [];
+  let res = await deezer(`chart/${id}/artists`, { limit }, 3 * DAY, true).catch(() => []);
+  if (!res.length) res = await deezer(`genre/${id}/artists`, {}, 3 * DAY, true).catch(() => []);
+  return res.slice(0, limit).map(a => ({ name: a.name, picture: a.picture_xl || a.picture_big || a.picture_medium || '' }));
+}
 export async function deezerCover(t) {
   const q = `artist:"${mainArtist(t.artist)}" track:"${String(t.title).replace(/\s*[\(\[].*?[\)\]]/g, '')}"`;
   let res = await deezer('search', { q, limit: 5 });

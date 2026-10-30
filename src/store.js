@@ -182,6 +182,14 @@ export async function undoRemoveFromPlaylist(r) {
   if (!p.trackIds.includes(r.id)) p.trackIds.splice(Math.max(0, Math.min(r.index, p.trackIds.length)), 0, r.id);
   await savePlaylist(p);
 }
+// Swap a playlist's songs for new ones (the BAZINGA! mix), cleaning up songs nothing else uses
+export async function replacePlaylistTracks(pid, ids) {
+  const p = lib.playlists.get(pid); if (!p) return;
+  const old = p.trackIds;
+  p.trackIds = [...new Set(ids)];
+  await savePlaylist(p);
+  await gc(old.filter(id => !p.trackIds.includes(id) && lib.tracks.get(id)?.mix));
+}
 export async function deletePlaylist(pid) {
   const p = lib.playlists.get(pid); if (!p) return;
   lib.playlists.delete(pid); await db.del('playlists', pid); await markDeleted('p', pid);

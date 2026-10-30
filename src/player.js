@@ -4,11 +4,12 @@ import { lib } from './store.js';
 import * as store from './store.js';
 import * as yt from './youtube.js';
 import { emit, toast, debounce } from './util.js';
+import { logoSrc } from './ui.js';
 
 export const P = {
   queue: [],          // [{id, user}]
   cursor: -1,
-  mode: 'audio',      // 'video' | 'audio'
+  mode: 'video',      // 'video' | 'audio' — music video is the default
   preferOffline: true,
   shuffle: false,
   repeat: 'off',      // off | all | one
@@ -55,6 +56,8 @@ export const current = () => (P.cursor >= 0 && P.queue[P.cursor]) ? lib.tracks.g
 export async function restore() {
   const s = await kv.get('player');
   if (s) { Object.assign(P, s, { playing: false }); resumeAt = +s.time || 0; P.time = resumeAt; }
+  // v1.6: music video is the default for everyone (once); switching to Audio afterwards is remembered
+  if (!(await kv.get('videoDefault'))) { P.mode = 'video'; await kv.set('videoDefault', 1); persist(); }
   P.queue = P.queue.filter(q => lib.tracks.has(q.id));
   if (P.cursor >= P.queue.length) P.cursor = P.queue.length - 1;
   const t = current();
@@ -339,6 +342,13 @@ export function addToQueue(ids, playNext = false) {
   persist(); changed();
   toast(ids.length === 1 ? (playNext ? 'Playing next' : 'Added to queue') : `${ids.length} songs added to queue`);
 }
+// Quietly add songs to the end of the queue (used while the BAZINGA! mix is still being built)
+export function appendToQueue(ids) {
+  ids = [].concat(ids).filter(id => lib.tracks.has(id) && !P.queue.some(q => q.id === id));
+  if (!ids.length) return;
+  P.queue.push(...ids.map(id => ({ id, user: false })));
+  persist(); changed();
+}
 export function removeFromQueue(i) {
   if (i === P.cursor) return;
   P.queue.splice(i, 1);
@@ -369,8 +379,8 @@ export function setShuffle(v) {
 export function cycleRepeat() { P.repeat = { off: 'all', all: 'one', one: 'off' }[P.repeat]; persist(); changed(); }
 export function setVolume(v) { P.volume = v; duckLevel = 1; applyVol(); persist(); changed(); }
 function applyVol() { audio.volume = outVol(); try { ytPlayer?.setVolume?.(outVol() * 100); } catch { } }
-// Quietly dip the music (voice assistant) without touching the saved volume
-export function duck(on) { duckLevel = on ? Math.min(1, 0.25 / Math.max(P.volume, 0.01)) : 1; applyVol(); }
+// Silence the music while the voice assistant is on screen, without touching the saved volume
+export function duck(on) { duckLevel = on ? 0 : 1; applyVol(); }
 
 // Switch between music video and audio-only version, keeping position
 export async function setMode(mode) {
@@ -404,7 +414,7 @@ function setMediaSession(t) {
   try {
     navigator.mediaSession.metadata = new MediaMetadata({
       title: t.title, artist: t.artist, album: t.album || '',
-      artwork: t.artwork && !t.artwork.startsWith('data:') ? [{ src: t.artwork, sizes: '600x600', type: 'image/jpeg' }] : [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }]
+      artwork: t.artwork && !t.artwork.startsWith('data:') ? [{ src: t.artwork, sizes: '600x600', type: 'image/jpeg' }] : [{ src: logoSrc('icon-512'), sizes: '512x512', type: 'image/png' }]
     });
   } catch { }
 }

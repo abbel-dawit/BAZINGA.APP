@@ -61,9 +61,70 @@ const I = {
   lock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
   unlock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.6-1.7"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
   qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  thumbUp: '<path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M7 10l4-7a2.5 2.5 0 0 1 3 2.6L13.4 9H19a2 2 0 0 1 2 2.3l-1.3 8A2 2 0 0 1 17.7 21H7"/>',
+  thumbDown: '<path d="M17 14V3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1z"/><path d="M17 14l-4 7a2.5 2.5 0 0 1-3-2.6l.6-3.4H5a2 2 0 0 1-2-2.3l1.3-8A2 2 0 0 1 6.3 3H17"/>',
+  sad: '<circle cx="12" cy="12" r="10"/><path d="M8 16.5c1-1.4 2.4-2.1 4-2.1s3 .7 4 2.1"/><circle cx="8.8" cy="9.6" r="1.1" fill="currentColor"/><circle cx="15.2" cy="9.6" r="1.1" fill="currentColor"/>'
 };
 export const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n] || ''}</svg>`;
+
+// ---------- Theme colour ----------
+// One accent colour drives the whole app: buttons, glows, the logo bolt, the app icon and the wordmark shadow.
+// The choice is mirrored to localStorage so index.html can paint the splash screen in it before the app loads.
+export const THEMES = [
+  ['volt', 'Volt', [255, 214, 10]],
+  ['mint', 'Mint', [16, 185, 129]], ['violet', 'Violet', [139, 61, 255]], ['indigo', 'Indigo', [99, 102, 241]],
+  ['ocean', 'Ocean', [47, 128, 255]], ['cyan', 'Cyan', [6, 182, 212]], ['gold', 'Gold', [245, 180, 0]],
+  ['sunset', 'Sunset', [255, 106, 43]], ['rose', 'Rose', [236, 72, 153]], ['crimson', 'Crimson', [239, 68, 68]]
+];
+let themeName = 'volt';
+try { const t = localStorage.getItem('bz_theme'); if (THEMES.some(x => x[0] === t)) themeName = t; } catch { }
+export const currentTheme = () => themeName;
+// Path of a logo/app icon in the current colour (the original yellow files are the "volt" set)
+export const logoSrc = (n = 'icon-192', name = themeName) => name === 'volt' ? `icons/${n}.png` : `icons/theme/${name}-${n}.png`;
+function hsl([r, g, b]) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  if (!d) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [(h * 60 + 360) % 360, s, l];
+}
+function rgbOf([h, s, l]) {
+  const c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+  const [r, g, b] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+  return [r, g, b].map(v => Math.round((v + m) * 255));
+}
+export function themeVars(name) {
+  const rgb = (THEMES.find(t => t[0] === name) || THEMES[0])[2];
+  const [h, s, l] = hsl(rgb);
+  const two = name === 'volt' ? [255, 149, 0] : rgbOf([(h - 18 + 360) % 360, Math.min(1, s * 1.05), l * 0.82]);
+  const hi = rgbOf([h, s, Math.min(0.85, l + 0.12)]);
+  const hex = c => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+  return { '--volt': hex(rgb), '--volt-rgb': rgb.join(' '), '--volt-2': hex(two), '--volt-2-rgb': two.join(' '), '--volt-hi': hex(hi) };
+}
+export function applyTheme(name) {
+  if (!THEMES.some(t => t[0] === name)) name = 'volt';
+  themeName = name;
+  const vars = themeVars(name);
+  try { localStorage.setItem('bz_theme', name); localStorage.setItem('bz_theme_vars', JSON.stringify(vars)); } catch { }
+  const root = document.documentElement;
+  for (const [k, v] of Object.entries(vars)) root.style.setProperty(k, v);
+  root.style.setProperty('--logo-url', `url("${new URL(logoSrc('icon-192'), location.href).href}")`);
+  root.dataset.theme = name;
+  // Every logo already on the page
+  document.querySelectorAll('img').forEach(img => {
+    const m = (img.getAttribute('src') || '').match(/^icons\/(?:theme\/[a-z]+-)?(icon-192|icon-512|app-192|app-512)\.png/);
+    if (m) img.setAttribute('src', logoSrc(m[1]));
+  });
+  // Tab icon, Home Screen icon (iPhone reads it when you tap "Add to Home Screen") and the install manifest
+  const set = (sel, href) => { const l = document.querySelector(sel); if (l) l.setAttribute('href', href); };
+  set('link[rel="apple-touch-icon"]', logoSrc('apple-touch-icon') + '?v=4');
+  set('link[rel="icon"][sizes="32x32"]', logoSrc('favicon-32'));
+  set('link[rel="icon"][sizes="16x16"]', logoSrc('favicon-16'));
+  set('link[rel="manifest"]', name === 'volt' ? 'manifest.webmanifest' : `icons/theme/manifest-${name}.webmanifest`);
+  emit('theme', name);
+}
 
 // Ask image servers for the size we actually show (a 42px row thumbnail doesn't need a 1000px image)
 export function sized(src, px) {
@@ -226,20 +287,20 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
   for (const t of tracks) { const y = t.year || yearOf(t.releaseDate); if (y) ym.set(y, (ym.get(y) || 0) + 1); }
   const years = [...ym.entries()].sort((a, b) => b[0] - a[0]);
   const active = (f.genres?.length || 0) + (f.years?.length || 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  // Sort options open as an on-screen panel, just like Filters (no system picker)
+  const sortOpts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
+    ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
+  const curSort = sortOpts.find(([v]) => v === (f.sort || '')) || sortOpts.find(([v]) => v === 'added');
   return `<div class="filters">
     <div class="filter-top">
       <div class="fsearch"><label class="searchbox sm">${icon('search')}<input data-f="q" placeholder="Filter songs" value="${esc(f.q || '')}" enterkeyhint="search" aria-label="Filter songs"></label>
         <button class="round-search" data-act="filter-go" aria-label="Search these songs" title="Search">${icon('search')}</button></div>
       <div class="fctl"><button class="chip ${f.open ? 'on' : ''}" data-act="toggle-filters">${icon('filter')}Filters${active ? ` <b>${active}</b>` : ''}</button>
-      ${showSort ? (() => {
-        const opts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
-          ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
-        const cur = opts.find(([v]) => v === (f.sort || '')) || opts.find(([v]) => v === 'added');
-        // The label + arrow are drawn centred together; the real <select> sits invisibly on top to open the list
-        return `<label class="sort-pick"><span class="sort-face"><span class="sort-lbl">${esc(cur[1])}</span>${icon('down')}</span>
-          <select data-f="sort" aria-label="Sort">${opts.map(([v, l]) => `<option value="${v}" ${cur[0] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
-      })() : ''}</div>
+      ${showSort ? `<button class="chip sort-chip ${f.sortOpen ? 'on' : ''}" data-act="toggle-sort" aria-expanded="${!!f.sortOpen}" aria-label="Sort: ${esc(curSort[1])}"><span class="sort-lbl">${esc(curSort[1])}</span>${icon('down')}</button>` : ''}</div>
     </div>
+    ${showSort && f.sortOpen ? `<div class="filter-panel sort-panel"><div class="fp-sec"><div class="fp-h">Sort by</div><div class="chips">
+      ${sortOpts.map(([v, l]) => `<button class="chip ${curSort[0] === v ? 'on' : ''}" data-act="f-sort" data-v="${v}" aria-pressed="${curSort[0] === v}">${curSort[0] === v ? icon('check') : ''}${esc(l)}</button>`).join('')}
+    </div></div></div>` : ''}
     ${f.open ? `<div class="filter-panel">
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
         ${genres.length ? genres.map(([g, n]) => `<button class="chip ${f.genres?.includes(g) ? 'on' : ''}" data-act="f-genre" data-g="${esc(g)}">${esc(g)} <small>${n}</small></button>`).join('') : '<span class="muted">Genres appear as songs get matched.</span>'}
@@ -257,7 +318,7 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
 }
 
 export function empty(title, body, cta = '') {
-  return `<div class="empty"><img src="icons/icon-192.png" alt="" class="empty-bolt"><h3>${title}</h3><p class="muted">${body}</p>${cta}</div>`;
+  return `<div class="empty"><img src="${logoSrc()}" alt="" class="empty-bolt"><h3>${title}</h3><p class="muted">${body}</p>${cta}</div>`;
 }
 
 // Liked Songs cover: a proper, full-size heart
@@ -265,5 +326,5 @@ export const likedCover = (cls = '') => `<div class="cover liked-cover heart-cov
 
 // Big, centered, animated loader
 export function loader(text = '', cls = '') {
-  return `<div class="bz-loader ${cls}" role="status" aria-live="polite"><div class="bz-orb"><span></span><span></span><span></span><img src="icons/icon-192.png" alt=""></div>${text ? `<p>${esc(text)}</p>` : ''}</div>`;
+  return `<div class="bz-loader ${cls}" role="status" aria-live="polite"><div class="bz-orb"><span></span><span></span><span></span><img src="${logoSrc()}" alt=""></div>${text ? `<p>${esc(text)}</p>` : ''}</div>`;
 }

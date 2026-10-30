@@ -49,6 +49,14 @@ css_hash = hashlib.sha1((ROOT / 'css' / 'app.css').read_bytes()).hexdigest()[:10
 (ROOT / 'version.json').write_text(json.dumps({'v': js_hash + '.' + css_hash}) + '\n')
 print('wrote version.json')
 
+# One install manifest per theme colour (the app swaps to it, so "Add to Home Screen" uses the chosen colour's icon)
+man = json.loads((ROOT / 'manifest.webmanifest').read_text())
+for name in ['mint', 'violet', 'indigo', 'ocean', 'cyan', 'gold', 'sunset', 'rose', 'crimson']:
+    m = dict(man, start_url='../', scope='../', id='./')
+    m['icons'] = [dict(i, src=f"{name}-{i['src'].split('/')[-1].split('?')[0]}") for i in man['icons']]
+    (ROOT / 'icons' / 'theme' / f'manifest-{name}.webmanifest').write_text(json.dumps(m, indent=2) + '\n')
+print('wrote theme manifests')
+
 # Standalone privacy page (Google's OAuth review needs a normal URL for it)
 import subprocess, html as _html
 try:

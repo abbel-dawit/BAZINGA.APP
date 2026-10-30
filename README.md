@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v22`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v31`) so phones fetch the new version.
 
 ## Features
 
@@ -34,6 +34,21 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Offline**: add music files you own; they're matched to your songs automatically, grouped into albums, and play without internet. The app itself also opens offline.
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
+
+### New in v1.6
+- **Theme colors**: Volt (the original yellow), Mint, Violet, Indigo, Ocean, Cyan, Gold, Sunset, Rose and Crimson. Pick one on the welcome card or in Settings → You. Buttons, glows, the logo bolt, the wordmark shadow, the tab icon and the Home Screen icon all follow it, and it's remembered on the device. (Recolored icons live in `icons/theme/`; `build.py` writes one install manifest per color.)
+- **Splash screen** in your theme color while the app starts.
+- **BAZINGA! button** on Home (replaces "Ask BAZINGA!" there): builds a fresh "BAZINGA! Mix" playlist of songs you don't have yet from your top 50 artists (taking turns, #1 first), then today's top songs in your top genres. The music starts as soon as the first few artists are in; the rest fills in behind it. New listeners pick favorite genres, then favorite artists (top 10 per genre) first.
+- **Music video is the default** playback version (Audio is still one tap away and remembered).
+- **Video dock (computers)**: the full-screen button uses the expand icon; the resize button is an arrow that points up when the video is small and down when it's big (size remembered). A soft loading veil shows while a song starts. Back to top sits to the left of the video.
+- **Home**: the clock sits in the top-right corner of the card.
+- **Search**: songs are listed first under All.
+- **Sort** opens an on-screen list like Filters instead of the system picker.
+- **"Do you love BAZINGA!?"** popup: every 10th time the app is opened. Thumbs up → a thank you and Buy Me a Coffee (big theme-bordered "Not now"); thumbs down → a sad face and it closes.
+- **Home buttons**: BAZINGA! is the main button (then Search and Import with an empty library; then Play Liked Songs and Shuffle everything once you have music).
+- **New from your top artists**: 10 in a sideways row with *See more*, which opens the full list 25 at a time (top 6 artists looked up first, the next 14 in the background).
+- **Mic buttons** always go back to normal when the assistant closes (Safari kept the tap/hover look stuck). "Hey Bazinga" background listening is now a small dot on the mic.
+- **Voice assistant**: loud chime when it starts listening; music stays silent until the assistant closes; closes after ~3.5 s if it hears nothing; mic buttons show a theme-colored ring while it's open and go back to normal after. iPhone now speaks with the phone's own (Siri-quality) voice instead of Apple's robotic "compact" voices, in one smooth sentence, after switching audio back from "phone call" mode.
 
 ### New in v1.5
 - **No more logins.** Google / Discord / email sign-in is gone. The welcome screen is one tap (accept the terms → *Let's go*), with *I use BAZINGA! on another device* for joining an existing library.
