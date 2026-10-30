@@ -4122,6 +4122,29 @@ window.visualViewport?.addEventListener('resize', pinSoon);
 window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
 const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
 
+// ---------- Installed iPhone app: fill the screen right to the bottom edge ----------
+// In some iOS versions a Home Screen web app reports a layout height shorter than the real screen
+// (by about the status-bar height), so everything pinned to the bottom floats with a gap under it.
+// Measure the missing strip and push the bottom bars (and the page) down by exactly that much.
+function fitStandalone() {
+  const ios = /iphone|ipod|ipad/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+  let gap = 0;
+  if (ios && standalone) {
+    const portrait = matchMedia('(orientation: portrait)').matches;
+    const full = portrait ? Math.max(screen.width, screen.height) : Math.min(screen.width, screen.height);
+    const have = Math.max(window.innerHeight, document.documentElement.clientHeight);
+    gap = Math.round(full - have);
+    if (gap < 4 || gap > 140) gap = 0; // only the known bug, never something else (keyboard, split view)
+  }
+  document.documentElement.style.setProperty('--pwa-gap', gap + 'px');
+  document.body.classList.toggle('pwa-gap', gap > 0);
+}
+fitStandalone();
+window.addEventListener('resize', () => setTimeout(fitStandalone, 120));
+window.addEventListener('orientationchange', () => setTimeout(fitStandalone, 350));
+window.addEventListener('pageshow', fitStandalone);
+
 // ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
 const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 let clockTimer = null;
@@ -4257,11 +4280,15 @@ function welcome(joinReq = null) {
   ob.innerHTML = `<div class="ob-card">
     <div class="ob-brand"><span class="logo-mark big"><img src="icons/icon-512.png" class="ob-logo" alt=""></span><h1 class="wordmark">BAZINGA!</h1></div>
     <p class="muted">${joinReq ? 'Almost there — this browser will sync with your music from your other device.' : 'Your Spotify & Apple Music library as YouTube music videos & audio — with a full player, albums, offline files and backups. No sign-up, no login.'}</p>
+    ${!joinReq ? `<form id="ob-form" class="ob-form" novalidate>
+      <label class="ob-pic" title="Add a profile picture (optional)"><input type="file" accept="image/*" id="ob-file" hidden><div class="avatar xl" id="ob-avatar">${icon('user')}</div><span>Add photo</span></label>
+      <label class="fld"><span>Pick a username</span><input name="username" id="ob-name" maxlength="30" autocomplete="nickname" placeholder="e.g. thunderkid" enterkeyhint="go"></label>
+    </form>` : ''}
     <label class="agree ob-terms"><input type="checkbox" id="ob-terms"><span>I agree to the <a class="lnk" href="#" id="ob-legal">Privacy Policy & Terms of Use</a>. BAZINGA! is provided as-is and isn't liable for anything.</span></label>
     <button class="btn primary big" id="ob-go">${joinReq ? `${icon('link')}Sync this browser` : `Let's go ${icon('play')}`}</button>
     ${!joinReq && canSync ? `<button class="btn" id="ob-link">${icon('qr')}I use BAZINGA! on another device</button>` : ''}
     ${!joinReq ? `<button class="btn ghost" id="ob-restore">${icon('restore')}Restore from a backup file</button>` : ''}
-    <p class="tiny muted">Everything is saved on this device. You can add your name and photo later in Settings.</p>
+    <p class="tiny muted">No email, no password — your name and music are saved on this device.</p>
     <p class="copyright">© 2026 Abbel Dawit · BAZINGA!</p>
   </div>`;
   $('#ob-legal').onclick = e => { e.preventDefault(); showLegal(); };
@@ -4270,8 +4297,18 @@ function welcome(joinReq = null) {
     $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600);
     toast('Please accept the Privacy Policy & Terms first', 'err'); return false;
   };
-  const start = async req => {
-    profile = { username: 'Listener', picture: '', createdAt: Date.now(), updatedAt: 0, termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
+  let pic = '';
+  const fileIn = $('#ob-file');
+  if (fileIn) fileIn.onchange = async e => { const f = e.target.files[0]; if (!f) return; pic = await imageToDataURL(f, 256); $('#ob-avatar').innerHTML = `<img src="${pic}" alt="">`; };
+  const nameOk = () => {
+    const i = $('#ob-name'); if (!i) return true;
+    if (i.value.trim()) return true;
+    i.focus(); i.closest('.fld').classList.add('shake'); setTimeout(() => i.closest('.fld')?.classList.remove('shake'), 600);
+    toast('Pick a username first', 'err'); return false;
+  };
+  $('#ob-form')?.addEventListener('submit', e => { e.preventDefault(); $('#ob-go').click(); });
+  const start = async (req, name = '') => {
+    profile = { username: name || 'Listener', picture: name ? pic : '', createdAt: Date.now(), updatedAt: name ? Date.now() : 0, termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
     await kv.set('profile', profile);
     emit('dirty', 'profile');
     location.hash = '#/home';
@@ -4279,7 +4316,7 @@ function welcome(joinReq = null) {
     await showApp();
     if (req) joinFlow({ ...req, mode: 'replace' });
   };
-  $('#ob-go').onclick = () => { if (termsOk()) start(joinReq); };
+  $('#ob-go').onclick = () => { if (!joinReq && !nameOk()) return; if (termsOk()) start(joinReq, joinReq ? '' : $('#ob-name').value.trim().slice(0, 30)); };
   const lk = $('#ob-link');
   if (lk) lk.onclick = async () => { if (!termsOk()) return; const req = await enterCodeDialog(); if (req) start(req); };
   const rs = $('#ob-restore');
@@ -5173,6 +5210,16 @@ async function addLocalFiles(files, { albumHint } = {}) {
 }
 
 // ---------- SETTINGS ----------
+// Scroll so the section's title sits just under the sticky top bar + section tabs (nothing hidden)
+function jumpToSection(id, smooth) {
+  const el = document.getElementById(id), main = $('#main'); if (!el || !main) return;
+  // where the tabs end once they've stuck under the top bar (they sit lower before you scroll)
+  const tb = $('.topbar'), topEdge = Math.max(tb && getComputedStyle(tb).display !== 'none' ? tb.getBoundingClientRect().bottom : 0, main.getBoundingClientRect().top);
+  const covered = topEdge + ($('.set-jump')?.offsetHeight || 0) - 6;
+  const target = main.scrollTop + el.getBoundingClientRect().top - covered - 12;
+  main.scrollTo({ top: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' });
+  $$('.set-jump a').forEach(a => a.classList.toggle('on', a.dataset.jump === id));
+}
 async function vSettings([section] = []) {
   const lastB = await kv.get('lastBackup');
   const lastD = await kv.get('lastDownload');
@@ -5282,8 +5329,8 @@ async function vSettings([section] = []) {
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
   $('#set-wake')?.addEventListener('change', e => { saveSettings({ wake: e.target.checked }); setWake(e.target.checked); toast(e.target.checked ? 'Say "Hey Bazinga" any time ⚡' : 'Hands-free listening is off', e.target.checked ? 'ok' : 'info'); });
-  $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); document.getElementById(a.dataset.jump)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
-  if (section) requestAnimationFrame(() => document.getElementById(section)?.scrollIntoView({ block: 'start' }));
+  $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
+  if (section) requestAnimationFrame(() => jumpToSection(section, false));
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });

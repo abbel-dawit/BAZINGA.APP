@@ -1554,3 +1554,43 @@ body.app-locked { overscroll-behavior: none; }
 .a2-never:hover { color: var(--text); }
 .modal-x { z-index: 3; opacity: .75; }
 .modal-x:hover { opacity: 1; }
+
+/* ================= v1.5.2 ================= */
+/* --- Installed iPhone app: close the strip some iOS versions leave under the bottom bars --- */
+:root { --pwa-gap: 0px; }
+body.pwa-gap #app { bottom: calc(-1 * var(--pwa-gap)); }
+body.pwa-gap .tabbar, body.pwa-gap #playerbar, body.pwa-gap #toasts, body.pwa-gap #to-top.show, body.pwa-gap #yt-dock:not(.in-np) { translate: 0 var(--pwa-gap); }
+body.pwa-gap .modal-wrap, body.pwa-gap #onboarding, body.pwa-gap #lock-layer, body.pwa-gap .menu-back { bottom: calc(-1 * var(--pwa-gap)); }
+body.pwa-gap #onboarding { height: auto; }
+body.pwa-gap .menu.sheet { translate: 0 var(--pwa-gap); }
+
+/* --- Back-to-top: always above the bottom menu (and the mini player) --- */
+@media (max-width: 700px) {
+  body:not(.has-track) #to-top { bottom: calc(var(--tab) + var(--safe-b) + 14px); }
+  body.has-track #to-top { bottom: calc(var(--tab) + var(--bar) + var(--safe-b) + 16px); }
+  #to-top { right: 16px; width: 44px; height: 44px; }
+}
+
+/* --- Toasts sit low, just above whatever is at the bottom --- */
+#toasts { bottom: calc(var(--bar) + 10px); }
+body:not(.has-track) #toasts { bottom: 18px; }
+@media (max-width: 700px) {
+  #toasts { bottom: calc(var(--tab) + var(--bar) + var(--safe-b) + 10px); }
+  body:not(.has-track) #toasts { bottom: calc(var(--tab) + var(--safe-b) + 10px); }
+}
+
+/* --- Lock button: yellow like the coffee and mic, tucked right next to the coffee cup --- */
+.topbar .lock-top { color: var(--volt) !important; margin-right: -10px; }
+.topbar .lock-top .ic { width: 22px; height: 22px; }
+
+/* --- Popups truly centred (sync / link dialog included) --- */
+.modal-wrap { display: grid; place-items: center; align-content: center; justify-content: center; }
+.modal { margin: auto; }
+.link-dlg { justify-items: center; }
+.link-dlg > * { width: 100%; }
+.link-dlg .qr-box { width: min(240px, 64vw); }
+
+/* --- Welcome: name + photo --- */
+.ob-form { display: grid; gap: 14px; justify-items: center; width: 100%; }
+.ob-form .fld { width: 100%; text-align: left; }
+.set-jump a.on { border-color: var(--volt); color: var(--volt); }
