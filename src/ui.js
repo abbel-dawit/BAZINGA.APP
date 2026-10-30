@@ -137,10 +137,26 @@ export function sized(src, px) {
     .replace(/\/(\d+)x\1-000000-80-0-0\.jpg$/, `/${Math.max(d, 250)}x${Math.max(d, 250)}-000000-80-0-0.jpg`) // Deezer
     .replace(/\/vi\/([\w-]{11})\/(hq|maxres|sd)default\.jpg$/, (m, id) => `/vi/${id}/${d <= 120 ? 'mqdefault' : 'hqdefault'}.jpg`); // YouTube
 }
+// Pictures this device has already loaded (remembered between visits): they're shown straight away,
+// no fade, no lazy loading — the browser / offline cache has them. Everything else shows the song's
+// letter on its own colour until the picture has arrived, then fades in.
+const seenImg = new Set();
+try { for (const u of JSON.parse(localStorage.getItem('bz_imgs') || '[]')) seenImg.add(u); } catch { }
+let saveImgT = null;
+window.__bzImg = img => {
+  img.parentNode?.classList.add('ld');
+  const u = img.getAttribute('src'); if (!u || seenImg.has(u)) return;
+  seenImg.add(u);
+  clearTimeout(saveImgT); saveImgT = setTimeout(() => { try { localStorage.setItem('bz_imgs', JSON.stringify([...seenImg].slice(-4000))); } catch { } }, 1500);
+};
 export function cover(src, label, cls = '') {
   const px = /\bsm\b|qt-art|pb-art/.test(cls) ? 64 : /np-art|hero/.test(cls) ? 600 : 200;
   const eager = /hero|np-art|pb-art/.test(cls);
-  if (src) return `<div class="cover ${cls}"><img src="${esc(sized(src, px))}" alt="" ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" onerror="this.parentNode.classList.add('noimg');this.remove()"><span>${esc((label || '?')[0])}</span></div>`;
+  const letter = esc((label || '?')[0].toUpperCase());
+  if (src) {
+    const u = sized(src, px), known = seenImg.has(u);
+    return `<div class="cover ${cls} ${known ? 'ld known' : ''}" style="--c:${hashColor(label)}"><img src="${esc(u)}" alt="" ${eager || known ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" onload="__bzImg(this)" onerror="this.parentNode.classList.add('noimg');this.remove()"><span>${letter}</span></div>`;
+  }
   return `<div class="cover noimg ${cls}" style="--c:${hashColor(label)}"><span>${esc((label || '?')[0].toUpperCase())}</span></div>`;
 }
 

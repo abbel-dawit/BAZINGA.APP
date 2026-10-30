@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v40`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v41`) so phones fetch the new version.
 
 ## Features
 
@@ -53,7 +53,7 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **No more "Hey Bazinga" background listening**: the microphone is only on while the assistant is open.
 - **Pull down to close** the full-screen player from anywhere at the top of it (top bar, cover, song info, controls, or the top part of the video). It follows your finger and springs back if you don't pull far enough.
 - **Save the queue as a playlist** (+ in the queue card), only for a BAZINGA! mix or a shuffled queue.
-- **Phones turned sideways**: the sidebar is a single column of icons that always fits the screen's height (iPhone Safari toolbars included), song times sit together on the right ("1:19 / 3:49"), a compact home card, a smaller corner video, and a full-screen player with the video on the left and the title, like, artist, timeline and controls on the right (no scrolling needed). Phones upright: the normal video size. Smaller clock on small screens; evenly spaced top-bar icons; back to top sits above the corner video again; the BAZINGA! button's bolt stays still.
+- **Phones turned sideways**: the sidebar is a single column of normal-sized icons that scrolls up and down, song times sit together on the right ("1:19 / 3:49"), a compact home card, a smaller corner video, and a full-screen player with the video on the left and the title, like, artist, timeline and controls on the right (no scrolling needed). Phones upright: the normal video size. Smaller clock on small screens; evenly spaced top-bar icons; back to top sits above the corner video again; the BAZINGA! button's bolt stays still.
 - **Settings tabs** follow you as you scroll (the section you're on is highlighted; none at the top).
 - **Phone menus** (the song ⋯ sheet and others) have a handle and close when you pull them down.
 - **No more previews**: YouTube matching skips previews, snippets, teasers and Shorts (by title and by length compared with the real song), and earlier matches that were previews are looked up again.
@@ -61,6 +61,10 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Sideways phones**: the genre / year / length pills sit at the far right under the heart, next to the album.
 - **Big libraries sync reliably**: ntfy.sh's free tier only accepts files up to 2 MB. The library is always compressed (gzip where the browser has it, BAZINGA!'s own LZ compression otherwise, e.g. iPhones before iOS 16.4), YouTube matches travel as ids only, and anything over 1.5 MB goes in parts that download side by side. If the relay still says "too big", the parts shrink automatically (down to 64 KB); if its storage is full, sync quietly retries later. The unchanged library is re-sent only every ~2.3 h, using less of the relay's storage.
 - **Playlist page**: one ⋯ menu (on phones it also holds Find YouTube matches / Save to YouTube).
+- **Live sync between devices**: a like/unlike, playlist change, new song or setting goes to your other devices within seconds, as a small change (usually a few hundred bytes) instead of the whole library; open devices hear about it straight away over a live connection to the relay. The full library is re-sent every couple of hours so devices that were closed catch up.
+- **Continue on another device**: the song, the spot in it and the queue go to your other devices when you pause, switch songs (at most every 3 minutes) or leave the app. A device that isn't playing anything picks it up and offers "Continue … ▶".
+- **Covers**: the song's letter on its own colour shows until the picture arrives, then it fades in; pictures that loaded once show instantly afterwards (remembered, and kept in the offline picture cache).
+- **BAZINGA! button**: the bolt is drawn in the page (no picture to load), so it never flickers when you come back to Home.
 - **Sync now includes settings and connections**: API keys, tokens, servers, theme, playback options, Spotify/YouTube connections, YouTube playlist links and your taste picks. Each setting remembers when you changed it and the newest change wins. A device that never set something can't wipe it, and removals only spread when you disconnect on purpose.
 - **Voice assistant**: loud chime when it starts listening; music stays silent until the assistant closes; closes after ~3.5 s if it hears nothing; mic buttons show a theme-colored ring while it's open and go back to normal after. iPhone now speaks with the phone's own (Siri-quality) voice instead of Apple's robotic "compact" voices, in one smooth sentence, after switching audio back from "phone call" mode.
 

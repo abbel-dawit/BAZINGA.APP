@@ -151,7 +151,7 @@ section { margin-bottom: 8px; }
 .cover { position: relative; aspect-ratio: 1; border-radius: var(--r-sm); overflow: hidden; background: var(--c, var(--surface3)); flex: none; display: grid; place-items: center; }
 .cover img { width: 100%; height: 100%; object-fit: cover; display: block; position: absolute; inset: 0; }
 .cover span { font-family: var(--display); font-weight: 800; font-size: 2.2em; color: rgb(255 255 255 / .85); }
-.cover:not(.noimg) span { visibility: hidden; }
+.cover.ld:not(.noimg) span { visibility: hidden; }
 .cover.sm { width: 42px; border-radius: 6px; }
 .cover.sm span { font-size: 18px; }
 .cover.round { border-radius: 50%; }
@@ -2012,3 +2012,32 @@ body.np-pulling #np-head::before { opacity: 1; }
 .set-jump a:focus:not(:focus-visible) { outline: none; }
 .set-jump a:not(.on) { color: var(--text); border-color: var(--line); }
 .set-jump a.on { background: rgb(var(--volt-rgb) / .12); }
+
+/* ===== v1.6.9 ===== */
+/* --- Sideways phones: the sidebar keeps normal-sized buttons and scrolls up and down to reach them all
+       (a soft fade at the bottom/top shows there's more) --- */
+@media (max-height: 600px) and (orientation: landscape) and (min-width: 701px) {
+  .sidebar { justify-content: flex-start !important; overflow-y: auto !important; overflow-x: hidden !important; gap: 6px !important;
+    overscroll-behavior: contain; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(transparent 0, #000 14px, #000 calc(100% - 22px), transparent 100%); mask-image: linear-gradient(transparent 0, #000 14px, #000 calc(100% - 22px), transparent 100%);
+    padding-bottom: 22px !important; }
+  .sidebar::-webkit-scrollbar { display: none; }
+  .sidebar .brand, .sidebar .nav a, .sidebar .ask-btn, .sidebar .lock-side, .sidebar .profile-chip { flex: none !important; height: 46px !important; max-height: none !important; width: 50px !important; }
+  .sidebar .brand { height: 44px !important; }
+  .sidebar .brand img, .sidebar .brand .logo-mark { height: 32px !important; width: 32px !important; max-height: none !important; }
+  .sidebar .nav a .ic, .sidebar .ask-btn .ic, .sidebar .lock-side .ic { width: 22px !important; height: 22px !important; }
+  .sidebar .profile-chip .avatar { width: 34px !important; height: 34px !important; max-height: none !important; }
+}
+
+/* --- Covers: letter + colour until the picture arrives, then a quick fade (instant for pictures seen before) --- */
+.cover img { opacity: 0; transition: opacity .22s ease; }
+.cover.ld img { opacity: 1; }
+.cover.known img { transition: none; }
+.cover:not(.ld) { container-type: inline-size; }
+.cover:not(.ld) span { font-size: 2.2em; font-size: 50cqi; line-height: 1; }
+
+/* --- BAZINGA! button bolt (drawn in the page) --- */
+.btn.bz-btn svg.bz-bolt { width: 22px; height: 22px; margin: -3px 0 -3px -4px; flex: none; overflow: visible; animation: none !important; transition: none !important; filter: drop-shadow(0 0 5px rgb(var(--volt-rgb) / .55)); }
+.btn.bz-btn.primary svg.bz-bolt { filter: none; }
+.btn.bz-btn.primary svg.bz-bolt path:first-child { fill: #fff; }
+.btn.bz-btn.primary svg.bz-bolt path:nth-child(3) { fill: rgb(0 0 0 / .18); }

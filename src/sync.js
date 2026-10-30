@@ -7,13 +7,17 @@
 // The whole library (songs, likes, playlists, albums, YouTube matches, name & picture) is
 // compressed and ENCRYPTED on the device with a key derived from the sync key, then posted to a
 // topic whose name is a one-way hash of that key. ntfy.sh only ever sees unreadable bytes.
-// Copies on the relay last about 3 hours, so every open device re-posts its library at least once
-// an hour, and devices merge whatever is newer (newest edit wins per item, likes merge
-// separately, deletions are remembered). Your own device always keeps the full library.
+// Copies on the relay last about 3 hours. Changes (a like, a playlist edit, a setting…) go out right away
+// as a small "delta" with only what changed, and every linked device that's open hears about it within
+// seconds (live connection to the relay). The whole library is re-sent every couple of hours so a
+// complete copy is always there for devices that were closed. Devices merge whatever is newer
+// (newest edit wins per item, likes merge separately, deletions are remembered).
+// What's playing (song, spot, queue) travels too, so you can continue on another device.
 import { db, kv, SYNC_KV, onSyncedKvChange } from './db.js';
 import { emit, on, debounce } from './util.js';
 import * as store from './store.js';
 import * as backup from './backup.js';
+import * as player from './player.js';
 
 const S = { status: 'off', lastSync: 0, error: '', rev: 0 };
 export const state = () => S;
@@ -32,6 +36,8 @@ export const deviceName = () => {
   const br = /EdgA?\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /OPR\//.test(ua) ? 'Opera' : /Firefox\/|FxiOS/.test(ua) ? 'Firefox' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
   return `${br} on ${os}`;
 };
+// A random id for this browser, so it can tell its own messages and "now playing" from other devices'
+const DEV = (() => { try { let d = localStorage.getItem('bz_dev'); if (!d) { d = Math.random().toString(36).slice(2, 12); localStorage.setItem('bz_dev', d); } return d; } catch { return 'x' + Math.random().toString(36).slice(2, 10); } })();
 function setStatus(status, error = '') { S.status = status; S.error = error; if (status === 'synced') S.lastSync = Date.now(); emit('sync', S); }
 
 // ---------- keys & links ----------
@@ -152,6 +158,7 @@ async function postLibrary(topic, bytes) {
       for (let i = 0; i < n; i++) {
         step(`Sending your library… part ${i + 1} of ${n}`, 92 + 7 * i / n);
         res = await relayPost(topic, new Blob([bytes.subarray(i * PART, (i + 1) * PART)]), { filename: `library.${set}.${i + 1}of${n}.bz`, title: deviceName() });
+        if (res?.id) mine.add(res.id);
       }
       return res;
     } catch (e) {
@@ -252,6 +259,26 @@ function mergeKv(L = {}, R = {}) {
   for (const [k, r] of Object.entries(R)) { const l = out[k]; if (!l || (r.ts || 0) > (l.ts || 0)) out[k] = r; }
   return out;
 }
+
+// ---------- deltas: only what changed since the last send ----------
+function changesSince(snap, t) {
+  const after = x => x > t;
+  const d = {
+    t: 'delta', dev: DEV,
+    tracks: snap.tracks.filter(x => after(Math.max(x.updatedAt || 0, x.likeTs || 0))),
+    playlists: snap.playlists.filter(x => after(x.updatedAt || x.createdAt || 0)),
+    albums: snap.albums.filter(x => after(x.updatedAt || x.savedAt || 0)),
+    tombstones: Object.fromEntries(['t', 'p', 'a'].map(k => [k, Object.fromEntries(Object.entries(snap.tombstones?.[k] || {}).filter(([, ts]) => after(ts)))])),
+    profile: snap.profile && after(snap.profile.updatedAt || 0) ? snap.profile : null,
+    settings: (() => { const st = snap.settings; if (!st) return null; const keys = Object.keys(st.ts).filter(k => after(st.ts[k])); return keys.length ? { values: Object.fromEntries(keys.map(k => [k, st.values[k]])), ts: Object.fromEntries(keys.map(k => [k, st.ts[k]])) } : null; })(),
+    kvx: Object.fromEntries(Object.entries(snap.kvx || {}).filter(([, r]) => after(r.ts || 0))),
+    ytcache: []
+  };
+  const empty = !d.tracks.length && !d.playlists.length && !d.albums.length && !['t', 'p', 'a'].some(k => Object.keys(d.tombstones[k]).length) && !d.profile && !d.settings && !Object.keys(d.kvx).length;
+  return empty ? null : d;
+}
+// The newer of two "now playing" states
+const newerNow = (a, b) => !a ? b : !b ? a : ((b.at || 0) > (a.at || 0) ? b : a);
 
 // ---------- merge ----------
 const has = v => v !== undefined && v !== null && v !== '';
@@ -365,18 +392,35 @@ export async function syncNow({ interactive = false } = {}) {
   S.cancelled = false;
   return running;
 }
+let playerWanted = false, lastPlayerPost = 0;
+const mine = new Set(); // ids of messages this device posted (no need to read them back)
+async function post(topic, bytesOrNote) {
+  const res = bytesOrNote; if (res?.id) { mine.add(res.id); if (mine.size > 200) mine.delete(mine.values().next().value); }
+  return res;
+}
 async function once() {
   keys = keys || await derive(link.secret);
   const topic = topicOf(keys.id);
+  const startedAt = Date.now();
   step('Checking for changes…', 6);
-  const msgs = (await relayList(topic, link.lastTs ? Math.max(0, link.lastTs - 5) : 'all')).filter(m => m.id !== link.lastId && (!link.seen || !link.seen.includes(m.id)));
-  // "Turn off sync everywhere" from another device
-  for (const m of msgs) if (!m.attachment && m.message && m.time * 1000 > (link.since || 0)) {
-    try { const note = await open(fromB64(m.message)); if (note?.t === 'off') { await leave(); emit('sync-removed'); return; } } catch { }
+  const msgs = (await relayList(topic, link.lastTs ? Math.max(0, link.lastTs - 5) : 'all'))
+    .filter(m => m.id !== link.lastId && !mine.has(m.id) && (!link.seen || !link.seen.includes(m.id)));
+  // Notes: "turn off sync everywhere", and small changes sent as text
+  const deltas = [];
+  for (const m of msgs) {
+    if (m.attachment) { if (m.attachment.name === 'delta.bz' && liveFile(m)) deltas.push({ m }); continue; }
+    if (!m.message || m.time * 1000 <= (link.since || 0) - 60e3) continue;
+    try {
+      const note = await open(fromB64(m.message));
+      if (note?.t === 'off' && m.time * 1000 > (link.since || 0)) { await leave(); emit('sync-removed'); return; }
+      if (note?.t === 'delta' && note.dev !== DEV) deltas.push({ m, data: note });
+    } catch { }
   }
-  const latest = [...msgs].reverse().find(liveFile);
+  const latest = [...msgs].reverse().find(m => liveFile(m) && m.attachment.name !== 'delta.bz');
   const local = await localSnap();
-  let base = local;
+  // what changed here since the last send (captured before anything from other devices is merged in)
+  const pending = link.deltaFrom ? changesSince(local, link.deltaFrom) : null;
+  let base = local, replaced = false, remoteNow = null;
   if (latest) {
     step('Downloading your music…', 15);
     const bytes = await fetchLibrary(topic, latest);
@@ -385,23 +429,77 @@ async function once() {
     if (sig()?.aborted) throw new DOMException('cancelled', 'AbortError');
     step('Merging with this device…', 75);
     // Joining with "use only the synced library": swap it in now that it has fully arrived
-    // (a cancelled download leaves this device untouched)
-    let replaced = false;
-    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; } // settings are never wiped, only merged
+    // (a cancelled download leaves this device untouched; settings are never wiped, only merged)
+    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; }
     base = merge(local, remote);
-    step('Saving to this device…', 85);
-    if (replaced || hash(base) !== hash(local)) await applyLocal(base);
-    link.hash = hash(remote); link.lastId = latest.id; link.lastTs = latest.time; link.pubTs = Math.max(link.pubTs || 0, latest.time);
+    if (remote.now?.dev !== DEV) remoteNow = newerNow(remoteNow, remote.now);
+    link.lastId = latest.id; link.pubTs = Math.max(link.pubTs || 0, latest.time);
   }
-  if (msgs.length) { link.seen = msgs.slice(-20).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
+  // small changes from other devices, oldest first
+  for (const d of deltas.sort((a, b) => a.m.time - b.m.time)) {
+    try {
+      const data = d.data || await open(await fetchFile(d.m));
+      if (data.dev === DEV) continue;
+      base = merge(base, data);
+      remoteNow = newerNow(remoteNow, data.now);
+    } catch (e) { if (isAbort(e)) throw e; }
+  }
+  if (replaced || hash(base) !== hash(local)) { step('Saving to this device…', 85); await applyLocal(base); }
+  // continue where you left off on another device (only if nothing is playing here)
+  if (remoteNow && remoteNow.dev !== DEV && (remoteNow.at || 0) > player.lastActive() && player.adopt(remoteNow)) emit('player-adopted', remoteNow);
+  if (msgs.length) { link.seen = msgs.slice(-30).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
+  link.deltaFrom = startedAt;
   await saveLink();
-  const h = hash(base);
-  const fresh = Date.now() / 1000 - (link.pubTs || 0) < 140 * 60; // the relay keeps copies ~3 h: refresh every ~2.3 h
-  if (h === link.hash && fresh) return;
-  step('Sending your library to your other devices…', 92);
-  const res = await postLibrary(topic, await seal(base));
-  link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
+  // ---- send ----
+  const now = Date.now() / 1000;
+  const stale = !link.pubTs || now - link.pubTs > 140 * 60 || !link.hash; // keep a full copy on the relay (copies last ~3 h)
+  const withNow = playerWanted && player.syncState().queue.length ? { ...player.syncState(), dev: DEV, device: deviceName() } : null;
+  if (stale) {
+    step('Sending your library to your other devices…', 92);
+    const full = { ...base, now: { ...player.syncState(), dev: DEV, device: deviceName() } };
+    const res = await post(topic, await postLibrary(topic, await seal(full)));
+    link.hash = hash(base); link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
+    playerWanted = false; lastPlayerPost = Date.now();
+  } else if (pending || withNow) {
+    step('Sending your changes…', 94);
+    const d = pending || { t: 'delta', dev: DEV, tracks: [], playlists: [], albums: [], tombstones: { t: {}, p: {}, a: {} }, ytcache: [] };
+    if (withNow) d.now = withNow;
+    const sealed = await seal(d), b64 = toB64(sealed);
+    // small enough for a plain message (no file storage used on the relay), otherwise a small file
+    const res = await post(topic, b64.length <= 3900 ? await postNote(topic, b64) : await relayPost(topic, new Blob([sealed]), { filename: 'delta.bz', title: deviceName() }));
+    if (res?.time) link.lastTs = Math.max(link.lastTs || 0, res.time);
+    if (withNow) { playerWanted = false; lastPlayerPost = Date.now(); }
+  }
   await saveLink();
+}
+// "What's playing" changed: send it to the other devices (right away when you pause or leave the app;
+// at most every 3 minutes for song changes — the free relay allows ~250 messages a day)
+let playerT = null;
+export function notePlayer(kind) {
+  if (!link) return;
+  playerWanted = true;
+  clearTimeout(playerT);
+  const wait = kind === 'track' ? Math.max(4000, lastPlayerPost + 180e3 - Date.now()) : 1500;
+  playerT = setTimeout(() => link && syncNow(), wait);
+}
+
+// ---------- live updates: hear about other devices' changes within seconds ----------
+let es = null;
+function listen() {
+  try { es?.close(); } catch { }
+  es = null;
+  if (!link || !window.EventSource) return;
+  (keys ? Promise.resolve(keys) : derive(link.secret)).then(k => {
+    keys = keys || k;
+    if (!link) return;
+    es = new EventSource(`${RELAY()}/${topicOf(keys.id)}/sse`);
+    let t = null;
+    es.onmessage = e => {
+      let m = null; try { m = JSON.parse(e.data); } catch { }
+      if (!m || m.event !== 'message' || mine.has(m.id)) return;
+      clearTimeout(t); t = setTimeout(() => link && syncNow(), 800);
+    };
+  }).catch(() => { });
 }
 
 // ---------- start / join / leave ----------
@@ -462,7 +560,7 @@ export async function redeemCode(code) {
   throw new Error('That code didn\'t work — check it, or make a new one on your other device (codes last 15 minutes).');
 }
 // Stop syncing on this device (its music stays here)
-export async function leave() { link = null; keys = null; await saveLink(); setStatus('off'); }
+export async function leave() { link = null; keys = null; try { es?.close(); } catch { } es = null; await saveLink(); setStatus('off'); }
 // Tell every linked device to stop syncing (each keeps its music)
 export async function removeEverywhere() {
   if (!link) return;
@@ -471,23 +569,25 @@ export async function removeEverywhere() {
   await leave();
 }
 
+// A change was made here: send it within a few seconds (several quick changes go out together)
 let lastPush = 0;
 const schedule = debounce(() => {
-  const wait = Math.max(0, lastPush + 20e3 - Date.now());
+  const wait = Math.max(0, lastPush + 8e3 - Date.now());
   setTimeout(() => { lastPush = Date.now(); syncNow(); }, wait);
-}, 5000);
+}, 2500);
 export async function restore() { link = await kv.get('syncLink'); if (link?.secret) start(); else setStatus('off'); }
 export function start() {
   if (!link) { setStatus('off'); return; }
   syncNow();
+  listen();
   if (started) return; started = true;
   on('dirty', why => { if (link && why !== 'synced') schedule(); });
   onSyncedKvChange(() => { if (link) schedule(); });
   document.addEventListener('visibilitychange', () => {
     if (!link) return;
-    if (document.visibilityState === 'visible' && Date.now() - S.lastSync > 15e3) syncNow();
-    if (document.visibilityState === 'hidden') syncNow(); // save before the browser is closed
+    if (document.visibilityState === 'visible') { if (Date.now() - S.lastSync > 5e3) syncNow(); if (!es || es.readyState === 2) listen(); }
+    if (document.visibilityState === 'hidden') { playerWanted = true; syncNow(); } // save (and hand over what's playing) before the app is closed
   });
-  window.addEventListener('online', () => link && syncNow());
+  window.addEventListener('online', () => { if (link) { syncNow(); listen(); } });
   setInterval(() => { if (document.visibilityState === 'visible' && link) syncNow(); }, 90e3);
 }

@@ -786,7 +786,10 @@ async function vHome(_, my) {
 
 // "Jump back in" — kept in sync with the player instantly (no page reload)
 // The BAZINGA! button: one tap builds a fresh mix of new songs from your top artists and genres
-const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt" width="22" height="22" decoding="sync" draggable="false">BAZINGA!</button>`;
+// The bolt is drawn right in the page (no picture file), so it's there instantly every time Home opens —
+// no loading, no flicker — and it follows the theme colour.
+const BOLT_SVG = `<svg class="bz-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="var(--volt)" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="var(--volt-2)"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix">${BOLT_SVG}BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
 const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
@@ -1833,7 +1836,6 @@ async function vSettings([section] = []) {
       : `<p class="muted">Use your music on your phone, computer and every browser — no account, no password. Scan a QR code or open a link on the other device and everything stays in sync automatically. Your library is encrypted on your device before it's sent.</p>
         <div class="row-btns"><button class="btn primary" data-act="link-device">${icon('qr')}Link a device</button><button class="btn" data-act="enter-code">${icon('link')}I have a code or link</button></div>`}
     </div>
-    <div class="panel support-panel only-m">${supportPanelInner()}</div>
     ${imports}
     ${ytPanel}
     <div class="panel" id="playback"><h2>${icon('play')} Playback</h2>
@@ -1872,7 +1874,7 @@ async function vSettings([section] = []) {
       <p class="tiny muted">Backups contain your library, playlists, albums, YouTube matches, profile and settings. Offline music files aren't copied (they're large) — keep the originals and re-add them after a restore.</p>
     </div>
 
-    <div class="panel support-panel only-d">${supportPanelInner()}</div>
+    <div class="panel support-panel">${supportPanelInner()}</div>
 
     <div class="panel"><h2>${icon('mic')} Lyrics (Genius)</h2>
       <p class="muted tiny">Lyrics come from Genius's official lyrics widget. If they don't load, add a free Genius access token: open <a class="lnk" href="https://genius.com/api-clients" target="_blank" rel="noopener">genius.com/api-clients</a> → New API Client (any name, any website) → Generate Access Token → paste it here. It's stored only on this device.</p>
@@ -2757,6 +2759,20 @@ function wireGlobal() {
 
   on('library', () => { renderSidebarPlaylists(); if (!document.querySelector('.modal-wrap') && !isTyping()) softRefresh(); });
   on('player', renderPlayer);
+  // Hand "what's playing" to your other devices: on every song change and when you pause
+  { let lastId = null, wasOn = false;
+    on('player', () => {
+      const id = player.current()?.id || null, isOn = player.isOn();
+      if (id && id !== lastId) { lastId = id; sync.notePlayer('track'); }
+      if (wasOn && !isOn && !P.loading) sync.notePlayer('pause');
+      wasOn = isOn;
+    }); }
+  // Picked up where you left off on another device (nothing was playing here)
+  on('player-adopted', s => {
+    const t = player.current(); if (!t) return;
+    renderPlayer();
+    toastUndo(`Continue "${displayTitle(t)}" from ${s.device || 'your other device'} ⚡`, () => player.play(), 'Play');
+  });
   on('like', onLikeChanged);
   on('needs-tap', () => { openNP(); requestAnimationFrame(placeDock); });
   on('track-art', ({ id, artwork }) => {

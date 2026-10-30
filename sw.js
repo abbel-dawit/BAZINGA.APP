@@ -1,10 +1,12 @@
 // BAZINGA service worker — makes the app open and run with no internet.
-const VERSION = 'bazinga-v40';
+const VERSION = 'bazinga-v41';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'favicon.ico',
   'js/bazinga.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/app-192.png', 'icons/app-512.png', 'icons/bmc-qr.png', 'icons/favicon-32.png', 'icons/apple-touch-icon.png', 'version.json'
 ];
+let trimT = null;
+const trimSoon = () => { clearTimeout(trimT); trimT = setTimeout(async () => { try { const c = await caches.open('bazinga-img'), ks = await c.keys(); for (const k of ks.slice(0, Math.max(0, ks.length - 3000))) await c.delete(k); } catch { } }, 10000); };
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
@@ -36,12 +38,13 @@ self.addEventListener('fetch', e => {
     })());
     return;
   }
-  // Fonts + album artwork: cache first, so covers show offline
-  if (/fonts\.(googleapis|gstatic)\.com|mzstatic\.com|i\.scdn\.co|ytimg\.com|dzcdn\.net/.test(url.hostname)) {
+  // Fonts + every picture (album art, artist photos, video thumbnails): cache first, so anything that loaded
+  // once shows instantly afterwards — and offline. The picture cache is trimmed to the newest ~3000.
+  if (e.request.destination === 'image' || /fonts\.(googleapis|gstatic)\.com|mzstatic\.com|i\.scdn\.co|ytimg\.com|dzcdn\.net|deezer\.com/.test(url.hostname)) {
     e.respondWith(caches.open('bazinga-img').then(async cache => {
       const hit = await cache.match(e.request);
       if (hit) return hit;
-      try { const r = await fetch(e.request); if (r.ok || r.type === 'opaque') cache.put(e.request, r.clone()); return r; }
+      try { const r = await fetch(e.request); if (r.ok || r.type === 'opaque') { cache.put(e.request, r.clone()); trimSoon(); } return r; }
       catch { return hit || Response.error(); }
     }));
   }

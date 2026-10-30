@@ -41,10 +41,11 @@ const changed = () => {
   emit('player', P);
   if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
 };
-const persist = debounce(() => kv.set('player', {
+// P.at = when this device last did anything with the player (used to decide which device "wins" on sync)
+const persist = debounce(() => { P.at = Date.now(); return kv.set('player', {
   queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
-  time: Math.floor(P.time || 0)
-}), 500);
+  time: Math.floor(P.time || 0), at: P.at
+}); }, 500);
 export const setEndHook = fn => { endHook = fn; };
 const outVol = () => Math.max(0, Math.min(1, P.volume * duckLevel));
 
@@ -54,6 +55,33 @@ export function audioMode(type = 'playback') { try { if (navigator.audioSession 
 
 export const current = () => (P.cursor >= 0 && P.queue[P.cursor]) ? lib.tracks.get(P.queue[P.cursor].id) : null;
 
+// ---------- Continue on another device ----------
+// What's playing here, for device sync (song, spot in the song, queue, video/audio, shuffle).
+export function syncState() {
+  const q = P.queue.slice(Math.max(0, P.cursor - 50), P.cursor + 250), off = Math.max(0, P.cursor - 50);
+  const extra = []; // songs that aren't in the library (a BAZINGA! mix, search results) travel with the queue
+  for (const it of q) { const t = lib.tracks.get(it.id); if (t?.transient) { const x = { ...t }; delete x.transient; extra.push(x); } }
+  return { queue: q, cursor: P.cursor - off, time: Math.floor(P.time || 0), mode: P.mode, shuffle: P.shuffle, origin: P.origin, at: P.at || 0, tracks: extra };
+}
+export const lastActive = () => P.at || 0;
+// Take over another device's spot (only when nothing is playing here). Press play to continue.
+export function adopt(s) {
+  if (!s || isOn()) return false;
+  for (const t of s.tracks || []) if (!lib.tracks.has(t.id)) store.remember(t);
+  const queue = (s.queue || []).filter(q => lib.tracks.has(q.id));
+  if (!queue.length) return false;
+  const curId = s.queue[s.cursor]?.id, cursor = Math.max(0, queue.findIndex(q => q.id === curId));
+  loadToken++; audio.pause(); try { ytPlayer?.pauseVideo?.(); } catch { }
+  wantPlay = false;
+  Object.assign(P, { queue, cursor, mode: s.mode || P.mode, shuffle: !!s.shuffle, origin: s.origin || '', playing: false, loading: false, source: null, ytId: null, error: '', time: s.time || 0 });
+  const t = current(); P.duration = (t?.durationMs || 0) / 1000;
+  resumeAt = s.time || 0; resumeFor = t?.id || null;
+  P.at = s.at || Date.now();
+  kv.set('player', { queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline, time: Math.floor(P.time), at: P.at });
+  if (t) setMediaSession(t);
+  changed(); emit('time', P);
+  return true;
+}
 export async function restore() {
   const s = await kv.get('player');
   if (s) { Object.assign(P, s, { playing: false }); resumeAt = +s.time || 0; P.time = resumeAt; }
