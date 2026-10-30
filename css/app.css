@@ -1594,3 +1594,10 @@ body:not(.has-track) #toasts { bottom: 18px; }
 .ob-form { display: grid; gap: 14px; justify-items: center; width: 100%; }
 .ob-form .fld { width: 100%; text-align: left; }
 .set-jump a.on { border-color: var(--volt); color: var(--volt); }
+
+/* --- Voice picker: the select shrinks to fit and "Try it" never pushes out of the card --- */
+.voice-pick { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; width: 100%; max-width: 100%; min-width: 0; align-items: center; }
+.voice-pick .select { width: 100%; min-width: 0; max-width: 100%; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-pick .btn { white-space: nowrap; }
+#voice-set .fld { min-width: 0; max-width: 100%; }
+@media (max-width: 420px) { .voice-pick { grid-template-columns: minmax(0, 1fr); } .voice-pick .btn { justify-self: start; } }
