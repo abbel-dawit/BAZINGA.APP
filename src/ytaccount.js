@@ -60,7 +60,7 @@ export async function signIn({ prompt = '' } = {}) {
 }
 export async function signOut() {
   try { if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.access, () => { }); } catch { }
-  token = null; await kv.del('ytToken'); emit('yt-account');
+  token = null; await kv.del('ytToken', { everywhere: true }); emit('yt-account');
 }
 
 class QuotaError extends Error { constructor() { super('YouTube\'s daily limit for this app has been reached. Your upload is saved — tap "Resume" tomorrow (limits reset at midnight Pacific time), or add your own Google key in Settings for your own limit.'); this.quota = true; } }

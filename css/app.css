@@ -1685,13 +1685,6 @@ body.dock-min #yt-dock:not(.in-np) .dock-load { display: none; }
 body.song-loading #playerbar .pb-art::after { content: ''; position: absolute; inset: 0; border-radius: inherit; background: rgb(0 0 0 / .45); }
 body.song-loading #playerbar .pb-art::before { content: ''; position: absolute; z-index: 2; inset: 28%; border-radius: 50%; border: 2.5px solid rgb(255 255 255 / .2); border-top-color: var(--volt); animation: spin .9s linear infinite; }
 
-/* --- Back to top: on computers it sits just to the LEFT of the corner video --- */
-@media (min-width: 701px) {
-  body.has-video #to-top { right: calc(16px + var(--dockw, 0px) + 14px) !important; bottom: calc(var(--bar) + 14px) !important; }
-  body.has-video.queue-open #to-top { right: calc(var(--queue) + 16px + var(--dockw, 0px) + 14px) !important; }
-}
-@media (min-width: 701px) and (max-width: 1000px) { body.has-video.queue-open #to-top { right: calc(16px + var(--dockw, 0px) + 14px) !important; } }
-
 /* --- Mic buttons: active = theme-coloured ring, icon stays the theme colour; back to normal when closed --- */
 .mic-top[data-act="voice"] { border-radius: 50%; color: var(--volt); }
 .mic-top[data-act="voice"]:hover { color: var(--volt); }
@@ -1705,7 +1698,7 @@ body.voice-on .ask-btn { color: var(--volt); border: 2px solid var(--volt); back
 /* The BAZINGA! mix button */
 .btn.bz-btn { font-family: var(--display); font-style: italic; font-weight: 800; letter-spacing: .03em; color: #fff; border: 2px solid var(--volt); background: rgb(var(--volt-rgb) / .14); box-shadow: 0 0 18px rgb(var(--volt-rgb) / .28); }
 .btn.bz-btn:hover { background: rgb(var(--volt-rgb) / .26); }
-.btn.bz-btn .bz-bolt { width: 22px; height: 22px; margin: -3px 0 -3px -4px; filter: drop-shadow(0 0 6px rgb(var(--volt-rgb) / .7)); animation: bolt-pulse 2.8s ease-in-out infinite; }
+.btn.bz-btn .bz-bolt { width: 22px; height: 22px; margin: -3px 0 -3px -4px; filter: drop-shadow(0 0 6px rgb(var(--volt-rgb) / .7)); }
 
 /* --- Theme colour picker --- */
 .theme-pick { display: flex; flex-wrap: wrap; gap: 10px 8px; }
@@ -1812,3 +1805,111 @@ body.wake-on:not(.voice-on) .mic-top[data-act="voice"]::after, body.wake-on:not(
 /* --- Coffee popup: bigger "Not now" with a theme-colored border --- */
 .p2-btns .p2-notnow { min-width: 200px; padding: 13px 28px; font-size: 16px; font-weight: 700; background: transparent; color: var(--text); border: 2px solid var(--volt); border-radius: 999px; }
 .p2-btns .p2-notnow:hover { background: rgb(var(--volt-rgb) / .14); }
+
+/* ===== v1.6.2 ===== */
+/* --- Back to top sits right above the corner video on computers --- */
+@media (min-width: 701px) { body.has-video #to-top { right: 22px !important; bottom: calc(var(--bar) + 14px + var(--dockh, 0px) + 14px) !important; } body.has-video.queue-open #to-top { right: calc(var(--queue) + 22px) !important; } }
+@media (min-width: 701px) and (max-width: 1000px) { body.has-video.queue-open #to-top { right: 22px !important; } }
+
+/* --- BAZINGA! button bolt: perfectly still --- */
+.btn.bz-btn .bz-bolt { animation: none !important; transform: none !important; will-change: auto; }
+
+/* --- Phone top bar: lock, coffee and mic evenly spaced --- */
+@media (max-width: 700px) { .topbar .lock-top, .topbar .coffee-top, .topbar .mic-top { margin: 0 !important; } }
+
+/* --- Home clock: smaller on smaller screens --- */
+@media (max-width: 700px), (max-height: 520px) {
+  .home .home-hero .hh-time { font-size: 11.5px; padding: 3px 9px 3px 7px; gap: 4px; top: 12px; right: 12px; letter-spacing: .04em; }
+  .home .home-hero .hh-time .ic { width: 12px; height: 12px; }
+}
+@media (max-width: 380px) { .home .home-hero .hh-time { font-size: 10.5px; } }
+
+/* --- Pull down to close the full-screen player --- */
+body.np-open, html:has(body.np-open) { overscroll-behavior-y: none; }
+body.np-pulling #np, body.np-pulling #np-head, body.np-pulling #yt-dock.in-np,
+body.np-springing #np, body.np-springing #np-head, body.np-springing #yt-dock.in-np { transform: translateY(var(--np-pull, 0px)) !important; }
+body.np-pulling #np, body.np-pulling #np-head, body.np-pulling #yt-dock.in-np { transition: none !important; }
+body.np-springing #np, body.np-springing #np-head, body.np-springing #yt-dock.in-np { transition: transform .22s cubic-bezier(.2, .8, .2, 1) !important; }
+body.np-pulling #np-head::before { opacity: 1; }
+#np-head::before { content: ''; position: absolute; top: calc(env(safe-area-inset-top) + 4px); left: 50%; width: 38px; height: 4px; margin-left: -19px; border-radius: 4px; background: rgb(255 255 255 / .35); opacity: .7; transition: opacity .2s; }
+@media (pointer: fine) { #np-head::before { display: none; } }
+/* a touch strip over the top of the video so you can pull down there too (a tap on it = play/pause) */
+.np-grab { display: none; }
+@media (pointer: coarse) { #yt-dock.in-np .np-grab { display: block; position: absolute; left: 0; right: 0; top: 0; height: 38%; z-index: 3; } body.needs-tap #yt-dock .np-grab { display: none; } }
+
+/* --- Queue: "save as playlist" (+) for BAZINGA! mixes and shuffled queues --- */
+.q-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.q-save { width: 34px; height: 34px; color: var(--volt-ink) !important; background: var(--volt) !important; border: 2px solid #000; box-shadow: 2px 2px 0 #000; }
+.q-save .ic { width: 18px; height: 18px; stroke-width: 2.8; }
+.q-save:active { transform: translate(1px, 1px); box-shadow: 1px 1px 0 #000; }
+
+/* --- Phones in portrait: the video in the full-screen player goes edge to edge (bigger) --- */
+@media (max-width: 700px) and (orientation: portrait) {
+  #np .np-inner > .np-media.vid { margin-left: -16px; margin-right: -16px; width: calc(100% + 32px); }
+  #np .np-media.vid .np-slot { width: 100% !important; border-radius: 0 !important; }
+  #yt-dock.in-np { border-radius: 0 !important; }
+}
+
+/* --- Phones & small tablets turned sideways (short screens) --- */
+@media (max-height: 520px) and (orientation: landscape) {
+  /* notch / rounded corners */
+  .sidebar { padding-left: max(8px, env(safe-area-inset-left)) !important; }
+  #main { padding-right: env(safe-area-inset-right); }
+  /* the icon sidebar scrolls instead of cutting buttons off, and is more compact */
+  .sidebar { overflow-y: auto; overflow-x: hidden; scrollbar-width: none; padding-top: 8px !important; padding-bottom: 8px !important; }
+  .sidebar::-webkit-scrollbar { display: none; }
+  .sidebar .brand { padding: 4px 0 8px !important; flex: none; }
+  .sidebar .brand img { width: 30px; height: 30px; }
+  .sidebar .nav { gap: 2px !important; flex: none; }
+  .sidebar .nav a, .sidebar .ask-btn, .sidebar .lock-side { height: 40px !important; min-height: 40px; flex: none; }
+  .sidebar .ask-btn, .sidebar .lock-side { margin-top: 4px !important; }
+  .sidebar .side-h, .sidebar .side-pl { display: none !important; }
+  .sidebar .profile-chip { margin-top: 8px !important; flex: none; }
+  /* home card: shorter */
+  .home .home-hero { min-height: 0 !important; padding: 18px 20px !important; }
+  .home-hero h1 { font-size: clamp(26px, 6vh, 40px) !important; margin: 4px 0 6px !important; }
+  .page { padding-top: 14px; }
+  /* the corner video: smaller so it doesn't cover the page; "bigger" makes it really big */
+  #yt-dock:not(.in-np) { width: 240px; right: max(12px, env(safe-area-inset-right)); bottom: calc(var(--bar) + 10px); }
+  #yt-dock:not(.in-np) .dock-frame { height: 135px; }
+  body.dock-big #yt-dock:not(.in-np) { width: min(52vw, calc((100vh - var(--bar) - 70px) * 16 / 9)); }
+  body.dock-big #yt-dock:not(.in-np) .dock-frame { height: auto; aspect-ratio: 16 / 9; }
+  body.dock-min #yt-dock:not(.in-np) { width: 240px; }
+  .dock-btn { width: 34px; height: 34px; }
+  .dock-btn svg { width: 19px; height: 19px; }
+  /* full-screen player: a big video (almost the whole height), queue below instead of beside it */
+  #np .np-media.vid .np-slot { width: min(100%, calc((100vh - 76px) * 16 / 9)) !important; width: min(100%, calc((100dvh - 76px) * 16 / 9)) !important; }
+  #np .np-media.art .np-art { width: min(42vh, 220px); }
+  #np .np-info h2 { font-size: 22px; }
+  /* the bottom player bar is a bit slimmer */
+  :root { --bar: 76px; }
+}
+
+/* ===== v1.6.3 ===== */
+/* --- "When the queue finishes": options sized to their text, extra space shared equally, so the gaps match --- */
+#set-autoplay { display: flex !important; grid-template-columns: none !important; }
+#set-autoplay label { flex: 1 1 auto !important; min-width: 0; }
+#set-autoplay span { display: flex !important; justify-content: center; white-space: nowrap; overflow: visible; padding: 9px 14px !important; }
+@media (max-width: 700px) { #set-autoplay span { padding: 9px 8px !important; font-size: clamp(11px, 3.1vw, 14px) !important; } }
+
+/* --- Song recognition in the assistant --- */
+.vc-id { margin: 2px auto 10px; display: flex; gap: 8px; border: 2px solid var(--volt); background: rgb(var(--volt-rgb) / .1); color: var(--text); font-weight: 700; }
+.vc-id .ic { width: 18px; height: 18px; color: var(--volt); }
+#voice.identifying .vc-orb { transform: scale(calc(1 + var(--lvl, 0) * .18)); transition: transform .08s linear; animation: none !important; }
+#voice.identifying .vc-orb b { box-shadow: 0 0 calc(30px + var(--lvl, 0) * 60px) rgb(var(--volt-rgb) / .8); }
+#voice.identifying .vc-id { opacity: .5; pointer-events: none; }
+.vc-song { display: flex; align-items: center; gap: 12px; margin: 4px 0 12px; padding: 10px; border-radius: 16px; background: var(--surface2); border: 2px solid var(--volt); box-shadow: 4px 4px 0 #000; text-align: left; animation: drop .3s ease-out; }
+.vc-song img, .vc-song-art { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; flex: none; background: var(--surface3); }
+.vc-song-t { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.vc-song-t b { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vc-song-t span { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vc-song-b { display: flex; flex-direction: column; gap: 6px; flex: none; }
+@media (max-width: 420px) { .vc-song { flex-wrap: wrap; } .vc-song-b { flex-direction: row; width: 100%; } .vc-song-b .btn { flex: 1; } }
+
+/* --- Sleep timer button (full-screen player top bar, left of ⋯) --- */
+.np-head-r { display: flex; align-items: center; gap: 2px; }
+#np-head .sleep-np.on { color: var(--volt); }
+#np-head .sleep-np.on::after { content: ''; position: absolute; top: 8px; right: 8px; width: 7px; height: 7px; border-radius: 50%; background: var(--volt); box-shadow: 0 0 8px var(--volt); }
+.menu-h .ic { width: 16px; height: 16px; vertical-align: -3px; margin-right: 4px; color: var(--volt); }
+.menu-h:has(.ic) { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.menu-h .ic { margin-right: 0; vertical-align: 0; flex: none; }

@@ -8,6 +8,7 @@ import { logoSrc } from './ui.js';
 
 export const P = {
   queue: [],          // [{id, user}]
+  origin: '',         // where the queue came from: 'mix' (BAZINGA! button) or '' (a list played as-is)
   cursor: -1,
   mode: 'video',      // 'video' | 'audio' — music video is the default
   preferOffline: true,
@@ -41,7 +42,7 @@ const changed = () => {
   if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
 };
 const persist = debounce(() => kv.set('player', {
-  queue: P.queue, cursor: P.cursor, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
+  queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
   time: Math.floor(P.time || 0)
 }), 500);
 export const setEndHook = fn => { endHook = fn; };
@@ -255,7 +256,24 @@ export function prefetch(id) {
   if (t && navigator.onLine && !(t.localFileId && P.preferOffline)) yt.findForTrack(t, { need: P.mode }).catch(() => { });
 }
 
+// Sleep timer: "stop at the end of this song"
+let stopAfterSong = false;
+export const setStopAfterSong = on => { stopAfterSong = !!on; };
+export const stopsAfterSong = () => stopAfterSong;
+// Sleep timer: gently fade the music out, then pause (the saved volume is never touched)
+let fadeT = null;
+export function fadeOutAndPause(ms = 8000) {
+  clearInterval(fadeT);
+  const t0 = Date.now(), from = duckLevel;
+  fadeT = setInterval(() => {
+    const k = Math.min(1, (Date.now() - t0) / ms);
+    duckLevel = from * (1 - k); applyVol();
+    if (k >= 1) { clearInterval(fadeT); pause(); setTimeout(() => { duckLevel = 1; applyVol(); }, 400); emit('sleep-done'); }
+  }, 100);
+}
+export const cancelFade = () => { if (fadeT) { clearInterval(fadeT); fadeT = null; duckLevel = 1; applyVol(); } };
 function ended() {
+  if (stopAfterSong) { stopAfterSong = false; seek(0); pause(); emit('sleep-done'); return; }
   if (P.repeat === 'one') { seek(0); play(); return; }
   next(true);
 }
@@ -293,6 +311,9 @@ export function seek(sec) {
   P.time = sec; emit('time', P);
 }
 
+// Worth saving as a new playlist? Only a queue BAZINGA! made or one that's shuffled — a list playing
+// in its own order already exists as that playlist/album.
+export const queueIsNew = () => P.queue.length > 1 && (P.origin === 'mix' || !!P.shuffle);
 export function next(auto = false) {
   if (!P.queue.length) return;
   if (P.cursor < P.queue.length - 1) P.cursor++;
@@ -303,7 +324,7 @@ export function next(auto = false) {
     if (plan?.ids?.length) {
       let list = plan.ids.filter(id => lib.tracks.has(id)).map(id => ({ id, user: false }));
       if (plan.shuffle) list.sort(() => Math.random() - 0.5);
-      if (list.length) { P.queue = list; P.cursor = 0; if (plan.msg) toast(plan.msg); load(true); return; }
+      if (list.length) { P.queue = list; P.cursor = 0; P.origin = ''; if (plan.msg) toast(plan.msg); load(true); return; }
     }
     if (auto) { P.playing = false; wantPlay = false; changed(); }
     return;
@@ -317,7 +338,7 @@ export function prev() {
 }
 
 // Replace the queue with a list and start at `start`
-export function playList(ids, start = 0, { shuffle = P.shuffle } = {}) {
+export function playList(ids, start = 0, { shuffle = P.shuffle, origin = '' } = {}) {
   ids = ids.filter(id => lib.tracks.has(id));
   if (!ids.length) return toast('Nothing to play');
   let list = ids.map(id => ({ id, user: false }));
@@ -326,7 +347,7 @@ export function playList(ids, start = 0, { shuffle = P.shuffle } = {}) {
     list.sort(() => Math.random() - 0.5);
     list.unshift(first); start = 0;
   }
-  P.queue = list; P.cursor = start; P.shuffle = shuffle;
+  P.queue = list; P.cursor = start; P.shuffle = shuffle; P.origin = origin;
   load(true);
 }
 

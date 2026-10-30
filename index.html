@@ -57,13 +57,17 @@
     @keyframes spg{50%{transform:scale(1.12);opacity:.75}}@keyframes spr{0%{transform:scale(.3);opacity:.9}100%{transform:scale(1.5);opacity:0}}
     @keyframes spb{0%{transform:scale(.2) rotate(-25deg);opacity:0}100%{transform:none;opacity:1}}@keyframes spz{50%{transform:scale(1.06) rotate(2deg)}}
     @keyframes spw{0%{transform:translateY(14px);opacity:0}100%{transform:none;opacity:1}}@keyframes spl{0%{transform:translateX(-110%)}100%{transform:translateX(260%)}}
+    #splash .sp-sub{margin:2px 0 0;min-height:1.4em;color:#e9e5da;font:600 clamp(14px,3.6vmin,17px)/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.01em;text-align:center;padding:0 20px;opacity:.92}
+    #splash .sp-sub.in{animation:sps .45s cubic-bezier(.2,1.2,.4,1) both}
+    @keyframes sps{0%{transform:translateY(8px);opacity:0}100%{transform:none;opacity:.92}}
     @media (prefers-reduced-motion:reduce){#splash *{animation:none!important}}
   </style>
-  <link rel="stylesheet" href="css/app.css?v=4947f2f416">
+  <link rel="stylesheet" href="css/app.css?v=664c08f341">
 </head>
 <body>
   <div id="splash" aria-hidden="true"><div class="sp-glow"></div><div class="sp-rings"><i></i><i></i><i></i></div>
-    <div class="sp-core"><img class="sp-bolt" src="icons/icon-512.png" alt=""><div class="sp-word">BAZINGA!</div><div class="sp-bar"><i></i></div></div></div>
+    <div class="sp-core"><img class="sp-bolt" src="icons/icon-512.png" alt=""><div class="sp-word">BAZINGA!</div><div class="sp-bar"><i></i></div><p class="sp-sub" aria-live="polite"></p></div></div>
+  <script>/* Fun lines while BAZINGA! starts */(function(){var L=["Charging the lightning ⚡","Warming up the speakers 🔊","Turning the bass up 🎚️","Dusting off the vinyl 💿","Finding your vibe 🎧","Lining up the bangers 🔥","Waking up the drummer 🥁","Tuning the guitar 🎸","Loading pure good vibes ✨","Getting the dance floor ready 🕺","Polishing the headphones 🎧","Counting you in: 1, 2, 3, 4 🎶"],el=document.querySelector("#splash .sp-sub"),i=Math.floor(Math.random()*L.length);function n(){if(!el||!el.isConnected)return;el.classList.remove("in");void el.offsetWidth;el.textContent=L[i++%L.length];el.classList.add("in");setTimeout(n,1300)}n()})();</script>
   <script>try{var bzt=localStorage.getItem("bz_theme");if(bzt&&/^[a-z]+$/.test(bzt)&&bzt!=="volt")document.querySelector("#splash .sp-bolt").src="icons/theme/"+bzt+"-icon-512.png"}catch(e){}</script>
   <div id="onboarding" hidden></div>
 
@@ -160,7 +164,9 @@
     window.BAZINGA_CONFIG = {
       googleClientId: '',  /* YouTube sync, e.g. '1234567890-abc123.apps.googleusercontent.com' */
       youtubeApiKey: '',   /* Backup YouTube search for everyone when the free servers are down (YouTube Data API v3 key, restrict it to your site) */
-      syncRelay: ''        /* Optional: your own ntfy server for device sync. Empty = the free public https://ntfy.sh (no setup) */
+      syncRelay: '',       /* Optional: your own ntfy server for device sync. Empty = the free public https://ntfy.sh (no setup) */
+      auddToken: '',       /* Song recognition ("What song is this?") for everyone: an AudD API token from https://dashboard.audd.io */
+      recognizeUrl: ''     /* Optional: your own proxy for AudD (if the browser blocks calling api.audd.io directly). Empty = https://api.audd.io/ */
     };
   </script>
   <script>
@@ -212,6 +218,6 @@
       });
     })();
   </script>
-  <script src="js/bazinga.js?v=b8e5d26cfd" defer onerror="window.__bzLoadErr && window.__bzLoadErr()"></script>
+  <script src="js/bazinga.js?v=9abd1ad13a" defer onerror="window.__bzLoadErr && window.__bzLoadErr()"></script>
 </body>
 </html>

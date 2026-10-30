@@ -68,7 +68,7 @@ async function token() {
 }
 
 export const isConnected = async () => !!(await kv.get('spotifyToken'));
-export const disconnect = () => kv.del('spotifyToken');
+export const disconnect = () => kv.del('spotifyToken', { everywhere: true });
 
 async function api(url) {
   for (let attempt = 0; attempt < 5; attempt++) {

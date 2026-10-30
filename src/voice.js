@@ -8,7 +8,7 @@ import * as store from './store.js';
 import * as meta from './meta.js';
 import * as player from './player.js';
 import { P } from './player.js';
-import { $, esc, norm, mainArtist, displayTitle, emit } from './util.js';
+import { $, esc, norm, mainArtist, displayTitle, emit, trackKey, sleep } from './util.js';
 
 const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
 // Brave ships the speech API but can't reach Google's speech service, so it gets the text box instead
@@ -48,7 +48,7 @@ function voiceScore(v) {
   if (/microsoft (david|zira|mark|hazel|george)(?!.*natural)/i.test(n)) s -= 10; // older desktop voices
   return s;
 }
-let voicePref = '', rate = 1;
+let voicePref = '', rate = 1, recogKey = '';
 export function voiceOptions() {
   if (!('speechSynthesis' in window)) return [];
   const vs = speechSynthesis.getVoices().map(v => ({ v, s: voiceScore(v) })).filter(x => x.s > -50).sort((a, b) => b.s - a.s);
@@ -60,7 +60,8 @@ function pickVoice() {
   if (voicePref) { const v = vs.find(x => x.name === voicePref); if (v) return v; }
   return vs.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0];
 }
-export function setVoicePrefs({ name, speed } = {}) {
+export function setVoicePrefs({ name, speed, recognizeKey } = {}) {
+  if (recognizeKey !== undefined) recogKey = recognizeKey || '';
   if (name !== undefined) { voicePref = name || ''; voice = pickVoice(); }
   if (speed) rate = speed;
 }
@@ -151,7 +152,7 @@ function setState(s) { const v = el(); if (v) v.dataset.state = s; }
 function setHeard(t) { const h = el()?.querySelector('.vc-heard'); if (h) { h.textContent = t; h.classList.toggle('empty', !t); } }
 function setReply(t) { const r = el()?.querySelector('.vc-reply'); if (r) r.textContent = t; }
 
-const SUGGEST = ['Play my liked songs', 'Play Blinding Lights by The Weeknd', 'Add Essence to the queue', 'Search for Burna Boy', 'Go to my artists', 'Show the lyrics', 'Switch to music video', 'What\'s playing?'];
+const SUGGEST = ['What song is this?', 'Play my liked songs', 'Play Blinding Lights by The Weeknd', 'Add Essence to the queue', 'Search for Burna Boy', 'Go to my artists', 'Show the lyrics', 'Switch to music video', 'What\'s playing?'];
 
 export function initVoice(hooks) {
   app = hooks;
@@ -165,12 +166,17 @@ export function initVoice(hooks) {
       <div class="vc-reply">${canListen ? 'Listening… try "Play my liked songs"' : 'Type what you\'d like — for example "Play Tapout by Rich Gang"'}</div>
       <div class="vc-confirm" hidden><button class="btn primary" data-vc="yes">${'Yes, play it'}</button><button class="btn" data-vc="no">No</button></div>
       <form class="vc-form"><input name="q" placeholder="${canListen ? 'Or type a request…' : 'Type a request…'}" autocomplete="off" enterkeyhint="go"><button class="btn primary sm">Go</button></form>
+      <button type="button" class="btn vc-id" data-vc="identify">${'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'}What song is playing around me?</button>
+      <div class="vc-song" hidden></div>
       <div class="vc-sugg">${SUGGEST.map(s => `<button class="chip" data-vc-say="${esc(s)}">${esc(s)}</button>`).join('')}</div>
     </div>`;
   document.body.appendChild(wrap);
   wrap.addEventListener('click', e => {
     const c = e.target.closest('[data-vc]');
     if (c?.dataset.vc === 'close') close();
+    if (c?.dataset.vc === 'identify') { stopListening(); setHeard('What song is playing around me?'); identifyNow(); }
+    if (c?.dataset.vc === 'song-play') playFound();
+    if (c?.dataset.vc === 'song-like') likeFound();
     if (c?.dataset.vc === 'mic') listening ? stopListening() : listen();
     if (c?.dataset.vc === 'yes' || c?.dataset.vc === 'no') { stopListening(); setHeard(c.dataset.vc === 'yes' ? 'Yes' : 'No'); handle(c.dataset.vc); }
     const s = e.target.closest('[data-vc-say]'); if (s) { setHeard(s.dataset.vcSay); handle(s.dataset.vcSay); }
@@ -219,6 +225,7 @@ function micUI(on) {
 }
 function close() {
   open = false;
+  stopIdentify(); songCard(null);
   micUI(false); // first, so nothing below can leave the mic looking active
   clearTimeout(closeTimer); pending = null; confirmUI(false);
   stopListening(); try { speechSynthesis.cancel(); } catch { }
@@ -533,7 +540,7 @@ async function handle(raw, alts = []) {
   if (!listening) setState('idle');
   restoreAudio();
   // Task done: close the assistant (stays open if it couldn't help, so you can try again)
-  if (open && !listening && !pending) scheduleClose(keep ? 8000 : 600);
+  if (open && !listening && !pending) scheduleClose(found ? 20000 : keep ? 8000 : 600);
 }
 
 async function run(q, alts = []) {
@@ -559,8 +566,11 @@ async function run(q, alts = []) {
   if (/^(hide|close)( the)? lyrics/.test(q)) { app.lyrics(false); return say('Lyrics hidden.'); }
   if (/^(open|show|go to)( the)? (now playing|full ?screen|player)$/.test(q)) { app.openNP(); return say('Here you go.'); }
   if (/^(close|exit|leave)( the)? (now playing|full ?screen|player)$/.test(q)) { app.closeNP(); return say('Okay.'); }
+  // --- song recognition (music playing around you, like Shazam)
+  if (IDENTIFY.test(q)) return identify();
   if (/^(what'?s|what is) (this|playing|this song)|^what song is (this|playing)|^who (sings|is singing|made) (this|it)|^what am i listening to/.test(q)) {
-    if (!cur) return say('Nothing\'s playing right now.');
+    // BAZINGA! isn't playing anything, so they mean the music around them
+    if (!cur || !player.isOn()) return identify();
     return say(`This is ${displayTitle(cur)} by ${cur.artist}${cur.album ? `, from ${cur.album}` : ''}.`);
   }
   if (/^(i )?(like|love)( this| this song| it)$|^(save|like|add) (this|this song|it) to (my )?(liked|likes|favorites|library)/.test(q)) {
@@ -602,6 +612,136 @@ async function run(q, alts = []) {
 }
 const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 
+// ---------- "What song is this?" — music recognition ----------
+// Records a few seconds through the microphone and asks a music-recognition service built for short,
+// noisy phone recordings (AudD, the same kind of fingerprinting Shazam uses). To do well in loud rooms:
+//  • the browser's speech filters (noise suppression, echo cancelling, auto gain) are switched OFF —
+//    they're made for voices and wipe out exactly the parts of music that identify a song;
+//  • BAZINGA!'s own music stays muted while it listens;
+//  • it checks after ~6 s, and if there's no match it keeps recording and tries again with a longer,
+//    clearer sample (~11 s, then ~16 s) — longer clips beat background chatter.
+// Needs an AudD key (Settings → Voice assistant, or the app owner's key in index.html).
+const IDENTIFY = /\b(identify|recogni[sz]e|shazam|name (this|that) (song|tune)|what song is (playing|this) (around|near|here|in here|right now)|(around|near) me|what('?s| is) (this|that) song (playing|on)|listen to (this|the) (song|music))\b|^what song is that\b/;
+let ident = null, found = null;
+const sleepOr = (ms, job) => new Promise(r => { const t = setTimeout(r, ms); job.wake = () => { clearTimeout(t); r(); }; });
+function stopIdentify() {
+  const j = ident; ident = null; if (!j) return;
+  j.stopped = true; j.wake?.();
+  try { if (j.rec?.state !== 'inactive') j.rec.stop(); } catch { }
+  try { j.stream?.getTracks().forEach(t => t.stop()); } catch { }
+  try { j.meterOff?.(); } catch { }
+  el()?.classList.remove('identifying');
+  player.audioMode('playback'); micEndedAt = Date.now();
+}
+async function lookupSong(blob, token) {
+  const ext = /mp4|aac|m4a/.test(blob.type) ? 'm4a' : /ogg/.test(blob.type) ? 'ogg' : 'webm';
+  const fd = new FormData();
+  fd.append('api_token', token); fd.append('file', blob, 'sample.' + ext); fd.append('return', 'apple_music,spotify');
+  const url = window.BAZINGA_CONFIG?.recognizeUrl || 'https://api.audd.io/';
+  let r;
+  try { r = await fetch(url, { method: 'POST', body: fd }); }
+  catch { const e = new Error('I couldn\'t reach the song recognition service. Check your connection and try again.'); e.fatal = true; throw e; }
+  const j = await r.json().catch(() => ({}));
+  if (j.status === 'error') {
+    const code = j.error?.error_code;
+    const e = new Error(code === 900 || code === 901 ? 'The song recognition key isn\'t working. Check it in Settings → Voice assistant.' : code === 902 ? 'Song recognition has hit its limit for now. Try again later.' : 'I couldn\'t make out the music. Try again closer to the speaker.');
+    e.fatal = code >= 900 && code < 1000; throw e;
+  }
+  return j.result || null;
+}
+function songFrom(res) {
+  const am = res.apple_music, sp = res.spotify;
+  const artwork = am?.artwork?.url ? am.artwork.url.replace('{w}', 600).replace('{h}', 600) : (sp?.album?.images?.[0]?.url || '');
+  return { title: res.title, artist: res.artist, album: res.album || '', releaseDate: res.release_date || '', artwork, link: res.song_link || '' };
+}
+function songCard(s) {
+  const box = el()?.querySelector('.vc-song'); if (!box) return;
+  found = s;
+  if (!s) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  box.innerHTML = `${s.artwork ? `<img src="${esc(s.artwork)}" alt="">` : '<div class="vc-song-art"></div>'}
+    <div class="vc-song-t"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.album ? ' · ' + esc(s.album) : ''}</span></div>
+    <div class="vc-song-b"><button type="button" class="btn primary sm" data-vc="song-play">Play it</button><button type="button" class="btn sm" data-vc="song-like">Like</button></div>`;
+}
+async function foundTrack() {
+  const s = found; if (!s) return null;
+  // the catalogue's version (cover, album, genre) when there is one, otherwise what was recognised
+  let t = null;
+  try { const res = await meta.withTimeout(meta.searchSongs(`${mainArtist(s.artist)} ${s.title}`, 8), 4000, []); t = res.find(r => norm(r.title) === norm(s.title) && norm(mainArtist(r.artist)) === norm(mainArtist(s.artist))) || null; } catch { }
+  t = t || { id: trackKey(s.artist, s.title), title: s.title, artist: s.artist, artists: [s.artist], album: s.album, artwork: s.artwork, releaseDate: s.releaseDate };
+  return lib.tracks.get(t.id) || store.remember(t);
+}
+async function playFound() { const t = await foundTrack(); if (!t) return; player.playList([t.id], 0, { shuffle: false }); found = null; say(`Playing ${t.title}.`); scheduleClose(1200); }
+async function likeFound() {
+  const t = await foundTrack(); if (!t) return;
+  if (!t.liked || t.transient) await store.upsertTracks([{ ...t, liked: true, likedAt: Date.now() }]);
+  const b = el()?.querySelector('[data-vc="song-like"]'); if (b) { b.textContent = 'Liked ♥'; b.disabled = true; }
+  app?.toast?.('Added to Liked Songs ♥', 'ok');
+}
+function meter(stream) {
+  const ac = unlockChime(); if (!ac) return () => { };
+  try {
+    const src = ac.createMediaStreamSource(stream), an = ac.createAnalyser(); an.fftSize = 512; src.connect(an);
+    const buf = new Uint8Array(an.fftSize); let on = true;
+    const tick = () => { if (!on) return; an.getByteTimeDomainData(buf); let m = 0; for (const v of buf) m = Math.max(m, Math.abs(v - 128)); el()?.style.setProperty('--lvl', Math.min(1, m / 60).toFixed(2)); requestAnimationFrame(tick); };
+    tick();
+    return () => { on = false; try { src.disconnect(); } catch { } el()?.style.setProperty('--lvl', 0); };
+  } catch { return () => { }; }
+}
+async function identifyNow() {
+  keep = false; clearTimeout(closeTimer);
+  try { await identify(); } catch (e) { console.warn(e); }
+  if (open && !listening && !pending) scheduleClose(found ? 20000 : keep ? 8000 : 600);
+}
+async function identify() {
+  stopIdentify(); stopListening(); songCard(null);
+  try { speechSynthesis.cancel(); } catch { }
+  const token = recogKey || window.BAZINGA_CONFIG?.auddToken || '';
+  if (!token) return fail('Song recognition needs an AudD key. Add one in Settings → Voice assistant.');
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return fail('This browser can\'t record audio for song recognition. Try Chrome or Safari.');
+  const job = ident = { stopped: false };
+  el()?.classList.add('identifying');
+  setState('listening'); setReply('Listening to the music around you 🎶 Hold your phone close to the speaker.');
+  duck(true); chime();
+  try {
+    // raw sound: the voice filters would erase the music's fingerprint
+    job.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 44100 } })
+      .catch(() => navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }));
+  } catch {
+    stopIdentify();
+    return fail('I need microphone access to hear the song. Allow it in your browser\'s site settings.');
+  }
+  if (job.stopped) { job.stream.getTracks().forEach(t => t.stop()); return; }
+  usedMic = true;
+  job.meterOff = meter(job.stream);
+  const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported?.(t)) || '';
+  const chunks = [];
+  job.rec = new MediaRecorder(job.stream, type ? { mimeType: type, audioBitsPerSecond: 128000 } : undefined);
+  job.rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+  job.rec.start(500);
+  const t0 = Date.now();
+  let res = null, err = null;
+  for (const [i, at] of [6000, 11000, 16000].entries()) {
+    await sleepOr(Math.max(0, at - (Date.now() - t0)), job);
+    if (job.stopped || !open) return;
+    try { job.rec.requestData?.(); } catch { }
+    await sleep(120);
+    setState('thinking');
+    setReply(i === 0 ? 'Got it, checking… 🔎' : 'Still listening for a clearer sample… 🎧');
+    try { res = await lookupSong(new Blob(chunks, { type: job.rec.mimeType || type || 'audio/webm' }), token); err = null; }
+    catch (e) { err = e; if (e.fatal) break; }
+    if (res || job.stopped || !open) break;
+    setState('listening');
+  }
+  stopIdentify();
+  if (!open) return;
+  if (err && !res) return fail(err.message);
+  if (!res) return fail('I couldn\'t catch that one 😕 Get closer to the speaker and try again.');
+  const s = songFrom(res);
+  songCard(s); keep = true;
+  return say(rand([`That's ${s.title} by ${s.artist}.`, `Got it! ${s.title} by ${s.artist}.`, `This is ${s.title} by ${s.artist}.`]));
+}
+
 
 // ---------- "Hey BAZINGA" — hands-free wake word (opt-in, Settings → Voice assistant) ----------
 // While it's on and BAZINGA! is open on screen, the browser listens in the background. Saying
@@ -611,8 +751,10 @@ const WAKE = /\b(?:hey|hi|okay|ok|yo|a)?[\s,]*(ba[\s-]?[sz]ing(?:a|er|ah|uh|o)|b
 let wakeOn = false, wakeRec = null, wakeTimer = null, wakeFails = 0, wakeHeard = false, wakeHeardTimer = null, wakeNeedsTap = false;
 export const wakeSupported = canListen;
 export const wakeActive = () => wakeOn;
+// "Hey Bazinga" background listening has been retired: the microphone is only ever on while the
+// assistant is open. setWake() always turns it off (kept so older saved settings can't switch it on).
 export function setWake(on) {
-  wakeOn = !!on && canListen;
+  wakeOn = false;
   if (wakeOn) { wakeFails = 0; startWake(); } else stopWake();
   emit('wake', wakeOn);
 }

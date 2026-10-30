@@ -51,9 +51,32 @@ export const db = {
   }
 };
 
-// Simple key/value helpers
+// Simple key/value helpers.
+// Items in SYNC_KV travel to your other synced devices. Each change is time-stamped so devices can tell
+// which copy is newer. Removing one only reaches your other devices when you asked for that
+// (e.g. "Disconnect"); things that just expire on this device are never removed elsewhere.
+export const SYNC_KV = ['spotifyClientId', 'spotifyToken', 'ytToken', 'ytLinks', 'ytUploads', 'taste', 'plPlays', 'mixPl'];
+const SYNCED = new Set(SYNC_KV);
+let stampsP = null, chain = Promise.resolve();
+const kvHooks = [];
+export const onSyncedKvChange = fn => kvHooks.push(fn); // sync.js: send the change to your other devices
+const changedKv = k => kvHooks.forEach(f => { try { f(k); } catch { } });
+const loadStamps = () => stampsP || (stampsP = db.get('kv', '__stamps').then(v => v || {}).catch(() => ({})));
+function editStamps(fn) {
+  chain = chain.then(async () => { const s = await loadStamps(); fn(s); await db.put('kv', s, '__stamps'); }).catch(() => { });
+  return chain;
+}
 export const kv = {
   get: (k, dflt = null) => db.get('kv', k).then(v => v === undefined ? dflt : v),
-  set: (k, v) => db.put('kv', v, k),
-  del: (k) => db.del('kv', k)
+  set: async (k, v) => { await db.put('kv', v, k); if (SYNCED.has(k)) { await editStamps(s => { s[k] = { ts: Date.now() }; }); changedKv(k); } },
+  del: async (k, { everywhere = false } = {}) => {
+    await db.del('kv', k);
+    if (SYNCED.has(k)) { await editStamps(s => { if (everywhere) s[k] = { ts: Date.now(), del: true }; else delete s[k]; }); if (everywhere) changedKv(k); }
+  },
+  // for sync: read the time stamps, and write a value that came from another device (keeping its stamp)
+  stamps: async () => ({ ...(await loadStamps()) }),
+  putSynced: async (k, rec) => {
+    if (rec.del) await db.del('kv', k); else await db.put('kv', rec.v, k);
+    await editStamps(s => { s[k] = rec.del ? { ts: rec.ts, del: true } : { ts: rec.ts }; });
+  }
 };

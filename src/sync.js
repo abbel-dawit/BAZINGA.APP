@@ -10,7 +10,7 @@
 // Copies on the relay last about 3 hours, so every open device re-posts its library at least once
 // an hour, and devices merge whatever is newer (newest edit wins per item, likes merge
 // separately, deletions are remembered). Your own device always keeps the full library.
-import { db, kv } from './db.js';
+import { db, kv, SYNC_KV, onSyncedKvChange } from './db.js';
 import { emit, on, debounce } from './util.js';
 import * as store from './store.js';
 import * as backup from './backup.js';
@@ -109,7 +109,7 @@ async function fetchFile(m) {
 }
 
 function hash(snap) {
-  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.profile]);
+  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.profile, snap.settings || null, snap.kvx || null]);
   let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
   return (h >>> 0).toString(36) + ':' + s.length;
 }
@@ -122,8 +122,41 @@ async function localSnap() {
   const p = snap.profile;
   snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
   delete snap.player; delete snap.createdAt;
-  delete snap.settings; // settings (and any private keys/tokens) stay on the device they were set on
+  // Settings (keys, tokens, servers, theme, playback…) travel too — encrypted on the device like everything else.
+  // Every setting carries the time it was last changed by you; values nobody ever set get stamp 0/1 so they
+  // can never overwrite a real choice from another device.
+  const st = snap.settings || {};
+  const vals = { ...st }; delete vals._ts;
+  const ts = {};
+  for (const k of Object.keys(vals)) ts[k] = st._ts?.[k] || (has(vals[k]) ? 1 : 0);
+  snap.settings = { values: vals, ts };
+  // Other things worth having everywhere: Spotify / YouTube connections, YouTube playlist links, your taste picks…
+  const stamps = await kv.stamps(), kvx = {};
+  for (const k of SYNC_KV) {
+    const v = await kv.get(k), st2 = stamps[k];
+    if (st2?.del) kvx[k] = { del: true, ts: st2.ts };
+    else if (v !== null && v !== undefined) kvx[k] = { v, ts: st2?.ts || 1 };
+  }
+  snap.kvx = kvx;
   return snap;
+}
+// Settings: per setting, the newer change wins. A setting one side doesn't have is simply added.
+// Nothing is ever removed just because the other device doesn't know about it.
+export function mergeSettings(L, R) {
+  if (!R) return L || null;
+  if (!L) return R;
+  const values = { ...L.values }, ts = { ...L.ts };
+  for (const [k, v] of Object.entries(R.values || {})) {
+    const rt = R.ts?.[k] || 0, lt = ts[k] || 0;
+    if (!(k in values) || rt > lt) { values[k] = v; ts[k] = rt; }
+  }
+  return { values, ts };
+}
+// Synced items: the newer copy wins; a removal only wins if you removed it after the other copy was saved
+function mergeKv(L = {}, R = {}) {
+  const out = { ...L };
+  for (const [k, r] of Object.entries(R)) { const l = out[k]; if (!l || (r.ts || 0) > (l.ts || 0)) out[k] = r; }
+  return out;
 }
 
 // ---------- merge ----------
@@ -164,6 +197,7 @@ export function merge(L, R) {
   const profile = lp && rp ? ((rp.updatedAt || 0) > (lp.updatedAt || 0) ? rp : lp) : (lp || rp || null);
   return {
     app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb, profile,
+    settings: mergeSettings(L.settings, R.settings), kvx: mergeKv(L.kvx, R.kvx),
     ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1)
   };
 }
@@ -182,6 +216,28 @@ async function applyLocal(m) {
       Object.assign(local, { username: m.profile.username || local.username, picture: m.profile.picture ?? local.picture, updatedAt: m.profile.updatedAt });
       await kv.set('profile', local); emit('profile-changed', local);
     }
+  }
+  // Settings: only write if something actually changed
+  if (m.settings) {
+    const cur = (await kv.get('settings')) || {};
+    const curTs = cur._ts || {};
+    let changed = false; const next = { ...cur, _ts: { ...curTs } };
+    for (const [k, v] of Object.entries(m.settings.values)) {
+      if (JSON.stringify(cur[k]) !== JSON.stringify(v)) { next[k] = v; changed = true; }
+      if ((m.settings.ts[k] || 0) > (curTs[k] || 0)) { next._ts[k] = m.settings.ts[k]; changed = true; }
+    }
+    if (changed) { await kv.set('settings', next); emit('settings-synced', next); }
+  }
+  if (m.kvx) {
+    const stamps = await kv.stamps();
+    for (const [k, rec] of Object.entries(m.kvx)) {
+      if (!SYNC_KV.includes(k)) continue;
+      const mine = stamps[k], have = await kv.get(k);
+      // the merge already picked the winner; only write it if this device doesn't have exactly that yet
+      const same = rec.del ? (mine?.del && mine.ts === rec.ts && have === null) : (have !== null && (mine?.ts || 1) === rec.ts);
+      if (!same) await kv.putSynced(k, rec);
+    }
+    emit('kv-synced');
   }
   await store.load();
   emit('library'); emit('synced-in');
@@ -228,7 +284,7 @@ async function once() {
     // Joining with "use only the synced library": swap it in now that it has fully arrived
     // (a cancelled download leaves this device untouched)
     let replaced = false;
-    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; }
+    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; } // settings are never wiped, only merged
     base = merge(local, remote);
     step('Saving to this device…', 85);
     if (replaced || hash(base) !== hash(local)) await applyLocal(base);
@@ -323,6 +379,7 @@ export function start() {
   syncNow();
   if (started) return; started = true;
   on('dirty', why => { if (link && why !== 'synced') schedule(); });
+  onSyncedKvChange(() => { if (link) schedule(); });
   document.addEventListener('visibilitychange', () => {
     if (!link) return;
     if (document.visibilityState === 'visible' && Date.now() - S.lastSync > 15e3) syncNow();

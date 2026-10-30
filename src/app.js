@@ -54,6 +54,9 @@ async function boot() {
   on('sync-removed', () => { toast('Sync was turned off on another device — your music stays here'); if (location.hash.startsWith('#/settings')) rerender(); });
   on('synced-in', () => { if (location.hash.startsWith('#/settings') && !$('.modal-wrap')) rerender(); });
   on('profile-changed', p => { profile = p; renderProfileChip(); });
+  // Settings that arrived from another synced device
+  on('settings-synced', s => { settings = { ...settings, ...s }; applySettings(); setVoicePrefs({ name: settings.voiceName || '' }); applyLockSetting(); if (location.hash.startsWith('#/settings') && !$('.modal-wrap') && !isTyping()) rerender(); });
+  on('kv-synced', () => { ya.restoreSession(); });
   if (!profile) { welcome(joinReq); return; }
   await sync.restore();
   await showApp();
@@ -253,6 +256,7 @@ async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('
 
 function applySettings() {
   applyTheme(settings.theme || currentTheme());
+  setVoicePrefs({ recognizeKey: settings.auddToken || window.BAZINGA_CONFIG?.auddToken || '' });
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -292,7 +296,14 @@ document.addEventListener('visibilitychange', () => keepAwake());
 const themePicker = (cur = currentTheme()) => `<div class="theme-pick" role="radiogroup" aria-label="Theme colour">${THEMES.map(([k, l, c]) =>
   `<button type="button" class="tp ${k === cur ? 'on' : ''}" data-theme="${k}" role="radio" aria-checked="${k === cur}" aria-label="${l}" title="${l}" style="--c:rgb(${c.join(' ')})"><i>${icon('check')}</i><span>${l}</span></button>`).join('')}</div>`;
 function markThemePicks(name) { $$('.theme-pick .tp').forEach(b => { const on = b.dataset.theme === name; b.classList.toggle('on', on); b.setAttribute('aria-checked', on); }); }
-async function saveSettings(patch) { settings = { ...settings, ...patch }; await kv.set('settings', settings); applySettings(); emit('dirty', 'settings'); }
+// Each setting remembers when YOU last changed it, so synced devices know which value is newer.
+// Saving a form with an unchanged (or still empty) field doesn't count as a change.
+async function saveSettings(patch) {
+  const ts = { ...(settings._ts || {}) };
+  for (const [k, v] of Object.entries(patch)) if (JSON.stringify(settings[k]) !== JSON.stringify(v)) ts[k] = Date.now();
+  settings = { ...settings, ...patch, _ts: ts };
+  await kv.set('settings', settings); applySettings(); emit('dirty', 'settings');
+}
 
 async function termsGate() {
   while (profile.termsAccepted !== TERMS_VERSION) {
@@ -438,7 +449,7 @@ async function showApp() {
   route().finally(hideSplash);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
-  if (settings.wake && wakeSupported) setWake(true);
+  setWake(false); // no background listening: the mic is only on while the assistant is open
   if (navigator.storage?.persist) navigator.storage.persist();
 }
 
@@ -773,7 +784,7 @@ async function vHome(_, my) {
 
 // "Jump back in" — kept in sync with the player instantly (no page reload)
 // The BAZINGA! button: one tap builds a fresh mix of new songs from your top artists and genres
-const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt">BAZINGA!</button>`;
+const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt" width="22" height="22" decoding="sync" draggable="false">BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
 const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
@@ -1033,7 +1044,7 @@ async function bazingaMix() {
     else { pl = await store.createPlaylist(name, startIds, meta2); await kv.set('mixPl', pl.id); }
     renderSidebarPlaylists();
     nowCtx = { list: null };
-    player.playList(startIds, 0, { shuffle: false });
+    player.playList(startIds, 0, { shuffle: false, origin: 'mix' });
     // Keep the overlay up until the music actually starts (or a few seconds pass)
     const t0 = Date.now();
     const waitStart = setInterval(() => { if (ov.cancelled || P.playing || P.needsTap || P.error || Date.now() - t0 > 9000) { clearInterval(waitStart); ov.step('Enjoy ⚡', 100); setTimeout(() => ov.close(), 250); } }, 200);
@@ -1799,9 +1810,10 @@ async function vSettings([section] = []) {
           </select><button class="btn" id="voice-try" type="button">${icon('play')}Try it</button></div></div>
           `;
       })()}
-      ${wakeSupported ? `<label class="toggle"><input type="checkbox" id="set-wake" ${settings.wake ? 'checked' : ''}><span></span><div>Hands-free: say <b>"Hey Bazinga"</b> to start the assistant</div></label>
-      <p class="tiny muted">While BAZINGA! is open on screen, your browser listens for "Hey Bazinga" or "Bazinga" — then just say what you want ("Hey Bazinga, play my liked songs"). Your browser's speech service does the listening; BAZINGA! doesn't record anything. Phones may play a short chime when listening restarts, and iPhones can make music sound thinner while the mic is on — turn it off any time.</p>`
-      : '<p class="tiny muted">Hands-free "Hey Bazinga" needs a browser with speech recognition (Chrome, Edge, Safari or Samsung Internet).</p>'}
+      <p class="tiny muted">Tap a mic button to talk to BAZINGA!. The microphone is only on while the assistant is open, and the music stays quiet until it closes.</p>
+      <div class="sub-panel"><b>🎶 Song recognition</b>
+        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, like Shazam. It uses <a class="lnk" href="https://audd.io" target="_blank" rel="noopener">AudD</a>, a recognition service built for short, noisy phone recordings. ${window.BAZINGA_CONFIG?.auddToken ? 'It\'s already set up. Add your own key below only if you want your own allowance.' : 'Get an API token from AudD\'s dashboard and paste it here. It\'s kept on your devices and synced to your other devices.'}</p>
+        <form id="recog-form" class="stack"><label class="fld"><span>AudD API token</span><input name="auddToken" value="${esc(settings.auddToken || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AudD token"></label><button class="btn">Save</button></form></div>
     </div>
     <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
       <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
@@ -1856,9 +1868,9 @@ async function vSettings([section] = []) {
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
-  $('#set-wake')?.addEventListener('change', e => { saveSettings({ wake: e.target.checked }); setWake(e.target.checked); toast(e.target.checked ? 'Say "Hey Bazinga" any time ⚡' : 'Hands-free listening is off', e.target.checked ? 'ok' : 'info'); });
   $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
+  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ auddToken: e.target.auddToken.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });
@@ -2779,6 +2791,7 @@ function wirePlayerUI() {
     if (k === 'open') openNP();
     if (k === 'close') closeNP();
     if (k === 'more') { const t = player.current(); if (t) trackMenu(b, t.id); }
+    if (k === 'sleep') sleepMenu(b);
     if (k === 'mute') player.setVolume(P.volume > 0 ? 0 : 0.8);
     if (k === 'artist') { const t = player.current(); if (t) { closeNP('nav'); location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist)); } }
     if (k === 'album') { const t = player.current(); if (t) { closeNP('nav'); gotoAlbum(t); } }
@@ -2789,17 +2802,7 @@ function wirePlayerUI() {
   $('#yt-dock').addEventListener('click', handle);
   for (const r of $$('.seek')) wireSeek(r);
   $$('.vol').forEach(v => v.addEventListener('input', () => player.setVolume(+v.value)));
-  // Swipe down to close now-playing on phones
-  let y0 = null;
-  // Scroll from anywhere: a swipe or mouse wheel on the top bar / cover scrolls the page below it.
-  // Swiping DOWN there while the page is at the top closes the player.
-  // The full-screen player scrolls the page itself, so the browser moves the video natively.
-  // Pulling down on the top bar / cover while at the very top closes it.
-  let fwd = false;
-  const tStart = e => { y0 = e.target.closest('.np-top, .np-media.art') && scrollY < 2 ? e.touches[0].clientY : null; fwd = false; };
-  const tMove = e => { if (y0 !== null && e.touches[0].clientY < y0 - 6) fwd = true; };
-  const tEnd = e => { if (y0 !== null && !fwd && scrollY < 2 && e.changedTouches[0].clientY - y0 > 110) closeNP(); y0 = null; };
-  for (const el of [np, head]) { el.addEventListener('touchstart', tStart, { passive: true }); el.addEventListener('touchmove', tMove, { passive: true }); el.addEventListener('touchend', tEnd, { passive: true }); }
+  wireSwipeClose();
   let headDark = false;
   window.addEventListener('scroll', () => { const d = scrollY > 8; if (d !== headDark) { headDark = d; head.classList.toggle('scrolled', d); } }, { passive: true });
   try { history.scrollRestoration = 'manual'; } catch { }
@@ -2818,6 +2821,63 @@ function wirePlayerUI() {
   document.addEventListener('pointerover', warmArtist, { passive: true });
   document.addEventListener('touchstart', warmArtist, { passive: true });
   document.addEventListener('click', e => { const b = e.target.closest('[data-p-ext]'); if (!b) return; if (b.dataset.pExt === 'toggle') player.toggle(); if (b.dataset.pExt === 'open') openNP(); });
+}
+// Pull down to close the full-screen player (phones/tablets).
+// Works from anywhere in the player while it's scrolled to the top: the top bar, the cover, the
+// song info, the controls, and the upper part of the video (a touch strip over it, since the video
+// frame itself swallows touches; tapping that strip plays/pauses like tapping the video).
+// The player follows your finger; let go far enough (or flick) and it closes, otherwise it springs back.
+// Sliders, the queue list (when scrolled), lyrics and text boxes keep their own gestures.
+function wireSwipeClose() {
+  const body = document.body;
+  const dock = $('#yt-dock');
+  if (!dock.querySelector('.np-grab')) dock.insertAdjacentHTML('beforeend', '<div class="np-grab" aria-hidden="true"></div>');
+  let g = null;
+  const setPull = y => body.style.setProperty('--np-pull', Math.max(0, y) + 'px');
+  const skip = t => t.closest('.seek, .vol, input, textarea, select, .np-lyrics, .menu, .modal-wrap, .grip, .qrow')
+    || (t.closest('.np-q-body') && t.closest('.np-q-body').scrollTop > 0)
+    || (t.closest('#yt-dock') && !t.closest('.np-grab'));
+  const atTop = () => (window.scrollY || document.documentElement.scrollTop || 0) <= 1;
+  const start = e => {
+    g = null;
+    if (!body.classList.contains('np-open') || e.touches.length !== 1 || skip(e.target) || !atTop()) return;
+    const t = e.touches[0];
+    g = { x: t.clientX, y: t.clientY, t: Date.now(), dy: 0, on: false, grab: !!e.target.closest('.np-grab') };
+  };
+  const move = e => {
+    if (!g) return;
+    const t = e.touches[0], dx = t.clientX - g.x, dy = t.clientY - g.y;
+    if (!g.on) {
+      if (Math.abs(dy) < 8 && Math.abs(dx) < 8) return;
+      if (dy <= 0 || Math.abs(dx) > Math.abs(dy) || !atTop()) { g = null; return; } // scrolling up / sideways: not ours
+      g.on = true; body.classList.add('np-pulling'); body.classList.remove('np-springing');
+    }
+    if (e.cancelable) e.preventDefault(); // no page bounce / pull-to-refresh while pulling
+    g.dy = dy; setPull(dy < 140 ? dy : 140 + (dy - 140) * 0.7);
+  };
+  const end = () => {
+    if (!g) return;
+    const was = g; g = null;
+    if (!was.on) {
+      if (was.grab) player.toggle(); // a plain tap on the video strip = tap on the video
+      return;
+    }
+    const v = was.dy / Math.max(1, Date.now() - was.t); // px per ms
+    body.classList.remove('np-pulling'); body.classList.add('np-springing');
+    if (was.dy > 120 || (was.dy > 45 && v > 0.55)) {
+      setPull(innerHeight);
+      setTimeout(() => { closeNP(); body.classList.remove('np-springing'); setPull(0); }, 220);
+    } else {
+      setPull(0);
+      setTimeout(() => body.classList.remove('np-springing'), 260);
+    }
+  };
+  for (const el of [$('#np'), $('#np-head'), dock]) {
+    el.addEventListener('touchstart', start, { passive: true });
+    el.addEventListener('touchmove', move, { passive: false });
+    el.addEventListener('touchend', end, { passive: true });
+    el.addEventListener('touchcancel', () => { if (g?.on) { g.dy = 0; end(); } g = null; }, { passive: true });
+  }
 }
 // The yellow progress bar pauses its updates only while a finger/mouse is actually dragging it.
 // Before, a drag that never "finished" (the page scrolled instead, the bar was redrawn when the next
@@ -2877,6 +2937,46 @@ function dockSizeLabel() {
   const big = document.body.classList.contains('dock-big');
   b.setAttribute('aria-label', big ? 'Smaller video' : 'Bigger video'); b.title = big ? 'Smaller' : 'Bigger';
 }
+// ---------- Sleep timer (full-screen player, next to ⋯) ----------
+// Pick a time and the music fades out gently and pauses, or stop at the end of the current song.
+let sleepAt = 0, sleepT = null, sleepTick = null;
+const sleepLeft = () => sleepAt ? Math.max(0, sleepAt - Date.now()) : 0;
+const fmtLeft = ms => { const m = Math.ceil(ms / 60e3); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60 ? (m % 60) + ' min' : ''}`.trim() : `${m} min`; };
+function sleepBtn() {
+  const b = $('#np-head .sleep-np'); if (!b) return;
+  const on = !!sleepAt || player.stopsAfterSong();
+  b.classList.toggle('on', on);
+  const label = sleepAt ? `Sleep timer: ${fmtLeft(sleepLeft())} left` : player.stopsAfterSong() ? 'Sleep timer: stops after this song' : 'Sleep timer';
+  b.setAttribute('aria-label', label); b.title = label;
+}
+function clearSleep(quiet) {
+  clearTimeout(sleepT); clearInterval(sleepTick); sleepAt = 0; player.setStopAfterSong(false); player.cancelFade(); sleepBtn();
+  if (!quiet) toast('Sleep timer off');
+}
+function setSleep(min) {
+  clearSleep(true);
+  if (min === 'song') { player.setStopAfterSong(true); sleepBtn(); toast('Music stops after this song 🌙', 'ok'); return; }
+  sleepAt = Date.now() + min * 60e3;
+  // fade over the last 8 seconds, then pause
+  sleepT = setTimeout(() => player.fadeOutAndPause(8000), Math.max(0, min * 60e3 - 8000));
+  sleepTick = setInterval(sleepBtn, 30e3);
+  sleepBtn();
+  toast(`Sleep timer: music stops in ${fmtLeft(min * 60e3)} 🌙`, 'ok');
+}
+async function sleepMenu(btn) {
+  const active = sleepAt ? `${fmtLeft(sleepLeft())} left` : player.stopsAfterSong() ? 'Stops after this song' : '';
+  const k = await menu(btn, [
+    { header: `${icon('moon')} Sleep timer${active ? ` · <b>${active}</b>` : ''}` },
+    ...[5, 10, 15, 30, 45, 60, 90].map(m => ({ k: String(m), label: m >= 60 ? `${m / 60 === 1 ? '1 hour' : m / 60 + ' hours'}` : `${m} minutes`, icon: 'timer' })),
+    { k: 'song', label: 'End of this song', icon: 'disc' },
+    (sleepAt || player.stopsAfterSong()) ? '-' : null,
+    (sleepAt || player.stopsAfterSong()) ? { k: 'off', label: 'Turn off sleep timer', icon: 'close', danger: true } : null
+  ]);
+  if (!k) return;
+  if (k === 'off') clearSleep();
+  else setSleep(k === 'song' ? 'song' : +k);
+}
+on('sleep-done', () => { clearTimeout(sleepT); clearInterval(sleepTick); sleepAt = 0; sleepBtn(); toast('Sleep timer: music paused. Good night 🌙'); });
 function toggleNPQueue() {
   const on = !document.body.classList.contains('np-q');
   document.body.classList.toggle('np-q', on);
@@ -2893,6 +2993,7 @@ function renderPlayer() {
   document.body.classList.toggle('has-track', !!t);
   // Subtle loading veil over the video / cover while a song is starting
   document.body.classList.toggle('song-loading', !!t && !!P.loading && !P.error);
+  document.body.classList.toggle('needs-tap', !!P.needsTap);
   const dl = $('#yt-dock .dl-art');
   if (dl && t && dl.dataset.src !== (t.artwork || '')) { dl.dataset.src = t.artwork || ''; dl.style.backgroundImage = t.artwork ? `url("${sized(t.artwork, 300).replace(/"/g, '%22')}")` : ''; }
   const bar = $('#playerbar');
@@ -3013,7 +3114,7 @@ function npScrollTo(el) {
   const headH = $('#np-head')?.offsetHeight || 60;
   window.scrollTo({ top: Math.max(0, scrollY + el.getBoundingClientRect().top - headH - 8), behavior: 'smooth' });
 }
-const npNarrow = matchMedia('(max-width: 900px)');
+const npNarrow = matchMedia('(max-width: 900px), (max-height: 520px) and (orientation: landscape)'); // queue below the video on small or sideways phones
 npNarrow.addEventListener?.('change', () => { if (document.body.classList.contains('np-open')) renderNP(true); });
 const npQueueHTML = () => `<aside class="np-queue"><div class="np-q-head"><h3>Up next</h3><span class="muted tiny">Drag ${icon('grip')} to reorder</span><button class="ib sm" data-p="npq" aria-label="Hide queue">${icon('close')}</button></div><div class="np-q-body"></div></aside>`;
 function renderNP(full = false) {
@@ -3040,7 +3141,8 @@ function renderNP(full = false) {
   }
   np.dataset.key = key;
   const keep = { sc: scrollY || 0, q: $('.np-q-body')?.scrollTop || 0 };
-  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button>`;
+  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><span class="np-head-r"><button class="ib sleep-np" data-p="sleep" aria-label="Sleep timer" title="Sleep timer">${icon('timer')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button></span>`;
+  sleepBtn();
   // Layout: the top bar and the video/cover stay put; everything below scrolls on its own.
   // On wide screens the queue is a panel on the right with its own scroll.
   np.innerHTML = `<div class="np-bg ${t.artwork ? '' : 'none'}" ${t.artwork ? `style="background-image:url('${esc(sized(t.artwork, 300))}')"` : ''}></div>
@@ -3148,13 +3250,27 @@ function placeDock() {
   if (!slot) requestAnimationFrame(() => { const on = dock.classList.contains('show'); document.body.style.setProperty('--dockh', (on ? dock.offsetHeight : 0) + 'px'); document.body.style.setProperty('--dockw', (on ? dock.offsetWidth : 0) + 'px'); });
 }
 
+// Save the whole queue (BAZINGA! mix or a shuffled queue) as a new playlist, in the order it plays
+async function saveQueueAsPlaylist() {
+  const ids = P.queue.map(q => q.id).filter(id => lib.tracks.has(id));
+  if (!ids.length) return;
+  const day = new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const name = await promptText('Save queue as a playlist', `${P.origin === 'mix' ? 'My BAZINGA! Mix' : 'Shuffle'} · ${day}`, 'Playlist name', 'Save');
+  if (!name) return;
+  const transient = ids.map(id => lib.tracks.get(id)).filter(t => t.transient);
+  if (transient.length) await store.upsertTracks(transient.map(stripTransient));
+  const pl = await store.createPlaylist(name, ids, { source: 'Saved from your queue' });
+  renderSidebarPlaylists();
+  toastUndo(`Saved "${name}" · ${ids.length} songs`, () => { closeNP('nav'); location.hash = '#/playlist/' + pl.id; }, 'Open');
+}
 function renderQueue(el, force = false) {
   if (!el || qDragging) return;
   const cur = player.current();
   if (!cur) { el.innerHTML = '<p class="muted pad">Nothing playing. Pick a song to start.</p>'; el.dataset.sig = ''; return; }
   // Skip the (expensive) rebuild when nothing in the queue changed — play/pause/buffering don't touch it
   const limit = +el.dataset.limit || 100;
-  const sig = `${cur.id}|${P.cursor}|${P.queue.length}|${limit}|` + P.queue.slice(P.cursor, P.cursor + limit + 1).map(q => q.id + (q.user ? '*' : '')).join(',');
+  const canSave = player.queueIsNew();
+  const sig = `${cur.id}|${P.cursor}|${P.queue.length}|${limit}|${canSave}|` + P.queue.slice(P.cursor, P.cursor + limit + 1).map(q => q.id + (q.user ? '*' : '')).join(',');
   if (!force && el.dataset.sig === sig && el.firstChild) return;
   el.dataset.sig = sig;
   const total = P.queue.length - P.cursor - 1;
@@ -3162,7 +3278,7 @@ function renderQueue(el, force = false) {
   const row = q => { const t = lib.tracks.get(q.id); if (!t) return ''; return `<div class="qrow ${q.user ? 'user' : ''}" data-qi="${q.i}">
       <span class="grip" title="Drag to reorder">${icon('grip')}</span>${cover(t.artwork, t.title, 'sm')}<div class="row-main" data-qjump="${q.i}"><div class="row-title">${esc(displayTitle(t))}${q.user ? '<span class="qtag">queued</span>' : ''}</div><div class="row-sub">${esc(t.artist)}</div></div>
       <button class="ib sm" data-qrm="${q.i}" aria-label="Remove from queue" title="Remove">${icon('close')}</button></div>`; };
-  el.innerHTML = `<div class="q-h">Now playing</div><div class="qrow now">${cover(cur.artwork, cur.title, 'sm')}<div class="row-main"><div class="row-title">${esc(displayTitle(cur))}</div><div class="row-sub">${esc(cur.artist)}</div></div></div>
+  el.innerHTML = `<div class="q-h">Now playing${canSave ? `<button class="ib q-save" data-qsave aria-label="Save this queue as a new playlist" title="Save this queue as a playlist">${icon('plus')}</button>` : ''}</div><div class="qrow now">${cover(cur.artwork, cur.title, 'sm')}<div class="row-main"><div class="row-title">${esc(displayTitle(cur))}</div><div class="row-sub">${esc(cur.artist)}</div></div></div>
     ${after.length ? `<div class="q-h">Next up <span>${after.some(q => q.user) ? '<button class="lnk" data-qclear>Clear queued</button>' : ''}</span></div><div class="qlist">${after.map(row).join('')}</div>`
       : `<p class="muted tiny pad">Nothing after this song. ${settings.autoplay === 'off' ? 'Use ⋯ → "Add to queue" on any song.' : 'Autoplay picks up from here.'}</p>`}
     ${total > after.length ? `<button class="more-btn" data-qmore>Show more <small>${total - after.length} more</small></button>` : ''}`;
@@ -3172,6 +3288,7 @@ function renderQueue(el, force = false) {
     const j = e.target.closest('[data-qjump]'); if (j) player.jumpTo(+j.dataset.qjump);
     const r = e.target.closest('[data-qrm]'); if (r) player.removeFromQueue(+r.dataset.qrm);
     if (e.target.closest('[data-qclear]')) player.clearUserQueue();
+    if (e.target.closest('[data-qsave]')) saveQueueAsPlaylist();
   };
   // Drag to reorder — pointer events, so it works with mouse AND touch
   el.onpointerdown = e => {

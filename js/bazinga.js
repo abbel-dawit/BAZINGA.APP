@@ -56,14 +56,37 @@ const db = {
   }
 };
 
-// Simple key/value helpers
+// Simple key/value helpers.
+// Items in SYNC_KV travel to your other synced devices. Each change is time-stamped so devices can tell
+// which copy is newer. Removing one only reaches your other devices when you asked for that
+// (e.g. "Disconnect"); things that just expire on this device are never removed elsewhere.
+const SYNC_KV = ['spotifyClientId', 'spotifyToken', 'ytToken', 'ytLinks', 'ytUploads', 'taste', 'plPlays', 'mixPl'];
+const SYNCED = new Set(SYNC_KV);
+let stampsP = null, chain = Promise.resolve();
+const kvHooks = [];
+const onSyncedKvChange = fn => kvHooks.push(fn); // sync.js: send the change to your other devices
+const changedKv = k => kvHooks.forEach(f => { try { f(k); } catch { } });
+const loadStamps = () => stampsP || (stampsP = db.get('kv', '__stamps').then(v => v || {}).catch(() => ({})));
+function editStamps(fn) {
+  chain = chain.then(async () => { const s = await loadStamps(); fn(s); await db.put('kv', s, '__stamps'); }).catch(() => { });
+  return chain;
+}
 const kv = {
   get: (k, dflt = null) => db.get('kv', k).then(v => v === undefined ? dflt : v),
-  set: (k, v) => db.put('kv', v, k),
-  del: (k) => db.del('kv', k)
+  set: async (k, v) => { await db.put('kv', v, k); if (SYNCED.has(k)) { await editStamps(s => { s[k] = { ts: Date.now() }; }); changedKv(k); } },
+  del: async (k, { everywhere = false } = {}) => {
+    await db.del('kv', k);
+    if (SYNCED.has(k)) { await editStamps(s => { if (everywhere) s[k] = { ts: Date.now(), del: true }; else delete s[k]; }); if (everywhere) changedKv(k); }
+  },
+  // for sync: read the time stamps, and write a value that came from another device (keeping its stamp)
+  stamps: async () => ({ ...(await loadStamps()) }),
+  putSynced: async (k, rec) => {
+    if (rec.del) await db.del('kv', k); else await db.put('kv', rec.v, k);
+    await editStamps(s => { s[k] = rec.del ? { ts: rec.ts, del: true } : { ts: rec.ts }; });
+  }
 };
 
-return { STORES, db, kv };
+return { STORES, db, SYNC_KV, onSyncedKvChange, kv };
 })();
 // ---------- util.js ----------
 const __m_util = (() => {
@@ -301,6 +324,8 @@ const I = {
   unlock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.6-1.7"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
   qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  timer: '<circle cx="12" cy="13.5" r="7.5"/><path d="M12 9.5v4l2.6 1.6M9.5 2.5h5M12 2.5V6M18.8 6.7l1.5-1.5"/>',
+  moon: '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
   thumbUp: '<path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M7 10l4-7a2.5 2.5 0 0 1 3 2.6L13.4 9H19a2 2 0 0 1 2 2.3l-1.3 8A2 2 0 0 1 17.7 21H7"/>',
   thumbDown: '<path d="M17 14V3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1z"/><path d="M17 14l-4 7a2.5 2.5 0 0 1-3-2.6l.6-3.4H5a2 2 0 0 1-2-2.3l1.3-8A2 2 0 0 1 6.3 3H17"/>',
   sad: '<circle cx="12" cy="12" r="10"/><path d="M8 16.5c1-1.4 2.4-2.1 4-2.1s3 .7 4 2.1"/><circle cx="8.8" cy="9.6" r="1.1" fill="currentColor"/><circle cx="15.2" cy="9.6" r="1.1" fill="currentColor"/>'
@@ -1690,7 +1715,7 @@ async function signIn({ prompt = '' } = {}) {
 }
 async function signOut() {
   try { if (token && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(token.access, () => { }); } catch { }
-  token = null; await kv.del('ytToken'); emit('yt-account');
+  token = null; await kv.del('ytToken', { everywhere: true }); emit('yt-account');
 }
 
 class QuotaError extends Error { constructor() { super('YouTube\'s daily limit for this app has been reached. Your upload is saved — tap "Resume" tomorrow (limits reset at midnight Pacific time), or add your own Google key in Settings for your own limit.'); this.quota = true; } }
@@ -1864,7 +1889,7 @@ async function token() {
 }
 
 const isConnected = async () => !!(await kv.get('spotifyToken'));
-const disconnect = () => kv.del('spotifyToken');
+const disconnect = () => kv.del('spotifyToken', { everywhere: true });
 
 async function api(url) {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -2217,6 +2242,7 @@ const { logoSrc } = __m_ui;
 
 const P = {
   queue: [],          // [{id, user}]
+  origin: '',         // where the queue came from: 'mix' (BAZINGA! button) or '' (a list played as-is)
   cursor: -1,
   mode: 'video',      // 'video' | 'audio' — music video is the default
   preferOffline: true,
@@ -2250,7 +2276,7 @@ const changed = () => {
   if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
 };
 const persist = debounce(() => kv.set('player', {
-  queue: P.queue, cursor: P.cursor, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
+  queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
   time: Math.floor(P.time || 0)
 }), 500);
 const setEndHook = fn => { endHook = fn; };
@@ -2464,7 +2490,24 @@ function prefetch(id) {
   if (t && navigator.onLine && !(t.localFileId && P.preferOffline)) yt.findForTrack(t, { need: P.mode }).catch(() => { });
 }
 
+// Sleep timer: "stop at the end of this song"
+let stopAfterSong = false;
+const setStopAfterSong = on => { stopAfterSong = !!on; };
+const stopsAfterSong = () => stopAfterSong;
+// Sleep timer: gently fade the music out, then pause (the saved volume is never touched)
+let fadeT = null;
+function fadeOutAndPause(ms = 8000) {
+  clearInterval(fadeT);
+  const t0 = Date.now(), from = duckLevel;
+  fadeT = setInterval(() => {
+    const k = Math.min(1, (Date.now() - t0) / ms);
+    duckLevel = from * (1 - k); applyVol();
+    if (k >= 1) { clearInterval(fadeT); pause(); setTimeout(() => { duckLevel = 1; applyVol(); }, 400); emit('sleep-done'); }
+  }, 100);
+}
+const cancelFade = () => { if (fadeT) { clearInterval(fadeT); fadeT = null; duckLevel = 1; applyVol(); } };
 function ended() {
+  if (stopAfterSong) { stopAfterSong = false; seek(0); pause(); emit('sleep-done'); return; }
   if (P.repeat === 'one') { seek(0); play(); return; }
   next(true);
 }
@@ -2502,6 +2545,9 @@ function seek(sec) {
   P.time = sec; emit('time', P);
 }
 
+// Worth saving as a new playlist? Only a queue BAZINGA! made or one that's shuffled — a list playing
+// in its own order already exists as that playlist/album.
+const queueIsNew = () => P.queue.length > 1 && (P.origin === 'mix' || !!P.shuffle);
 function next(auto = false) {
   if (!P.queue.length) return;
   if (P.cursor < P.queue.length - 1) P.cursor++;
@@ -2512,7 +2558,7 @@ function next(auto = false) {
     if (plan?.ids?.length) {
       let list = plan.ids.filter(id => lib.tracks.has(id)).map(id => ({ id, user: false }));
       if (plan.shuffle) list.sort(() => Math.random() - 0.5);
-      if (list.length) { P.queue = list; P.cursor = 0; if (plan.msg) toast(plan.msg); load(true); return; }
+      if (list.length) { P.queue = list; P.cursor = 0; P.origin = ''; if (plan.msg) toast(plan.msg); load(true); return; }
     }
     if (auto) { P.playing = false; wantPlay = false; changed(); }
     return;
@@ -2526,7 +2572,7 @@ function prev() {
 }
 
 // Replace the queue with a list and start at `start`
-function playList(ids, start = 0, { shuffle = P.shuffle } = {}) {
+function playList(ids, start = 0, { shuffle = P.shuffle, origin = '' } = {}) {
   ids = ids.filter(id => lib.tracks.has(id));
   if (!ids.length) return toast('Nothing to play');
   let list = ids.map(id => ({ id, user: false }));
@@ -2535,7 +2581,7 @@ function playList(ids, start = 0, { shuffle = P.shuffle } = {}) {
     list.sort(() => Math.random() - 0.5);
     list.unshift(first); start = 0;
   }
-  P.queue = list; P.cursor = start; P.shuffle = shuffle;
+  P.queue = list; P.cursor = start; P.shuffle = shuffle; P.origin = origin;
   load(true);
 }
 
@@ -2650,7 +2696,7 @@ function stopAll() {
   P.queue = []; P.cursor = -1; P.playing = false; changed();
 }
 
-return { P, isOn, setEndHook, audioMode, current, restore, warmup, prefetch, play, pause, toggle, seek, next, prev, playList, addToQueue, appendToQueue, removeFromQueue, moveInQueue, jumpTo, clearQueue, clearUserQueue, setShuffle, cycleRepeat, setVolume, duck, setMode, setPreferOffline, reloadCurrent, refreshOutput, stopAll };
+return { P, isOn, setEndHook, audioMode, current, restore, warmup, prefetch, setStopAfterSong, stopsAfterSong, fadeOutAndPause, cancelFade, play, pause, toggle, seek, queueIsNew, next, prev, playList, addToQueue, appendToQueue, removeFromQueue, moveInQueue, jumpTo, clearQueue, clearUserQueue, setShuffle, cycleRepeat, setVolume, duck, setMode, setPreferOffline, reloadCurrent, refreshOutput, stopAll };
 })();
 // ---------- backup.js ----------
 const __m_backup = (() => {
@@ -2788,7 +2834,7 @@ const __m_sync = (() => {
 // Copies on the relay last about 3 hours, so every open device re-posts its library at least once
 // an hour, and devices merge whatever is newer (newest edit wins per item, likes merge
 // separately, deletions are remembered). Your own device always keeps the full library.
-const { db, kv } = __m_db;
+const { db, kv, SYNC_KV, onSyncedKvChange } = __m_db;
 const { emit, on, debounce } = __m_util;
 const store = __m_store;
 const backup = __m_backup;
@@ -2887,7 +2933,7 @@ async function fetchFile(m) {
 }
 
 function hash(snap) {
-  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.profile]);
+  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.profile, snap.settings || null, snap.kvx || null]);
   let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
   return (h >>> 0).toString(36) + ':' + s.length;
 }
@@ -2900,8 +2946,41 @@ async function localSnap() {
   const p = snap.profile;
   snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
   delete snap.player; delete snap.createdAt;
-  delete snap.settings; // settings (and any private keys/tokens) stay on the device they were set on
+  // Settings (keys, tokens, servers, theme, playback…) travel too — encrypted on the device like everything else.
+  // Every setting carries the time it was last changed by you; values nobody ever set get stamp 0/1 so they
+  // can never overwrite a real choice from another device.
+  const st = snap.settings || {};
+  const vals = { ...st }; delete vals._ts;
+  const ts = {};
+  for (const k of Object.keys(vals)) ts[k] = st._ts?.[k] || (has(vals[k]) ? 1 : 0);
+  snap.settings = { values: vals, ts };
+  // Other things worth having everywhere: Spotify / YouTube connections, YouTube playlist links, your taste picks…
+  const stamps = await kv.stamps(), kvx = {};
+  for (const k of SYNC_KV) {
+    const v = await kv.get(k), st2 = stamps[k];
+    if (st2?.del) kvx[k] = { del: true, ts: st2.ts };
+    else if (v !== null && v !== undefined) kvx[k] = { v, ts: st2?.ts || 1 };
+  }
+  snap.kvx = kvx;
   return snap;
+}
+// Settings: per setting, the newer change wins. A setting one side doesn't have is simply added.
+// Nothing is ever removed just because the other device doesn't know about it.
+function mergeSettings(L, R) {
+  if (!R) return L || null;
+  if (!L) return R;
+  const values = { ...L.values }, ts = { ...L.ts };
+  for (const [k, v] of Object.entries(R.values || {})) {
+    const rt = R.ts?.[k] || 0, lt = ts[k] || 0;
+    if (!(k in values) || rt > lt) { values[k] = v; ts[k] = rt; }
+  }
+  return { values, ts };
+}
+// Synced items: the newer copy wins; a removal only wins if you removed it after the other copy was saved
+function mergeKv(L = {}, R = {}) {
+  const out = { ...L };
+  for (const [k, r] of Object.entries(R)) { const l = out[k]; if (!l || (r.ts || 0) > (l.ts || 0)) out[k] = r; }
+  return out;
 }
 
 // ---------- merge ----------
@@ -2942,6 +3021,7 @@ function merge(L, R) {
   const profile = lp && rp ? ((rp.updatedAt || 0) > (lp.updatedAt || 0) ? rp : lp) : (lp || rp || null);
   return {
     app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb, profile,
+    settings: mergeSettings(L.settings, R.settings), kvx: mergeKv(L.kvx, R.kvx),
     ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1)
   };
 }
@@ -2960,6 +3040,28 @@ async function applyLocal(m) {
       Object.assign(local, { username: m.profile.username || local.username, picture: m.profile.picture ?? local.picture, updatedAt: m.profile.updatedAt });
       await kv.set('profile', local); emit('profile-changed', local);
     }
+  }
+  // Settings: only write if something actually changed
+  if (m.settings) {
+    const cur = (await kv.get('settings')) || {};
+    const curTs = cur._ts || {};
+    let changed = false; const next = { ...cur, _ts: { ...curTs } };
+    for (const [k, v] of Object.entries(m.settings.values)) {
+      if (JSON.stringify(cur[k]) !== JSON.stringify(v)) { next[k] = v; changed = true; }
+      if ((m.settings.ts[k] || 0) > (curTs[k] || 0)) { next._ts[k] = m.settings.ts[k]; changed = true; }
+    }
+    if (changed) { await kv.set('settings', next); emit('settings-synced', next); }
+  }
+  if (m.kvx) {
+    const stamps = await kv.stamps();
+    for (const [k, rec] of Object.entries(m.kvx)) {
+      if (!SYNC_KV.includes(k)) continue;
+      const mine = stamps[k], have = await kv.get(k);
+      // the merge already picked the winner; only write it if this device doesn't have exactly that yet
+      const same = rec.del ? (mine?.del && mine.ts === rec.ts && have === null) : (have !== null && (mine?.ts || 1) === rec.ts);
+      if (!same) await kv.putSynced(k, rec);
+    }
+    emit('kv-synced');
   }
   await store.load();
   emit('library'); emit('synced-in');
@@ -3006,7 +3108,7 @@ async function once() {
     // Joining with "use only the synced library": swap it in now that it has fully arrived
     // (a cancelled download leaves this device untouched)
     let replaced = false;
-    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; }
+    if (link.replace) { replaced = true; local.tracks = []; local.albums = []; local.playlists = []; local.tombstones = { t: {}, p: {}, a: {} }; if (local.profile) local.profile.updatedAt = 0; delete link.replace; } // settings are never wiped, only merged
     base = merge(local, remote);
     step('Saving to this device…', 85);
     if (replaced || hash(base) !== hash(local)) await applyLocal(base);
@@ -3101,6 +3203,7 @@ function start() {
   syncNow();
   if (started) return; started = true;
   on('dirty', why => { if (link && why !== 'synced') schedule(); });
+  onSyncedKvChange(() => { if (link) schedule(); });
   document.addEventListener('visibilitychange', () => {
     if (!link) return;
     if (document.visibilityState === 'visible' && Date.now() - S.lastSync > 15e3) syncNow();
@@ -3110,7 +3213,7 @@ function start() {
   setInterval(() => { if (document.visibilityState === 'visible' && link) syncNow(); }, 90e3);
 }
 
-return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, cancel, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
+return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, cancel, mergeSettings, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
 })();
 // ---------- voice.js ----------
 const __m_voice = (() => {
@@ -3124,7 +3227,7 @@ const store = __m_store;
 const meta = __m_meta;
 const player = __m_player;
 const { P } = __m_player;
-const { $, esc, norm, mainArtist, displayTitle, emit } = __m_util;
+const { $, esc, norm, mainArtist, displayTitle, emit, trackKey, sleep } = __m_util;
 
 const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
 // Brave ships the speech API but can't reach Google's speech service, so it gets the text box instead
@@ -3164,7 +3267,7 @@ function voiceScore(v) {
   if (/microsoft (david|zira|mark|hazel|george)(?!.*natural)/i.test(n)) s -= 10; // older desktop voices
   return s;
 }
-let voicePref = '', rate = 1;
+let voicePref = '', rate = 1, recogKey = '';
 function voiceOptions() {
   if (!('speechSynthesis' in window)) return [];
   const vs = speechSynthesis.getVoices().map(v => ({ v, s: voiceScore(v) })).filter(x => x.s > -50).sort((a, b) => b.s - a.s);
@@ -3176,7 +3279,8 @@ function pickVoice() {
   if (voicePref) { const v = vs.find(x => x.name === voicePref); if (v) return v; }
   return vs.slice().sort((a, b) => voiceScore(b) - voiceScore(a))[0];
 }
-function setVoicePrefs({ name, speed } = {}) {
+function setVoicePrefs({ name, speed, recognizeKey } = {}) {
+  if (recognizeKey !== undefined) recogKey = recognizeKey || '';
   if (name !== undefined) { voicePref = name || ''; voice = pickVoice(); }
   if (speed) rate = speed;
 }
@@ -3267,7 +3371,7 @@ function setState(s) { const v = el(); if (v) v.dataset.state = s; }
 function setHeard(t) { const h = el()?.querySelector('.vc-heard'); if (h) { h.textContent = t; h.classList.toggle('empty', !t); } }
 function setReply(t) { const r = el()?.querySelector('.vc-reply'); if (r) r.textContent = t; }
 
-const SUGGEST = ['Play my liked songs', 'Play Blinding Lights by The Weeknd', 'Add Essence to the queue', 'Search for Burna Boy', 'Go to my artists', 'Show the lyrics', 'Switch to music video', 'What\'s playing?'];
+const SUGGEST = ['What song is this?', 'Play my liked songs', 'Play Blinding Lights by The Weeknd', 'Add Essence to the queue', 'Search for Burna Boy', 'Go to my artists', 'Show the lyrics', 'Switch to music video', 'What\'s playing?'];
 
 function initVoice(hooks) {
   app = hooks;
@@ -3281,12 +3385,17 @@ function initVoice(hooks) {
       <div class="vc-reply">${canListen ? 'Listening… try "Play my liked songs"' : 'Type what you\'d like — for example "Play Tapout by Rich Gang"'}</div>
       <div class="vc-confirm" hidden><button class="btn primary" data-vc="yes">${'Yes, play it'}</button><button class="btn" data-vc="no">No</button></div>
       <form class="vc-form"><input name="q" placeholder="${canListen ? 'Or type a request…' : 'Type a request…'}" autocomplete="off" enterkeyhint="go"><button class="btn primary sm">Go</button></form>
+      <button type="button" class="btn vc-id" data-vc="identify">${'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>'}What song is playing around me?</button>
+      <div class="vc-song" hidden></div>
       <div class="vc-sugg">${SUGGEST.map(s => `<button class="chip" data-vc-say="${esc(s)}">${esc(s)}</button>`).join('')}</div>
     </div>`;
   document.body.appendChild(wrap);
   wrap.addEventListener('click', e => {
     const c = e.target.closest('[data-vc]');
     if (c?.dataset.vc === 'close') close();
+    if (c?.dataset.vc === 'identify') { stopListening(); setHeard('What song is playing around me?'); identifyNow(); }
+    if (c?.dataset.vc === 'song-play') playFound();
+    if (c?.dataset.vc === 'song-like') likeFound();
     if (c?.dataset.vc === 'mic') listening ? stopListening() : listen();
     if (c?.dataset.vc === 'yes' || c?.dataset.vc === 'no') { stopListening(); setHeard(c.dataset.vc === 'yes' ? 'Yes' : 'No'); handle(c.dataset.vc); }
     const s = e.target.closest('[data-vc-say]'); if (s) { setHeard(s.dataset.vcSay); handle(s.dataset.vcSay); }
@@ -3335,6 +3444,7 @@ function micUI(on) {
 }
 function close() {
   open = false;
+  stopIdentify(); songCard(null);
   micUI(false); // first, so nothing below can leave the mic looking active
   clearTimeout(closeTimer); pending = null; confirmUI(false);
   stopListening(); try { speechSynthesis.cancel(); } catch { }
@@ -3649,7 +3759,7 @@ async function handle(raw, alts = []) {
   if (!listening) setState('idle');
   restoreAudio();
   // Task done: close the assistant (stays open if it couldn't help, so you can try again)
-  if (open && !listening && !pending) scheduleClose(keep ? 8000 : 600);
+  if (open && !listening && !pending) scheduleClose(found ? 20000 : keep ? 8000 : 600);
 }
 
 async function run(q, alts = []) {
@@ -3675,8 +3785,11 @@ async function run(q, alts = []) {
   if (/^(hide|close)( the)? lyrics/.test(q)) { app.lyrics(false); return say('Lyrics hidden.'); }
   if (/^(open|show|go to)( the)? (now playing|full ?screen|player)$/.test(q)) { app.openNP(); return say('Here you go.'); }
   if (/^(close|exit|leave)( the)? (now playing|full ?screen|player)$/.test(q)) { app.closeNP(); return say('Okay.'); }
+  // --- song recognition (music playing around you, like Shazam)
+  if (IDENTIFY.test(q)) return identify();
   if (/^(what'?s|what is) (this|playing|this song)|^what song is (this|playing)|^who (sings|is singing|made) (this|it)|^what am i listening to/.test(q)) {
-    if (!cur) return say('Nothing\'s playing right now.');
+    // BAZINGA! isn't playing anything, so they mean the music around them
+    if (!cur || !player.isOn()) return identify();
     return say(`This is ${displayTitle(cur)} by ${cur.artist}${cur.album ? `, from ${cur.album}` : ''}.`);
   }
   if (/^(i )?(like|love)( this| this song| it)$|^(save|like|add) (this|this song|it) to (my )?(liked|likes|favorites|library)/.test(q)) {
@@ -3718,6 +3831,136 @@ async function run(q, alts = []) {
 }
 const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 
+// ---------- "What song is this?" — music recognition ----------
+// Records a few seconds through the microphone and asks a music-recognition service built for short,
+// noisy phone recordings (AudD, the same kind of fingerprinting Shazam uses). To do well in loud rooms:
+//  • the browser's speech filters (noise suppression, echo cancelling, auto gain) are switched OFF —
+//    they're made for voices and wipe out exactly the parts of music that identify a song;
+//  • BAZINGA!'s own music stays muted while it listens;
+//  • it checks after ~6 s, and if there's no match it keeps recording and tries again with a longer,
+//    clearer sample (~11 s, then ~16 s) — longer clips beat background chatter.
+// Needs an AudD key (Settings → Voice assistant, or the app owner's key in index.html).
+const IDENTIFY = /\b(identify|recogni[sz]e|shazam|name (this|that) (song|tune)|what song is (playing|this) (around|near|here|in here|right now)|(around|near) me|what('?s| is) (this|that) song (playing|on)|listen to (this|the) (song|music))\b|^what song is that\b/;
+let ident = null, found = null;
+const sleepOr = (ms, job) => new Promise(r => { const t = setTimeout(r, ms); job.wake = () => { clearTimeout(t); r(); }; });
+function stopIdentify() {
+  const j = ident; ident = null; if (!j) return;
+  j.stopped = true; j.wake?.();
+  try { if (j.rec?.state !== 'inactive') j.rec.stop(); } catch { }
+  try { j.stream?.getTracks().forEach(t => t.stop()); } catch { }
+  try { j.meterOff?.(); } catch { }
+  el()?.classList.remove('identifying');
+  player.audioMode('playback'); micEndedAt = Date.now();
+}
+async function lookupSong(blob, token) {
+  const ext = /mp4|aac|m4a/.test(blob.type) ? 'm4a' : /ogg/.test(blob.type) ? 'ogg' : 'webm';
+  const fd = new FormData();
+  fd.append('api_token', token); fd.append('file', blob, 'sample.' + ext); fd.append('return', 'apple_music,spotify');
+  const url = window.BAZINGA_CONFIG?.recognizeUrl || 'https://api.audd.io/';
+  let r;
+  try { r = await fetch(url, { method: 'POST', body: fd }); }
+  catch { const e = new Error('I couldn\'t reach the song recognition service. Check your connection and try again.'); e.fatal = true; throw e; }
+  const j = await r.json().catch(() => ({}));
+  if (j.status === 'error') {
+    const code = j.error?.error_code;
+    const e = new Error(code === 900 || code === 901 ? 'The song recognition key isn\'t working. Check it in Settings → Voice assistant.' : code === 902 ? 'Song recognition has hit its limit for now. Try again later.' : 'I couldn\'t make out the music. Try again closer to the speaker.');
+    e.fatal = code >= 900 && code < 1000; throw e;
+  }
+  return j.result || null;
+}
+function songFrom(res) {
+  const am = res.apple_music, sp = res.spotify;
+  const artwork = am?.artwork?.url ? am.artwork.url.replace('{w}', 600).replace('{h}', 600) : (sp?.album?.images?.[0]?.url || '');
+  return { title: res.title, artist: res.artist, album: res.album || '', releaseDate: res.release_date || '', artwork, link: res.song_link || '' };
+}
+function songCard(s) {
+  const box = el()?.querySelector('.vc-song'); if (!box) return;
+  found = s;
+  if (!s) { box.hidden = true; box.innerHTML = ''; return; }
+  box.hidden = false;
+  box.innerHTML = `${s.artwork ? `<img src="${esc(s.artwork)}" alt="">` : '<div class="vc-song-art"></div>'}
+    <div class="vc-song-t"><b>${esc(s.title)}</b><span>${esc(s.artist)}${s.album ? ' · ' + esc(s.album) : ''}</span></div>
+    <div class="vc-song-b"><button type="button" class="btn primary sm" data-vc="song-play">Play it</button><button type="button" class="btn sm" data-vc="song-like">Like</button></div>`;
+}
+async function foundTrack() {
+  const s = found; if (!s) return null;
+  // the catalogue's version (cover, album, genre) when there is one, otherwise what was recognised
+  let t = null;
+  try { const res = await meta.withTimeout(meta.searchSongs(`${mainArtist(s.artist)} ${s.title}`, 8), 4000, []); t = res.find(r => norm(r.title) === norm(s.title) && norm(mainArtist(r.artist)) === norm(mainArtist(s.artist))) || null; } catch { }
+  t = t || { id: trackKey(s.artist, s.title), title: s.title, artist: s.artist, artists: [s.artist], album: s.album, artwork: s.artwork, releaseDate: s.releaseDate };
+  return lib.tracks.get(t.id) || store.remember(t);
+}
+async function playFound() { const t = await foundTrack(); if (!t) return; player.playList([t.id], 0, { shuffle: false }); found = null; say(`Playing ${t.title}.`); scheduleClose(1200); }
+async function likeFound() {
+  const t = await foundTrack(); if (!t) return;
+  if (!t.liked || t.transient) await store.upsertTracks([{ ...t, liked: true, likedAt: Date.now() }]);
+  const b = el()?.querySelector('[data-vc="song-like"]'); if (b) { b.textContent = 'Liked ♥'; b.disabled = true; }
+  app?.toast?.('Added to Liked Songs ♥', 'ok');
+}
+function meter(stream) {
+  const ac = unlockChime(); if (!ac) return () => { };
+  try {
+    const src = ac.createMediaStreamSource(stream), an = ac.createAnalyser(); an.fftSize = 512; src.connect(an);
+    const buf = new Uint8Array(an.fftSize); let on = true;
+    const tick = () => { if (!on) return; an.getByteTimeDomainData(buf); let m = 0; for (const v of buf) m = Math.max(m, Math.abs(v - 128)); el()?.style.setProperty('--lvl', Math.min(1, m / 60).toFixed(2)); requestAnimationFrame(tick); };
+    tick();
+    return () => { on = false; try { src.disconnect(); } catch { } el()?.style.setProperty('--lvl', 0); };
+  } catch { return () => { }; }
+}
+async function identifyNow() {
+  keep = false; clearTimeout(closeTimer);
+  try { await identify(); } catch (e) { console.warn(e); }
+  if (open && !listening && !pending) scheduleClose(found ? 20000 : keep ? 8000 : 600);
+}
+async function identify() {
+  stopIdentify(); stopListening(); songCard(null);
+  try { speechSynthesis.cancel(); } catch { }
+  const token = recogKey || window.BAZINGA_CONFIG?.auddToken || '';
+  if (!token) return fail('Song recognition needs an AudD key. Add one in Settings → Voice assistant.');
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return fail('This browser can\'t record audio for song recognition. Try Chrome or Safari.');
+  const job = ident = { stopped: false };
+  el()?.classList.add('identifying');
+  setState('listening'); setReply('Listening to the music around you 🎶 Hold your phone close to the speaker.');
+  duck(true); chime();
+  try {
+    // raw sound: the voice filters would erase the music's fingerprint
+    job.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 44100 } })
+      .catch(() => navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } }));
+  } catch {
+    stopIdentify();
+    return fail('I need microphone access to hear the song. Allow it in your browser\'s site settings.');
+  }
+  if (job.stopped) { job.stream.getTracks().forEach(t => t.stop()); return; }
+  usedMic = true;
+  job.meterOff = meter(job.stream);
+  const type = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported?.(t)) || '';
+  const chunks = [];
+  job.rec = new MediaRecorder(job.stream, type ? { mimeType: type, audioBitsPerSecond: 128000 } : undefined);
+  job.rec.ondataavailable = e => { if (e.data?.size) chunks.push(e.data); };
+  job.rec.start(500);
+  const t0 = Date.now();
+  let res = null, err = null;
+  for (const [i, at] of [6000, 11000, 16000].entries()) {
+    await sleepOr(Math.max(0, at - (Date.now() - t0)), job);
+    if (job.stopped || !open) return;
+    try { job.rec.requestData?.(); } catch { }
+    await sleep(120);
+    setState('thinking');
+    setReply(i === 0 ? 'Got it, checking… 🔎' : 'Still listening for a clearer sample… 🎧');
+    try { res = await lookupSong(new Blob(chunks, { type: job.rec.mimeType || type || 'audio/webm' }), token); err = null; }
+    catch (e) { err = e; if (e.fatal) break; }
+    if (res || job.stopped || !open) break;
+    setState('listening');
+  }
+  stopIdentify();
+  if (!open) return;
+  if (err && !res) return fail(err.message);
+  if (!res) return fail('I couldn\'t catch that one 😕 Get closer to the speaker and try again.');
+  const s = songFrom(res);
+  songCard(s); keep = true;
+  return say(rand([`That's ${s.title} by ${s.artist}.`, `Got it! ${s.title} by ${s.artist}.`, `This is ${s.title} by ${s.artist}.`]));
+}
+
 
 // ---------- "Hey BAZINGA" — hands-free wake word (opt-in, Settings → Voice assistant) ----------
 // While it's on and BAZINGA! is open on screen, the browser listens in the background. Saying
@@ -3727,8 +3970,10 @@ const WAKE = /\b(?:hey|hi|okay|ok|yo|a)?[\s,]*(ba[\s-]?[sz]ing(?:a|er|ah|uh|o)|b
 let wakeOn = false, wakeRec = null, wakeTimer = null, wakeFails = 0, wakeHeard = false, wakeHeardTimer = null, wakeNeedsTap = false;
 const wakeSupported = canListen;
 const wakeActive = () => wakeOn;
+// "Hey Bazinga" background listening has been retired: the microphone is only ever on while the
+// assistant is open. setWake() always turns it off (kept so older saved settings can't switch it on).
 function setWake(on) {
-  wakeOn = !!on && canListen;
+  wakeOn = false;
   if (wakeOn) { wakeFails = 0; startWake(); } else stopWake();
   emit('wake', wakeOn);
 }
@@ -4100,6 +4345,9 @@ async function boot() {
   on('sync-removed', () => { toast('Sync was turned off on another device — your music stays here'); if (location.hash.startsWith('#/settings')) rerender(); });
   on('synced-in', () => { if (location.hash.startsWith('#/settings') && !$('.modal-wrap')) rerender(); });
   on('profile-changed', p => { profile = p; renderProfileChip(); });
+  // Settings that arrived from another synced device
+  on('settings-synced', s => { settings = { ...settings, ...s }; applySettings(); setVoicePrefs({ name: settings.voiceName || '' }); applyLockSetting(); if (location.hash.startsWith('#/settings') && !$('.modal-wrap') && !isTyping()) rerender(); });
+  on('kv-synced', () => { ya.restoreSession(); });
   if (!profile) { welcome(joinReq); return; }
   await sync.restore();
   await showApp();
@@ -4299,6 +4547,7 @@ async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('
 
 function applySettings() {
   applyTheme(settings.theme || currentTheme());
+  setVoicePrefs({ recognizeKey: settings.auddToken || window.BAZINGA_CONFIG?.auddToken || '' });
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -4338,7 +4587,14 @@ document.addEventListener('visibilitychange', () => keepAwake());
 const themePicker = (cur = currentTheme()) => `<div class="theme-pick" role="radiogroup" aria-label="Theme colour">${THEMES.map(([k, l, c]) =>
   `<button type="button" class="tp ${k === cur ? 'on' : ''}" data-theme="${k}" role="radio" aria-checked="${k === cur}" aria-label="${l}" title="${l}" style="--c:rgb(${c.join(' ')})"><i>${icon('check')}</i><span>${l}</span></button>`).join('')}</div>`;
 function markThemePicks(name) { $$('.theme-pick .tp').forEach(b => { const on = b.dataset.theme === name; b.classList.toggle('on', on); b.setAttribute('aria-checked', on); }); }
-async function saveSettings(patch) { settings = { ...settings, ...patch }; await kv.set('settings', settings); applySettings(); emit('dirty', 'settings'); }
+// Each setting remembers when YOU last changed it, so synced devices know which value is newer.
+// Saving a form with an unchanged (or still empty) field doesn't count as a change.
+async function saveSettings(patch) {
+  const ts = { ...(settings._ts || {}) };
+  for (const [k, v] of Object.entries(patch)) if (JSON.stringify(settings[k]) !== JSON.stringify(v)) ts[k] = Date.now();
+  settings = { ...settings, ...patch, _ts: ts };
+  await kv.set('settings', settings); applySettings(); emit('dirty', 'settings');
+}
 
 async function termsGate() {
   while (profile.termsAccepted !== TERMS_VERSION) {
@@ -4484,7 +4740,7 @@ async function showApp() {
   route().finally(hideSplash);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
-  if (settings.wake && wakeSupported) setWake(true);
+  setWake(false); // no background listening: the mic is only on while the assistant is open
   if (navigator.storage?.persist) navigator.storage.persist();
 }
 
@@ -4819,7 +5075,7 @@ async function vHome(_, my) {
 
 // "Jump back in" — kept in sync with the player instantly (no page reload)
 // The BAZINGA! button: one tap builds a fresh mix of new songs from your top artists and genres
-const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt">BAZINGA!</button>`;
+const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix"><img src="${logoSrc()}" alt="" class="bz-bolt" width="22" height="22" decoding="sync" draggable="false">BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
 const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
@@ -5079,7 +5335,7 @@ async function bazingaMix() {
     else { pl = await store.createPlaylist(name, startIds, meta2); await kv.set('mixPl', pl.id); }
     renderSidebarPlaylists();
     nowCtx = { list: null };
-    player.playList(startIds, 0, { shuffle: false });
+    player.playList(startIds, 0, { shuffle: false, origin: 'mix' });
     // Keep the overlay up until the music actually starts (or a few seconds pass)
     const t0 = Date.now();
     const waitStart = setInterval(() => { if (ov.cancelled || P.playing || P.needsTap || P.error || Date.now() - t0 > 9000) { clearInterval(waitStart); ov.step('Enjoy ⚡', 100); setTimeout(() => ov.close(), 250); } }, 200);
@@ -5845,9 +6101,10 @@ async function vSettings([section] = []) {
           </select><button class="btn" id="voice-try" type="button">${icon('play')}Try it</button></div></div>
           `;
       })()}
-      ${wakeSupported ? `<label class="toggle"><input type="checkbox" id="set-wake" ${settings.wake ? 'checked' : ''}><span></span><div>Hands-free: say <b>"Hey Bazinga"</b> to start the assistant</div></label>
-      <p class="tiny muted">While BAZINGA! is open on screen, your browser listens for "Hey Bazinga" or "Bazinga" — then just say what you want ("Hey Bazinga, play my liked songs"). Your browser's speech service does the listening; BAZINGA! doesn't record anything. Phones may play a short chime when listening restarts, and iPhones can make music sound thinner while the mic is on — turn it off any time.</p>`
-      : '<p class="tiny muted">Hands-free "Hey Bazinga" needs a browser with speech recognition (Chrome, Edge, Safari or Samsung Internet).</p>'}
+      <p class="tiny muted">Tap a mic button to talk to BAZINGA!. The microphone is only on while the assistant is open, and the music stays quiet until it closes.</p>
+      <div class="sub-panel"><b>🎶 Song recognition</b>
+        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, like Shazam. It uses <a class="lnk" href="https://audd.io" target="_blank" rel="noopener">AudD</a>, a recognition service built for short, noisy phone recordings. ${window.BAZINGA_CONFIG?.auddToken ? 'It\'s already set up. Add your own key below only if you want your own allowance.' : 'Get an API token from AudD\'s dashboard and paste it here. It\'s kept on your devices and synced to your other devices.'}</p>
+        <form id="recog-form" class="stack"><label class="fld"><span>AudD API token</span><input name="auddToken" value="${esc(settings.auddToken || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AudD token"></label><button class="btn">Save</button></form></div>
     </div>
     <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
       <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
@@ -5902,9 +6159,9 @@ async function vSettings([section] = []) {
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
-  $('#set-wake')?.addEventListener('change', e => { saveSettings({ wake: e.target.checked }); setWake(e.target.checked); toast(e.target.checked ? 'Say "Hey Bazinga" any time ⚡' : 'Hands-free listening is off', e.target.checked ? 'ok' : 'info'); });
   $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
+  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ auddToken: e.target.auddToken.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });
@@ -6825,6 +7082,7 @@ function wirePlayerUI() {
     if (k === 'open') openNP();
     if (k === 'close') closeNP();
     if (k === 'more') { const t = player.current(); if (t) trackMenu(b, t.id); }
+    if (k === 'sleep') sleepMenu(b);
     if (k === 'mute') player.setVolume(P.volume > 0 ? 0 : 0.8);
     if (k === 'artist') { const t = player.current(); if (t) { closeNP('nav'); location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist)); } }
     if (k === 'album') { const t = player.current(); if (t) { closeNP('nav'); gotoAlbum(t); } }
@@ -6835,17 +7093,7 @@ function wirePlayerUI() {
   $('#yt-dock').addEventListener('click', handle);
   for (const r of $$('.seek')) wireSeek(r);
   $$('.vol').forEach(v => v.addEventListener('input', () => player.setVolume(+v.value)));
-  // Swipe down to close now-playing on phones
-  let y0 = null;
-  // Scroll from anywhere: a swipe or mouse wheel on the top bar / cover scrolls the page below it.
-  // Swiping DOWN there while the page is at the top closes the player.
-  // The full-screen player scrolls the page itself, so the browser moves the video natively.
-  // Pulling down on the top bar / cover while at the very top closes it.
-  let fwd = false;
-  const tStart = e => { y0 = e.target.closest('.np-top, .np-media.art') && scrollY < 2 ? e.touches[0].clientY : null; fwd = false; };
-  const tMove = e => { if (y0 !== null && e.touches[0].clientY < y0 - 6) fwd = true; };
-  const tEnd = e => { if (y0 !== null && !fwd && scrollY < 2 && e.changedTouches[0].clientY - y0 > 110) closeNP(); y0 = null; };
-  for (const el of [np, head]) { el.addEventListener('touchstart', tStart, { passive: true }); el.addEventListener('touchmove', tMove, { passive: true }); el.addEventListener('touchend', tEnd, { passive: true }); }
+  wireSwipeClose();
   let headDark = false;
   window.addEventListener('scroll', () => { const d = scrollY > 8; if (d !== headDark) { headDark = d; head.classList.toggle('scrolled', d); } }, { passive: true });
   try { history.scrollRestoration = 'manual'; } catch { }
@@ -6864,6 +7112,63 @@ function wirePlayerUI() {
   document.addEventListener('pointerover', warmArtist, { passive: true });
   document.addEventListener('touchstart', warmArtist, { passive: true });
   document.addEventListener('click', e => { const b = e.target.closest('[data-p-ext]'); if (!b) return; if (b.dataset.pExt === 'toggle') player.toggle(); if (b.dataset.pExt === 'open') openNP(); });
+}
+// Pull down to close the full-screen player (phones/tablets).
+// Works from anywhere in the player while it's scrolled to the top: the top bar, the cover, the
+// song info, the controls, and the upper part of the video (a touch strip over it, since the video
+// frame itself swallows touches; tapping that strip plays/pauses like tapping the video).
+// The player follows your finger; let go far enough (or flick) and it closes, otherwise it springs back.
+// Sliders, the queue list (when scrolled), lyrics and text boxes keep their own gestures.
+function wireSwipeClose() {
+  const body = document.body;
+  const dock = $('#yt-dock');
+  if (!dock.querySelector('.np-grab')) dock.insertAdjacentHTML('beforeend', '<div class="np-grab" aria-hidden="true"></div>');
+  let g = null;
+  const setPull = y => body.style.setProperty('--np-pull', Math.max(0, y) + 'px');
+  const skip = t => t.closest('.seek, .vol, input, textarea, select, .np-lyrics, .menu, .modal-wrap, .grip, .qrow')
+    || (t.closest('.np-q-body') && t.closest('.np-q-body').scrollTop > 0)
+    || (t.closest('#yt-dock') && !t.closest('.np-grab'));
+  const atTop = () => (window.scrollY || document.documentElement.scrollTop || 0) <= 1;
+  const start = e => {
+    g = null;
+    if (!body.classList.contains('np-open') || e.touches.length !== 1 || skip(e.target) || !atTop()) return;
+    const t = e.touches[0];
+    g = { x: t.clientX, y: t.clientY, t: Date.now(), dy: 0, on: false, grab: !!e.target.closest('.np-grab') };
+  };
+  const move = e => {
+    if (!g) return;
+    const t = e.touches[0], dx = t.clientX - g.x, dy = t.clientY - g.y;
+    if (!g.on) {
+      if (Math.abs(dy) < 8 && Math.abs(dx) < 8) return;
+      if (dy <= 0 || Math.abs(dx) > Math.abs(dy) || !atTop()) { g = null; return; } // scrolling up / sideways: not ours
+      g.on = true; body.classList.add('np-pulling'); body.classList.remove('np-springing');
+    }
+    if (e.cancelable) e.preventDefault(); // no page bounce / pull-to-refresh while pulling
+    g.dy = dy; setPull(dy < 140 ? dy : 140 + (dy - 140) * 0.7);
+  };
+  const end = () => {
+    if (!g) return;
+    const was = g; g = null;
+    if (!was.on) {
+      if (was.grab) player.toggle(); // a plain tap on the video strip = tap on the video
+      return;
+    }
+    const v = was.dy / Math.max(1, Date.now() - was.t); // px per ms
+    body.classList.remove('np-pulling'); body.classList.add('np-springing');
+    if (was.dy > 120 || (was.dy > 45 && v > 0.55)) {
+      setPull(innerHeight);
+      setTimeout(() => { closeNP(); body.classList.remove('np-springing'); setPull(0); }, 220);
+    } else {
+      setPull(0);
+      setTimeout(() => body.classList.remove('np-springing'), 260);
+    }
+  };
+  for (const el of [$('#np'), $('#np-head'), dock]) {
+    el.addEventListener('touchstart', start, { passive: true });
+    el.addEventListener('touchmove', move, { passive: false });
+    el.addEventListener('touchend', end, { passive: true });
+    el.addEventListener('touchcancel', () => { if (g?.on) { g.dy = 0; end(); } g = null; }, { passive: true });
+  }
 }
 // The yellow progress bar pauses its updates only while a finger/mouse is actually dragging it.
 // Before, a drag that never "finished" (the page scrolled instead, the bar was redrawn when the next
@@ -6923,6 +7228,46 @@ function dockSizeLabel() {
   const big = document.body.classList.contains('dock-big');
   b.setAttribute('aria-label', big ? 'Smaller video' : 'Bigger video'); b.title = big ? 'Smaller' : 'Bigger';
 }
+// ---------- Sleep timer (full-screen player, next to ⋯) ----------
+// Pick a time and the music fades out gently and pauses, or stop at the end of the current song.
+let sleepAt = 0, sleepT = null, sleepTick = null;
+const sleepLeft = () => sleepAt ? Math.max(0, sleepAt - Date.now()) : 0;
+const fmtLeft = ms => { const m = Math.ceil(ms / 60e3); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60 ? (m % 60) + ' min' : ''}`.trim() : `${m} min`; };
+function sleepBtn() {
+  const b = $('#np-head .sleep-np'); if (!b) return;
+  const on = !!sleepAt || player.stopsAfterSong();
+  b.classList.toggle('on', on);
+  const label = sleepAt ? `Sleep timer: ${fmtLeft(sleepLeft())} left` : player.stopsAfterSong() ? 'Sleep timer: stops after this song' : 'Sleep timer';
+  b.setAttribute('aria-label', label); b.title = label;
+}
+function clearSleep(quiet) {
+  clearTimeout(sleepT); clearInterval(sleepTick); sleepAt = 0; player.setStopAfterSong(false); player.cancelFade(); sleepBtn();
+  if (!quiet) toast('Sleep timer off');
+}
+function setSleep(min) {
+  clearSleep(true);
+  if (min === 'song') { player.setStopAfterSong(true); sleepBtn(); toast('Music stops after this song 🌙', 'ok'); return; }
+  sleepAt = Date.now() + min * 60e3;
+  // fade over the last 8 seconds, then pause
+  sleepT = setTimeout(() => player.fadeOutAndPause(8000), Math.max(0, min * 60e3 - 8000));
+  sleepTick = setInterval(sleepBtn, 30e3);
+  sleepBtn();
+  toast(`Sleep timer: music stops in ${fmtLeft(min * 60e3)} 🌙`, 'ok');
+}
+async function sleepMenu(btn) {
+  const active = sleepAt ? `${fmtLeft(sleepLeft())} left` : player.stopsAfterSong() ? 'Stops after this song' : '';
+  const k = await menu(btn, [
+    { header: `${icon('moon')} Sleep timer${active ? ` · <b>${active}</b>` : ''}` },
+    ...[5, 10, 15, 30, 45, 60, 90].map(m => ({ k: String(m), label: m >= 60 ? `${m / 60 === 1 ? '1 hour' : m / 60 + ' hours'}` : `${m} minutes`, icon: 'timer' })),
+    { k: 'song', label: 'End of this song', icon: 'disc' },
+    (sleepAt || player.stopsAfterSong()) ? '-' : null,
+    (sleepAt || player.stopsAfterSong()) ? { k: 'off', label: 'Turn off sleep timer', icon: 'close', danger: true } : null
+  ]);
+  if (!k) return;
+  if (k === 'off') clearSleep();
+  else setSleep(k === 'song' ? 'song' : +k);
+}
+on('sleep-done', () => { clearTimeout(sleepT); clearInterval(sleepTick); sleepAt = 0; sleepBtn(); toast('Sleep timer: music paused. Good night 🌙'); });
 function toggleNPQueue() {
   const on = !document.body.classList.contains('np-q');
   document.body.classList.toggle('np-q', on);
@@ -6939,6 +7284,7 @@ function renderPlayer() {
   document.body.classList.toggle('has-track', !!t);
   // Subtle loading veil over the video / cover while a song is starting
   document.body.classList.toggle('song-loading', !!t && !!P.loading && !P.error);
+  document.body.classList.toggle('needs-tap', !!P.needsTap);
   const dl = $('#yt-dock .dl-art');
   if (dl && t && dl.dataset.src !== (t.artwork || '')) { dl.dataset.src = t.artwork || ''; dl.style.backgroundImage = t.artwork ? `url("${sized(t.artwork, 300).replace(/"/g, '%22')}")` : ''; }
   const bar = $('#playerbar');
@@ -7059,7 +7405,7 @@ function npScrollTo(el) {
   const headH = $('#np-head')?.offsetHeight || 60;
   window.scrollTo({ top: Math.max(0, scrollY + el.getBoundingClientRect().top - headH - 8), behavior: 'smooth' });
 }
-const npNarrow = matchMedia('(max-width: 900px)');
+const npNarrow = matchMedia('(max-width: 900px), (max-height: 520px) and (orientation: landscape)'); // queue below the video on small or sideways phones
 npNarrow.addEventListener?.('change', () => { if (document.body.classList.contains('np-open')) renderNP(true); });
 const npQueueHTML = () => `<aside class="np-queue"><div class="np-q-head"><h3>Up next</h3><span class="muted tiny">Drag ${icon('grip')} to reorder</span><button class="ib sm" data-p="npq" aria-label="Hide queue">${icon('close')}</button></div><div class="np-q-body"></div></aside>`;
 function renderNP(full = false) {
@@ -7086,7 +7432,8 @@ function renderNP(full = false) {
   }
   np.dataset.key = key;
   const keep = { sc: scrollY || 0, q: $('.np-q-body')?.scrollTop || 0 };
-  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button>`;
+  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><span class="np-head-r"><button class="ib sleep-np" data-p="sleep" aria-label="Sleep timer" title="Sleep timer">${icon('timer')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button></span>`;
+  sleepBtn();
   // Layout: the top bar and the video/cover stay put; everything below scrolls on its own.
   // On wide screens the queue is a panel on the right with its own scroll.
   np.innerHTML = `<div class="np-bg ${t.artwork ? '' : 'none'}" ${t.artwork ? `style="background-image:url('${esc(sized(t.artwork, 300))}')"` : ''}></div>
@@ -7194,13 +7541,27 @@ function placeDock() {
   if (!slot) requestAnimationFrame(() => { const on = dock.classList.contains('show'); document.body.style.setProperty('--dockh', (on ? dock.offsetHeight : 0) + 'px'); document.body.style.setProperty('--dockw', (on ? dock.offsetWidth : 0) + 'px'); });
 }
 
+// Save the whole queue (BAZINGA! mix or a shuffled queue) as a new playlist, in the order it plays
+async function saveQueueAsPlaylist() {
+  const ids = P.queue.map(q => q.id).filter(id => lib.tracks.has(id));
+  if (!ids.length) return;
+  const day = new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const name = await promptText('Save queue as a playlist', `${P.origin === 'mix' ? 'My BAZINGA! Mix' : 'Shuffle'} · ${day}`, 'Playlist name', 'Save');
+  if (!name) return;
+  const transient = ids.map(id => lib.tracks.get(id)).filter(t => t.transient);
+  if (transient.length) await store.upsertTracks(transient.map(stripTransient));
+  const pl = await store.createPlaylist(name, ids, { source: 'Saved from your queue' });
+  renderSidebarPlaylists();
+  toastUndo(`Saved "${name}" · ${ids.length} songs`, () => { closeNP('nav'); location.hash = '#/playlist/' + pl.id; }, 'Open');
+}
 function renderQueue(el, force = false) {
   if (!el || qDragging) return;
   const cur = player.current();
   if (!cur) { el.innerHTML = '<p class="muted pad">Nothing playing. Pick a song to start.</p>'; el.dataset.sig = ''; return; }
   // Skip the (expensive) rebuild when nothing in the queue changed — play/pause/buffering don't touch it
   const limit = +el.dataset.limit || 100;
-  const sig = `${cur.id}|${P.cursor}|${P.queue.length}|${limit}|` + P.queue.slice(P.cursor, P.cursor + limit + 1).map(q => q.id + (q.user ? '*' : '')).join(',');
+  const canSave = player.queueIsNew();
+  const sig = `${cur.id}|${P.cursor}|${P.queue.length}|${limit}|${canSave}|` + P.queue.slice(P.cursor, P.cursor + limit + 1).map(q => q.id + (q.user ? '*' : '')).join(',');
   if (!force && el.dataset.sig === sig && el.firstChild) return;
   el.dataset.sig = sig;
   const total = P.queue.length - P.cursor - 1;
@@ -7208,7 +7569,7 @@ function renderQueue(el, force = false) {
   const row = q => { const t = lib.tracks.get(q.id); if (!t) return ''; return `<div class="qrow ${q.user ? 'user' : ''}" data-qi="${q.i}">
       <span class="grip" title="Drag to reorder">${icon('grip')}</span>${cover(t.artwork, t.title, 'sm')}<div class="row-main" data-qjump="${q.i}"><div class="row-title">${esc(displayTitle(t))}${q.user ? '<span class="qtag">queued</span>' : ''}</div><div class="row-sub">${esc(t.artist)}</div></div>
       <button class="ib sm" data-qrm="${q.i}" aria-label="Remove from queue" title="Remove">${icon('close')}</button></div>`; };
-  el.innerHTML = `<div class="q-h">Now playing</div><div class="qrow now">${cover(cur.artwork, cur.title, 'sm')}<div class="row-main"><div class="row-title">${esc(displayTitle(cur))}</div><div class="row-sub">${esc(cur.artist)}</div></div></div>
+  el.innerHTML = `<div class="q-h">Now playing${canSave ? `<button class="ib q-save" data-qsave aria-label="Save this queue as a new playlist" title="Save this queue as a playlist">${icon('plus')}</button>` : ''}</div><div class="qrow now">${cover(cur.artwork, cur.title, 'sm')}<div class="row-main"><div class="row-title">${esc(displayTitle(cur))}</div><div class="row-sub">${esc(cur.artist)}</div></div></div>
     ${after.length ? `<div class="q-h">Next up <span>${after.some(q => q.user) ? '<button class="lnk" data-qclear>Clear queued</button>' : ''}</span></div><div class="qlist">${after.map(row).join('')}</div>`
       : `<p class="muted tiny pad">Nothing after this song. ${settings.autoplay === 'off' ? 'Use ⋯ → "Add to queue" on any song.' : 'Autoplay picks up from here.'}</p>`}
     ${total > after.length ? `<button class="more-btn" data-qmore>Show more <small>${total - after.length} more</small></button>` : ''}`;
@@ -7218,6 +7579,7 @@ function renderQueue(el, force = false) {
     const j = e.target.closest('[data-qjump]'); if (j) player.jumpTo(+j.dataset.qjump);
     const r = e.target.closest('[data-qrm]'); if (r) player.removeFromQueue(+r.dataset.qrm);
     if (e.target.closest('[data-qclear]')) player.clearUserQueue();
+    if (e.target.closest('[data-qsave]')) saveQueueAsPlaylist();
   };
   // Drag to reorder — pointer events, so it works with mouse AND touch
   el.onpointerdown = e => {
