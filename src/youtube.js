@@ -232,6 +232,18 @@ export async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
   return p;
 }
 
+// Previews, snippets and teasers (often uploaded before a release, or as Shorts) aren't the full song
+const PREVIEW = /(\b(preview|snippet|teaser|trailer|sneak ?peek|shorts|30 ?sec(ond)?s?|coming soon|unreleased|leak(ed)?)\b|#shorts?\b)/;
+export function isPreview(r, t) {
+  const raw = String(r.title || '').toLowerCase(), song = String(t?.title || '').toLowerCase();
+  if (PREVIEW.test(raw) && !PREVIEW.test(song)) return true;
+  const full = t?.durationMs ? t.durationMs / 1000 : 0;
+  if (r.seconds) {
+    if (full > 90 && r.seconds < full * 0.72) return true; // much shorter than the real song
+    if (!full && r.seconds < 70) return true;               // a minute or less: almost always a preview/short
+  }
+  return false;
+}
 // Score a result for "video" (official music video) or "audio" (Topic channel / official audio)
 function score(r, t, mode) {
   const title = norm(r.title), author = String(r.author || '').toLowerCase();
@@ -259,6 +271,7 @@ function score(r, t, mode) {
     if (diff < 5) s += 3; else if (diff > 90 && mode === 'audio') s -= 3;
   }
   if (r.seconds > 1200) s -= 5;
+  if (isPreview(r, t)) s -= 14; // never pick a preview when the full song is there
   if (r.views > 1e6) s += 1;
   return s;
 }
@@ -277,7 +290,9 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
   const p = (async () => {
     if (!force) {
       const c = await db.get('ytcache', t.id);
-      if (c && (c.video || c.audio)) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
+      // a match saved earlier that turns out to be a preview gets looked up again (your own links are kept)
+      const stalePreview = c && !c.manual && !c.fromSearch && [c.videoTitle, c.audioTitle].some(x => x && isPreview({ title: x }, t));
+      if (c && (c.video || c.audio) && !stalePreview) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
     }
     const base = `${mainArtist(t.artist)} ${t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')}`;
     const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now() };
@@ -286,7 +301,8 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
     const save = async () => {
       if (v) { out.video = v.id; out.videoTitle = v.title; }
       if (a) { out.audio = a.id; out.audioTitle = a.title; }
-      if (!out.video && !out.audio && list[0]) { out.audio = list[0].id; out.audioTitle = list[0].title; out.guess = true; }
+      const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
+      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; }
       await db.put('ytcache', { ...out }, t.id);
       if (out.video || out.audio) hot.set(t.id, { ...out });
       return { ...out };

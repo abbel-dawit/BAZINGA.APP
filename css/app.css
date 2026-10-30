@@ -1937,3 +1937,84 @@ body.np-pulling #np-head::before { opacity: 1; }
   .home .home-hero .hh-when [data-date] { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .home .home-hero .hh-time { position: static !important; margin-left: auto; flex: none; top: auto; right: auto; }
 }
+
+/* ===== v1.6.5 ===== */
+/* --- Sideways phones (short screens): the sidebar is a compact 2-column icon grid that fits on screen,
+       with no scrolling needed; every button stays a comfortable 44×40 tap target --- */
+@media (max-height: 600px) and (orientation: landscape) and (min-width: 701px) {
+  :root { --side: calc(108px + env(safe-area-inset-left, 0px)); }
+  .sidebar { display: grid !important; grid-template-columns: repeat(2, 44px); grid-auto-rows: 40px; gap: 5px 8px; align-content: center; justify-content: center; align-items: center;
+    padding: 6px 6px 6px max(6px, env(safe-area-inset-left)) !important; overflow-y: auto; overflow-x: hidden; }
+  .sidebar .nav { display: contents !important; }
+  .sidebar .brand { grid-column: 1 / -1; display: flex; justify-content: center; align-items: center; padding: 0 !important; margin: 0 !important; height: 40px; width: auto !important; }
+  .sidebar .brand .wordmark { display: none !important; }
+  .sidebar .brand img, .sidebar .brand .logo-mark { width: 30px !important; height: 30px !important; }
+  .sidebar .nav a, .sidebar .ask-btn, .sidebar .lock-side, .sidebar .profile-chip {
+    width: 44px !important; height: 40px !important; min-height: 0 !important; padding: 0 !important; margin: 0 !important; gap: 0 !important;
+    display: flex !important; align-items: center; justify-content: center; font-size: 0 !important; border-radius: 12px; }
+  .sidebar .nav a .ic, .sidebar .ask-btn .ic, .sidebar .lock-side .ic { width: 22px !important; height: 22px !important; margin: 0 !important; }
+  .sidebar .ask-btn { border-style: solid !important; }
+  .sidebar .side-h, .sidebar .side-pl { display: none !important; }
+  .sidebar .profile-chip { border: 0 !important; }
+  .sidebar .profile-chip span:not(.avatar) { display: none !important; }
+  .sidebar .profile-chip .avatar { width: 32px !important; height: 32px !important; margin: 0 !important; }
+  body.lock-off .sidebar .lock-side { display: none !important; }
+}
+
+/* --- Sideways phones: song times sit together on the right ("1:19 / 3:49") --- */
+@media (max-height: 600px) and (orientation: landscape) {
+  .pb-seek input { order: 1; }
+  .pb-seek .t-now { order: 2; width: auto !important; text-align: right; margin-left: 4px; }
+  .pb-seek .t-dur { order: 3; width: auto !important; text-align: left; }
+  .pb-seek .t-now::after { content: ' /'; }
+  .pb-seek { gap: 6px; }
+  #np .np-times { justify-content: flex-end; gap: 5px; }
+  #np .np-times .t-now::after { content: ' /'; }
+}
+@media (max-height: 600px) and (orientation: landscape) and (min-width: 701px) { .sidebar .profile-chip .avatar { font-size: 15px !important; } }
+
+/* ===== v1.6.6 ===== */
+/* --- Phone menus (bottom sheets): a grab handle; pull down to close --- */
+.menu.sheet { overscroll-behavior: contain; touch-action: pan-y; padding-top: 4px; }
+.menu.sheet .sheet-grab { position: sticky; top: 0; z-index: 2; height: 22px; margin: 0 -10px 2px; display: grid; place-items: center; background: inherit; cursor: grab; }
+.menu.sheet .sheet-grab::before { content: ''; width: 40px; height: 5px; border-radius: 5px; background: rgb(255 255 255 / .3); }
+.menu-back { transition: opacity .18s; }
+.menu.sheet::before { display: none; }
+
+/* --- Full-screen player: genre / year / length pills. Sideways phones: far right, under the heart, beside the album --- */
+.np-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: none; }
+.np-tags-side { display: none !important; }
+@media (max-height: 520px) and (orientation: landscape) {
+  .np-tags-main { display: none !important; }
+  #np .np-info { align-items: flex-start; }
+  .np-tags-side { display: flex !important; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin: 0; max-width: 150px; }
+  .np-tags-side .pill { font-size: 11px; padding: 2px 8px; }
+}
+@media (max-height: 520px) and (orientation: landscape) {
+  .np-tags-side { flex-wrap: nowrap !important; max-width: none !important; white-space: nowrap; }
+  #np .np-info > div:first-child { min-width: 0; }
+  #np .np-info .np-album { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+
+/* ===== v1.6.7 ===== */
+/* --- Settings: the support card is centred (heading, text and the coffee button) --- */
+.settings-page .support-panel { text-align: center; display: flex; flex-direction: column; align-items: center; }
+.settings-page .support-panel h2 { justify-content: center; }
+.settings-page .support-panel .coffee-btn { margin-left: auto; margin-right: auto; }
+
+/* --- Sideways phones: the sidebar is ONE column again and always fits the screen's height.
+       Every button shares the height that's actually there (iPhone Safari's toolbars, the notch and the
+       home bar included), up to a comfortable 46px, so nothing is ever cut off. --- */
+@media (max-height: 600px) and (orientation: landscape) and (min-width: 701px) {
+  :root { --side: calc(64px + env(safe-area-inset-left, 0px)); }
+  .sidebar { display: flex !important; flex-direction: column !important; align-items: center !important; justify-content: space-evenly !important;
+    grid-template-columns: none !important; gap: 2px !important; overflow: hidden !important; height: 100%; min-height: 0;
+    padding: max(4px, env(safe-area-inset-top)) 4px max(4px, env(safe-area-inset-bottom)) max(4px, env(safe-area-inset-left)) !important; }
+  .sidebar .nav { display: contents !important; }
+  .sidebar .brand, .sidebar .nav a, .sidebar .ask-btn, .sidebar .lock-side, .sidebar .profile-chip {
+    flex: 1 1 0 !important; min-height: 0 !important; max-height: 46px; height: auto !important; width: 48px !important; }
+  .sidebar .brand img, .sidebar .brand .logo-mark { width: auto !important; height: min(30px, 100%) !important; max-height: 30px; aspect-ratio: 1; }
+  .sidebar .nav a .ic, .sidebar .ask-btn .ic, .sidebar .lock-side .ic { width: 20px !important; height: 20px !important; }
+  .sidebar .nav a.on { box-shadow: 2px 2px 0 #000, inset 0 0 0 2px #000 !important; }
+  .sidebar .profile-chip .avatar { width: min(30px, 100%) !important; height: auto !important; max-height: 30px; aspect-ratio: 1; }
+}

@@ -501,7 +501,7 @@ function menu(anchor, items) {
   const back = document.createElement('div'); back.className = 'menu-back';
   root.append(back, m);
   const mobile = innerWidth < 700;
-  if (mobile) m.classList.add('sheet');
+  if (mobile) { m.classList.add('sheet'); m.insertAdjacentHTML('afterbegin', '<div class="sheet-grab" aria-hidden="true"></div>'); }
   else {
     const r = anchor.getBoundingClientRect();
     const mw = 260, mh = Math.min(m.scrollHeight, innerHeight - 20);
@@ -511,6 +511,27 @@ function menu(anchor, items) {
   return new Promise(resolve => {
     m.addEventListener('click', e => { const b = e.target.closest('button[data-k]'); if (b) { closeMenu(); resolve(b.dataset.k); } });
     back.addEventListener('click', () => { closeMenu(); resolve(null); });
+    // Phones: pull the sheet down to close it (from the handle, or anywhere once its list is scrolled to the top)
+    if (mobile) {
+      let y0 = null, dy = 0, t0 = 0, on = false;
+      const close = () => { m.style.transition = 'transform .18s ease-in'; m.style.transform = 'translateY(110%)'; back.style.opacity = '0'; setTimeout(() => { closeMenu(); resolve(null); }, 170); };
+      m.addEventListener('touchstart', e => { if (e.touches.length !== 1) return; y0 = e.touches[0].clientY; dy = 0; t0 = Date.now(); on = false; m.style.transition = 'none'; }, { passive: true });
+      m.addEventListener('touchmove', e => {
+        if (y0 === null) return;
+        dy = e.touches[0].clientY - y0;
+        if (!on) { if (dy > 6 && (m.scrollTop <= 0 || e.target.closest('.sheet-grab'))) on = true; else if (dy < -6) { y0 = null; return; } else return; }
+        if (e.cancelable) e.preventDefault();
+        m.style.transform = `translateY(${Math.max(0, dy)}px)`;
+        back.style.opacity = String(Math.max(0.2, 1 - dy / 400));
+      }, { passive: false });
+      m.addEventListener('touchend', () => {
+        if (y0 === null) return; y0 = null;
+        if (!on) return;
+        const v = dy / Math.max(1, Date.now() - t0);
+        if (dy > 90 || (dy > 30 && v > 0.5)) close();
+        else { m.style.transition = 'transform .2s cubic-bezier(.2,.8,.2,1)'; m.style.transform = ''; back.style.opacity = ''; }
+      }, { passive: true });
+    }
   });
 }
 function closeMenu() { const r = $('#menu-root'); if (r) r.innerHTML = ''; }
@@ -1454,6 +1475,18 @@ async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
   return p;
 }
 
+// Previews, snippets and teasers (often uploaded before a release, or as Shorts) aren't the full song
+const PREVIEW = /(\b(preview|snippet|teaser|trailer|sneak ?peek|shorts|30 ?sec(ond)?s?|coming soon|unreleased|leak(ed)?)\b|#shorts?\b)/;
+function isPreview(r, t) {
+  const raw = String(r.title || '').toLowerCase(), song = String(t?.title || '').toLowerCase();
+  if (PREVIEW.test(raw) && !PREVIEW.test(song)) return true;
+  const full = t?.durationMs ? t.durationMs / 1000 : 0;
+  if (r.seconds) {
+    if (full > 90 && r.seconds < full * 0.72) return true; // much shorter than the real song
+    if (!full && r.seconds < 70) return true;               // a minute or less: almost always a preview/short
+  }
+  return false;
+}
 // Score a result for "video" (official music video) or "audio" (Topic channel / official audio)
 function score(r, t, mode) {
   const title = norm(r.title), author = String(r.author || '').toLowerCase();
@@ -1481,6 +1514,7 @@ function score(r, t, mode) {
     if (diff < 5) s += 3; else if (diff > 90 && mode === 'audio') s -= 3;
   }
   if (r.seconds > 1200) s -= 5;
+  if (isPreview(r, t)) s -= 14; // never pick a preview when the full song is there
   if (r.views > 1e6) s += 1;
   return s;
 }
@@ -1499,7 +1533,9 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
   const p = (async () => {
     if (!force) {
       const c = await db.get('ytcache', t.id);
-      if (c && (c.video || c.audio)) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
+      // a match saved earlier that turns out to be a preview gets looked up again (your own links are kept)
+      const stalePreview = c && !c.manual && !c.fromSearch && [c.videoTitle, c.audioTitle].some(x => x && isPreview({ title: x }, t));
+      if (c && (c.video || c.audio) && !stalePreview) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
     }
     const base = `${mainArtist(t.artist)} ${t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')}`;
     const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now() };
@@ -1508,7 +1544,8 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
     const save = async () => {
       if (v) { out.video = v.id; out.videoTitle = v.title; }
       if (a) { out.audio = a.id; out.audioTitle = a.title; }
-      if (!out.video && !out.audio && list[0]) { out.audio = list[0].id; out.audioTitle = list[0].title; out.guess = true; }
+      const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
+      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; }
       await db.put('ytcache', { ...out }, t.id);
       if (out.video || out.audio) hot.set(t.id, { ...out });
       return { ...out };
@@ -1649,7 +1686,7 @@ async function publicPlaylist(listId) {
   throw new Error('Couldn\'t read that playlist. Make sure it\'s public or unlisted, or sign in with YouTube to import your private playlists.');
 }
 
-return { setYTSettings, startInstances, proxySearch, rawSearch, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
+return { setYTSettings, startInstances, proxySearch, rawSearch, isPreview, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
 })();
 // ---------- ytaccount.js ----------
 const __m_ytaccount = (() => {
@@ -2915,6 +2952,41 @@ async function relayPost(topic, body, params) {
   return r.json();
 }
 const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filename: 'library.bz', title: deviceName() });
+// Big libraries: the (already compressed + encrypted) file is sent in 6 MB parts, so it never hits the
+// relay's 15 MB per-file limit and a slow connection only has to resend a small piece. Each part is named
+// library.<set>.<i>of<n>.bz; a device only uses a set once every part of it has arrived.
+const PART = 6 * 1024 * 1024;
+const partOf = m => { const x = /^library\.(\w+)\.(\d+)of(\d+)\.bz$/.exec(m?.attachment?.name || ''); return x ? { set: x[1], i: +x[2], n: +x[3] } : null; };
+async function postLibrary(topic, bytes) {
+  if (bytes.length <= PART) return postFile(topic, bytes);
+  const set = Math.random().toString(36).slice(2, 10), n = Math.ceil(bytes.length / PART);
+  let res = null;
+  for (let i = 0; i < n; i++) {
+    step(`Sending your library… part ${i + 1} of ${n}`, 92 + 7 * i / n);
+    res = await relayPost(topic, new Blob([bytes.subarray(i * PART, (i + 1) * PART)]), { filename: `library.${set}.${i + 1}of${n}.bz`, title: deviceName() });
+  }
+  return res;
+}
+// The newest complete library on the relay: a single file, or every part of a split one (downloaded side by side)
+async function fetchLibrary(topic, latest) {
+  const pt = partOf(latest);
+  if (!pt) return fetchFile(latest);
+  const all = (await relayList(topic, 'all')).filter(liveFile);
+  const sets = new Map();
+  for (const m of all) { const q = partOf(m); if (!q) continue; const g = sets.get(q.set) || { n: q.n, parts: new Map(), time: 0 }; g.parts.set(q.i, m); g.time = Math.max(g.time, m.time); sets.set(q.set, g); }
+  const done = [...sets.values()].filter(g => g.parts.size === g.n).sort((a, b) => b.time - a.time)[0];
+  if (!done || done.time < latest.time - 120) return null; // the newest set is still uploading: try again shortly
+  let got = 0;
+  const bufs = await Promise.all([...Array(done.n).keys()].map(async k => {
+    const r = await fetch(done.parts.get(k + 1).attachment.url, { cache: 'no-store', signal: sig() });
+    if (!r.ok) throw new Error('Couldn\'t download the synced library — will try again.');
+    const b = new Uint8Array(await r.arrayBuffer()); got++;
+    step(`Downloading your music… part ${got} of ${done.n}`, 15 + 55 * got / done.n);
+    return b;
+  }));
+  const out = new Uint8Array(bufs.reduce((a, b) => a + b.length, 0)); let o = 0; for (const b of bufs) { out.set(b, o); o += b.length; }
+  return out;
+}
 const postNote = (topic, text) => relayPost(topic, text, {});
 const liveFile = m => m.attachment?.url && (!m.attachment.expires || m.attachment.expires * 1000 > Date.now() + 30e3);
 async function fetchFile(m) {
@@ -3102,7 +3174,9 @@ async function once() {
   let base = local;
   if (latest) {
     step('Downloading your music…', 15);
-    const remote = await open(await fetchFile(latest));
+    const bytes = await fetchLibrary(topic, latest);
+    if (!bytes) { setTimeout(() => link && syncNow(), 20e3); return; } // another device is still sending its parts: check again in 20 s
+    const remote = await open(bytes);
     if (sig()?.aborted) throw new DOMException('cancelled', 'AbortError');
     step('Merging with this device…', 75);
     // Joining with "use only the synced library": swap it in now that it has fully arrived
@@ -3120,7 +3194,7 @@ async function once() {
   const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
   if (h === link.hash && fresh) return;
   step('Sending your library to your other devices…', 92);
-  const res = await postFile(topic, await seal(base));
+  const res = await postLibrary(topic, await seal(base));
   link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
   await saveLink();
 }
@@ -4525,6 +4599,8 @@ async function boot() {
   try { if (await sp.handleRedirect()) { toast('Spotify connected ✓'); location.hash = '#/import'; } }
   catch (e) { toast(e.message, 'err'); }
   await store.load();
+  for (const t of (await kv.get('mixTracks')) || []) store.remember(t); // songs of the last BAZINGA! mix (queue only)
+  await retireAutoMix();
   profile = await kv.get('profile');
   await player.restore();
   player.setEndHook(queueEnded);
@@ -5096,6 +5172,7 @@ async function route() {
   setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'songs'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
   const arg = rest.map(decodeURIComponent);
   lists.clear(); sections.clear(); pagers.clear();
+  $('#main')?.removeEventListener('scroll', settingsSpy);
   $$('.nav a, .tabbar a').forEach(a => a.classList.toggle('on', a.dataset.r === name || (name === 'import' && a.dataset.r === 'settings')));
   if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
   $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
@@ -5369,6 +5446,13 @@ async function vNewReleases(_, my) {
 // the mix keeps filling in behind it (queue + playlist).
 const MIX_GENRES = ['Hip-Hop/Rap', 'Pop', 'R&B', 'Afrobeats', 'Rock', 'Electronic', 'Latin', 'Country', 'Soul', 'Reggae', 'Jazz', 'Gospel', 'K-Pop', 'Classical', 'Metal', 'Folk', 'Blues'];
 const mixPlaylist = async () => { const id = await kv.get('mixPl'); return id && lib.playlists.get(id); };
+// Earlier versions saved every mix as a "BAZINGA! Mix" playlist automatically. Remove that one (only if
+// it's still the untouched auto-made playlist); songs the user liked or put in other playlists stay.
+async function retireAutoMix() {
+  const pl = await mixPlaylist();
+  if (pl && pl.mix && pl.name === 'BAZINGA! Mix') await store.deletePlaylist(pl.id);
+  if (await kv.get('mixPl')) await kv.del('mixPl');
+}
 // Songs that are only in the library because an earlier mix put them there
 const isMixOnly = (t, mixId) => t.mix && !t.liked && ![...lib.playlists.values()].some(p => p.id !== mixId && p.trackIds.includes(t.id));
 function libraryTaste(mixId) {
@@ -5493,7 +5577,10 @@ async function bazingaMix() {
       if (picks[i][0]?.artwork) ov.art(picks[i][0].artwork);
     };
     const roundRobin = () => { const out = [], max = Math.max(0, ...picks.map(p => p?.length || 0)); for (let r = 0; r < max; r++) for (const p of picks) if (p?.[r]) out.push(p[r]); return out; };
-    const save = list => store.upsertTracks(list.map(t => ({ ...t, mix: 1 })));
+    // The mix only lives in the queue (kept across refreshes) — nothing goes into the library or a
+    // playlist unless the user saves it (+ in the queue card) or likes a song.
+    const mixTracks = [];
+    const save = async list => { const out = list.map(t => lib.tracks.get(t.id) || store.remember({ ...t, mix: 1 })); mixTracks.push(...list.map(t => ({ ...t, mix: 1 }))); await kv.set('mixTracks', mixTracks.slice(-300)); return out; };
 
     // 1) Fast start: your top few artists at once
     ov.step(artists.length ? `Digging into ${artists[0]}…` : 'Finding the hottest songs in your genres…', 12);
@@ -5519,12 +5606,6 @@ async function bazingaMix() {
     const firstSaved = await save(startList);
     const startIds = firstSaved.map(t => t.id);
     player.prefetch(startIds[0]);
-    let pl = await mixPlaylist();
-    const name = 'BAZINGA! Mix';
-    const meta2 = { source: 'Made for you ⚡', image: startList.find(t => t.artwork)?.artwork || '', mix: 1 };
-    if (pl) { Object.assign(pl, { name, ...meta2 }); await store.replacePlaylistTracks(pl.id, startIds); }
-    else { pl = await store.createPlaylist(name, startIds, meta2); await kv.set('mixPl', pl.id); }
-    renderSidebarPlaylists();
     nowCtx = { list: null };
     player.playList(startIds, 0, { shuffle: false, origin: 'mix' });
     // Keep the overlay up until the music actually starts (or a few seconds pass)
@@ -5541,10 +5622,9 @@ async function bazingaMix() {
     if (!more.length) return;
     const moreSaved = await save(more);
     const all = [...startIds, ...moreSaved.map(t => t.id)];
-    await store.replacePlaylistTracks(pl.id, all);
     // still playing the mix? add the rest to the queue
     if (P.queue.some(q => q.id === startIds[0])) player.appendToQueue(moreSaved.map(t => t.id));
-    toast(`Your BAZINGA! Mix is ready: ${all.length} songs ⚡`, 'ok');
+    toast(`Your BAZINGA! mix: ${all.length} songs ⚡ Tap + in the queue to save it as a playlist`, 'ok');
   } catch (e) { console.warn(e); ov.close(); toast('Couldn\'t build a mix right now. Try again in a moment', 'err'); }
   finally { mixBusy = false; }
 }
@@ -5917,11 +5997,28 @@ async function doSearch(q, tab) {
     await Promise.all([
       part(artistsP.then?.(v => keepRelevant(v, q, a => [a.name])) ?? artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
       part(albumsP.then?.(v => keepRelevant(v, q, a => [a.title, a.artist])) ?? albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
-      part(songsP.then?.(v => keepRelevant(v, q, t => [t.title, t.artist, t.album])) ?? songsP, v => { const st = v.map(t => lib.tracks.get(t.id) || store.remember(t)); prefetchTop(st, 3); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
+      part(songsP.then?.(v => keepRelevant(v, q, t => [t.title, t.artist, t.album])) ?? songsP, v => { const st = dedupeSongs(v, local).map(t => lib.tracks.get(t.id) || store.remember(t)); prefetchTop(st, 3); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
     ]);
   } catch (e) {
     if (alive()) $('#s-main').innerHTML = '<p class="muted">Music search is unavailable right now. Try again in a moment.</p>';
   }
+}
+// One row per song: the catalogue often lists the same song several times (single, album, deluxe,
+// explicit/clean, "feat." spelled differently, remasters). Keep the first (best match), prefer one with
+// a cover, and skip songs already shown under "In your library". Remixes, live and acoustic versions stay.
+const songKey = t => norm(String(t.title || '')
+  .replace(/\s*[\(\[](feat|ft|with)\.?[^\)\]]*[\)\]]/gi, '')
+  .replace(/\s*[\(\[][^\)\]]*\b(explicit|clean|remaster(ed)?|album version|single version|original( mix| version)?|radio edit|bonus track|from [^\)\]]*)\b[^\)\]]*[\)\]]/gi, '')
+  .replace(/\s+-\s+(\d{4}\s+)?(remaster(ed)?|single version|album version|radio edit)(\s+\d{4})?$/i, '')) + '|' + norm(mainArtist(t.artist));
+function dedupeSongs(list, already = []) {
+  const seen = new Map(), have = new Set(already.map(songKey));
+  for (const t of list) {
+    const k = songKey(t); if (have.has(k)) continue;
+    const prev = seen.get(k);
+    if (!prev) seen.set(k, t);
+    else if (!prev.artwork && t.artwork) seen.set(k, t);
+  }
+  return [...seen.values()];
 }
 // Look up the YouTube version of the top results right away, so tapping one starts instantly
 function prefetchTop(tracks, n) { setTimeout(() => tracks.slice(0, n).forEach((t, k) => setTimeout(() => player.prefetch(t.id), k * 450)), 250); }
@@ -6234,7 +6331,32 @@ function jumpToSection(id, smooth) {
   const covered = topEdge + ($('.set-jump')?.offsetHeight || 0) - 6;
   const target = main.scrollTop + el.getBoundingClientRect().top - covered - 12;
   main.scrollTo({ top: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' });
-  $$('.set-jump a').forEach(a => a.classList.toggle('on', a.dataset.jump === id));
+  markSetTab(id);
+  // while it glides there, don't let the sections it passes light up their tabs
+  setSpyHold = Date.now() + (smooth ? 900 : 150);
+}
+// Settings tabs follow you: the tab of the section you're reading is highlighted; back at the top, none is.
+let setSpyHold = 0, setSpyRaf = 0;
+function markSetTab(id) {
+  $$('.set-jump a').forEach(a => {
+    const on = !!id && a.dataset.jump === id;
+    if (a.classList.contains('on') !== on) { a.classList.toggle('on', on); if (on) a.setAttribute('aria-current', 'true'); else a.removeAttribute('aria-current'); }
+    if (on) { const bar = a.parentElement, l = a.offsetLeft - bar.offsetLeft, r = l + a.offsetWidth; if (l < bar.scrollLeft || r > bar.scrollLeft + bar.clientWidth) bar.scrollTo({ left: Math.max(0, l - 16), behavior: 'smooth' }); }
+  });
+}
+function settingsSpy() {
+  if (setSpyRaf) return;
+  setSpyRaf = requestAnimationFrame(() => {
+    setSpyRaf = 0;
+    const bar = $('.set-jump'), main = $('#main'); if (!bar || !main) return;
+    if (Date.now() < setSpyHold) { setSpyHold = Math.min(setSpyHold, Date.now() + 160); return; }
+    if (main.scrollTop < 40) return markSetTab(null); // back at the top: nothing selected
+    const line = bar.getBoundingClientRect().bottom + 24;
+    let cur = null;
+    for (const a of $$('.set-jump a')) { const sec = document.getElementById(a.dataset.jump); if (sec && sec.getBoundingClientRect().top <= line) cur = a.dataset.jump; }
+    if (main.scrollTop + main.clientHeight >= main.scrollHeight - 4) cur = $$('.set-jump a').map(a => a.dataset.jump).filter(id => { const e = document.getElementById(id); return e && e.getBoundingClientRect().top < innerHeight; }).pop() || cur;
+    markSetTab(cur);
+  });
 }
 async function vSettings([section] = []) {
   const lastB = await kv.get('lastBackup');
@@ -6351,6 +6473,7 @@ async function vSettings([section] = []) {
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
   $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
+  const main = $('#main'); main.removeEventListener('scroll', settingsSpy); main.addEventListener('scroll', settingsSpy, { passive: true });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
   $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ acoustidKey: e.target.acoustidKey.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
@@ -7571,6 +7694,7 @@ let qDragging = false;
 // Full-screen player. The first render builds the page; after that (play/pause, like,
 // shuffle…) only the parts that changed are patched, so the video slot, the lyrics
 // and your scroll position never jump or reload.
+const npTags = t => `${genreOf(t) ? `<span class="pill">${esc(genreOf(t))}</span>` : ''}${t.year ? `<span class="pill">${t.year}</span>` : ''}${t.durationMs ? `<span class="pill">${fmtDur(t.durationMs)}</span>` : ''}`;
 const npLike = t => `<button class="ib lg like ${t.liked && !t.transient ? 'on' : ''}" data-p="like" aria-label="Like">${icon(t.liked && !t.transient ? 'heartFill' : 'heart')}</button>`;
 const npCtrls = () => `
       <button class="ib lg ${P.shuffle ? 'on' : ''}" data-p="shuffle" aria-label="Shuffle">${icon('shuffle')}</button>
@@ -7633,12 +7757,12 @@ function renderNP(full = false) {
       <div class="np-scroll"><div class="np-inner">
         <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
         <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
-          ${npLike(t)}</div>
+          <div class="np-side">${npLike(t)}<div class="np-tags np-tags-side">${npTags(t)}</div></div></div>
         <p class="err-text np-err" ${P.error ? '' : 'hidden'}>${esc(P.error || '')}</p>
         <div class="np-seek"><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><div class="np-times"><span class="t-now">0:00</span><span class="t-dur">0:00</span></div></div>
         <div class="np-ctrls" data-sig="${P.shuffle}|${P.repeat}">${npCtrls()}</div>
         <div class="np-extra">${npExtra()}</div>
-        <div class="np-tags">${genreOf(t) ? `<span class="pill">${esc(genreOf(t))}</span>` : ''}${t.year ? `<span class="pill">${t.year}</span>` : ''}${t.durationMs ? `<span class="pill">${fmtDur(t.durationMs)}</span>` : ''}</div>
+        <div class="np-tags np-tags-main">${npTags(t)}</div>
         ${qOn && narrow ? npQueueHTML() : ''}
         <section class="np-lyrics" aria-label="Lyrics"></section>
       </div></div>
@@ -7740,7 +7864,7 @@ async function saveQueueAsPlaylist() {
   const name = await promptText('Save queue as a playlist', `${P.origin === 'mix' ? 'My BAZINGA! Mix' : 'Shuffle'} · ${day}`, 'Playlist name', 'Save');
   if (!name) return;
   const transient = ids.map(id => lib.tracks.get(id)).filter(t => t.transient);
-  if (transient.length) await store.upsertTracks(transient.map(stripTransient));
+  if (transient.length) await store.upsertTracks(transient.map(t => { const x = stripTransient(t); delete x.mix; return x; }));
   const pl = await store.createPlaylist(name, ids, { source: 'Saved from your queue' });
   renderSidebarPlaylists();
   toastUndo(`Saved "${name}" · ${ids.length} songs`, () => { closeNP('nav'); location.hash = '#/playlist/' + pl.id; }, 'Open');

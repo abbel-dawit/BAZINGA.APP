@@ -91,6 +91,41 @@ async function relayPost(topic, body, params) {
   return r.json();
 }
 const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filename: 'library.bz', title: deviceName() });
+// Big libraries: the (already compressed + encrypted) file is sent in 6 MB parts, so it never hits the
+// relay's 15 MB per-file limit and a slow connection only has to resend a small piece. Each part is named
+// library.<set>.<i>of<n>.bz; a device only uses a set once every part of it has arrived.
+const PART = 6 * 1024 * 1024;
+const partOf = m => { const x = /^library\.(\w+)\.(\d+)of(\d+)\.bz$/.exec(m?.attachment?.name || ''); return x ? { set: x[1], i: +x[2], n: +x[3] } : null; };
+async function postLibrary(topic, bytes) {
+  if (bytes.length <= PART) return postFile(topic, bytes);
+  const set = Math.random().toString(36).slice(2, 10), n = Math.ceil(bytes.length / PART);
+  let res = null;
+  for (let i = 0; i < n; i++) {
+    step(`Sending your library… part ${i + 1} of ${n}`, 92 + 7 * i / n);
+    res = await relayPost(topic, new Blob([bytes.subarray(i * PART, (i + 1) * PART)]), { filename: `library.${set}.${i + 1}of${n}.bz`, title: deviceName() });
+  }
+  return res;
+}
+// The newest complete library on the relay: a single file, or every part of a split one (downloaded side by side)
+async function fetchLibrary(topic, latest) {
+  const pt = partOf(latest);
+  if (!pt) return fetchFile(latest);
+  const all = (await relayList(topic, 'all')).filter(liveFile);
+  const sets = new Map();
+  for (const m of all) { const q = partOf(m); if (!q) continue; const g = sets.get(q.set) || { n: q.n, parts: new Map(), time: 0 }; g.parts.set(q.i, m); g.time = Math.max(g.time, m.time); sets.set(q.set, g); }
+  const done = [...sets.values()].filter(g => g.parts.size === g.n).sort((a, b) => b.time - a.time)[0];
+  if (!done || done.time < latest.time - 120) return null; // the newest set is still uploading: try again shortly
+  let got = 0;
+  const bufs = await Promise.all([...Array(done.n).keys()].map(async k => {
+    const r = await fetch(done.parts.get(k + 1).attachment.url, { cache: 'no-store', signal: sig() });
+    if (!r.ok) throw new Error('Couldn\'t download the synced library — will try again.');
+    const b = new Uint8Array(await r.arrayBuffer()); got++;
+    step(`Downloading your music… part ${got} of ${done.n}`, 15 + 55 * got / done.n);
+    return b;
+  }));
+  const out = new Uint8Array(bufs.reduce((a, b) => a + b.length, 0)); let o = 0; for (const b of bufs) { out.set(b, o); o += b.length; }
+  return out;
+}
 const postNote = (topic, text) => relayPost(topic, text, {});
 const liveFile = m => m.attachment?.url && (!m.attachment.expires || m.attachment.expires * 1000 > Date.now() + 30e3);
 async function fetchFile(m) {
@@ -278,7 +313,9 @@ async function once() {
   let base = local;
   if (latest) {
     step('Downloading your music…', 15);
-    const remote = await open(await fetchFile(latest));
+    const bytes = await fetchLibrary(topic, latest);
+    if (!bytes) { setTimeout(() => link && syncNow(), 20e3); return; } // another device is still sending its parts: check again in 20 s
+    const remote = await open(bytes);
     if (sig()?.aborted) throw new DOMException('cancelled', 'AbortError');
     step('Merging with this device…', 75);
     // Joining with "use only the synced library": swap it in now that it has fully arrived
@@ -296,7 +333,7 @@ async function once() {
   const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
   if (h === link.hash && fresh) return;
   step('Sending your library to your other devices…', 92);
-  const res = await postFile(topic, await seal(base));
+  const res = await postLibrary(topic, await seal(base));
   link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
   await saveLink();
 }

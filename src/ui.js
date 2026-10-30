@@ -239,7 +239,7 @@ export function menu(anchor, items) {
   const back = document.createElement('div'); back.className = 'menu-back';
   root.append(back, m);
   const mobile = innerWidth < 700;
-  if (mobile) m.classList.add('sheet');
+  if (mobile) { m.classList.add('sheet'); m.insertAdjacentHTML('afterbegin', '<div class="sheet-grab" aria-hidden="true"></div>'); }
   else {
     const r = anchor.getBoundingClientRect();
     const mw = 260, mh = Math.min(m.scrollHeight, innerHeight - 20);
@@ -249,6 +249,27 @@ export function menu(anchor, items) {
   return new Promise(resolve => {
     m.addEventListener('click', e => { const b = e.target.closest('button[data-k]'); if (b) { closeMenu(); resolve(b.dataset.k); } });
     back.addEventListener('click', () => { closeMenu(); resolve(null); });
+    // Phones: pull the sheet down to close it (from the handle, or anywhere once its list is scrolled to the top)
+    if (mobile) {
+      let y0 = null, dy = 0, t0 = 0, on = false;
+      const close = () => { m.style.transition = 'transform .18s ease-in'; m.style.transform = 'translateY(110%)'; back.style.opacity = '0'; setTimeout(() => { closeMenu(); resolve(null); }, 170); };
+      m.addEventListener('touchstart', e => { if (e.touches.length !== 1) return; y0 = e.touches[0].clientY; dy = 0; t0 = Date.now(); on = false; m.style.transition = 'none'; }, { passive: true });
+      m.addEventListener('touchmove', e => {
+        if (y0 === null) return;
+        dy = e.touches[0].clientY - y0;
+        if (!on) { if (dy > 6 && (m.scrollTop <= 0 || e.target.closest('.sheet-grab'))) on = true; else if (dy < -6) { y0 = null; return; } else return; }
+        if (e.cancelable) e.preventDefault();
+        m.style.transform = `translateY(${Math.max(0, dy)}px)`;
+        back.style.opacity = String(Math.max(0.2, 1 - dy / 400));
+      }, { passive: false });
+      m.addEventListener('touchend', () => {
+        if (y0 === null) return; y0 = null;
+        if (!on) return;
+        const v = dy / Math.max(1, Date.now() - t0);
+        if (dy > 90 || (dy > 30 && v > 0.5)) close();
+        else { m.style.transition = 'transform .2s cubic-bezier(.2,.8,.2,1)'; m.style.transform = ''; back.style.opacity = ''; }
+      }, { passive: true });
+    }
   });
 }
 export function closeMenu() { const r = $('#menu-root'); if (r) r.innerHTML = ''; }
