@@ -1,5 +1,5 @@
 // BAZINGA service worker — makes the app open and run with no internet.
-const VERSION = 'bazinga-v39';
+const VERSION = 'bazinga-v40';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'favicon.ico',
   'js/bazinga.js',

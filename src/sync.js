@@ -55,8 +55,55 @@ export const prettyCode = c => c.length === 8 ? c.slice(0, 4) + '-' + c.slice(4)
 // ---------- file format: gzip → AES-GCM → base64 ----------
 function toB64(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
 function fromB64(b) { const s = atob(b), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
-async function gz(bytes) { return 'CompressionStream' in window ? new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()) : bytes; }
-async function gunz(u8) { return u8[0] === 0x1f && u8[1] === 0x8b ? new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()) : u8; }
+// BZL1: a small LZ77 compressor (greedy, 64 KB window, 4-byte hash) — used only when the browser has no gzip.
+const MAGIC = [0x42, 0x5a, 0x4c, 0x31];
+const isLz = u => u.length > 4 && u[0] === 0x42 && u[1] === 0x5a && u[2] === 0x4c && u[3] === 0x31;
+function lzCompress(src) {
+  const n = src.length, out = new Uint8Array(n + (n >> 3) + 64); let o = 0;
+  const put = b => { out[o++] = b; };
+  const varint = v => { while (v >= 128) { put((v & 127) | 128); v = Math.floor(v / 128); } put(v); };
+  for (const b of MAGIC) put(b); varint(n);
+  const HB = 16, table = new Int32Array(1 << HB).fill(-1);
+  const hash = i => (Math.imul(src[i] | src[i + 1] << 8 | src[i + 2] << 16 | src[i + 3] << 24, 2654435761) >>> (32 - HB));
+  let i = 0, lit = 0;
+  const flush = (end, mlen, dist) => { varint(end - lit); out.set(src.subarray(lit, end), o); o += end - lit; varint(mlen); if (mlen) varint(dist); };
+  while (i + 4 <= n) {
+    const h = hash(i), c = table[h]; table[h] = i;
+    if (c >= 0 && i - c < 65536 && src[c] === src[i] && src[c + 1] === src[i + 1] && src[c + 2] === src[i + 2] && src[c + 3] === src[i + 3]) {
+      let l = 4; while (i + l < n && src[c + l] === src[i + l] && l < 65535) l++;
+      flush(i, l, i - c);
+      for (let k = i + 1; k < i + l && k + 4 <= n; k += 2) table[hash(k)] = k;
+      i += l; lit = i;
+    } else i++;
+  }
+  flush(n, 0, 0);
+  return out.subarray(0, o);
+}
+function lzDecompress(u) {
+  let p = 4;
+  const varint = () => { let v = 0, m = 1, b; do { b = u[p++]; v += (b & 127) * m; m *= 128; } while (b & 128); return v; };
+  const n = varint(), out = new Uint8Array(n); let o = 0;
+  while (o < n) {
+    const L = varint(); out.set(u.subarray(p, p + L), o); o += L; p += L;
+    if (o >= n) break;
+    const M = varint(); if (!M) continue; const d = varint();
+    for (let k = 0; k < M; k++, o++) out[o] = out[o - d];
+  }
+  return out;
+}
+// Always compressed: gzip where the browser has it (~5× smaller), otherwise BAZINGA!'s own LZ (~2.5× smaller).
+// Before, browsers without gzip (e.g. iPhones before iOS 16.4) sent the library uncompressed and hit the relay's size limit.
+async function gz(bytes) {
+  if ('CompressionStream' in window) { try { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); } catch { } }
+  return lzCompress(bytes);
+}
+async function gunz(u8) {
+  if (u8[0] === 0x1f && u8[1] === 0x8b) {
+    if ('DecompressionStream' in window) return new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+    throw new Error('This browser can\'t open the synced library. Update it (or use Chrome / Safari 16.4+).');
+  }
+  return isLz(u8) ? lzDecompress(u8) : u8;
+}
 async function seal(obj) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, keys.key, await gz(new TextEncoder().encode(JSON.stringify(obj)))));
@@ -87,24 +134,34 @@ async function relayList(topic, since = 'all') {
 }
 async function relayPost(topic, body, params) {
   const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body, signal: sig() });
-  if (!r.ok) throw new Error(r.status === 413 ? 'Your library is too big for the free sync relay.' : r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
+  if (!r.ok) { const e = new Error(r.status === 413 ? 'Your library is too big for the free sync relay.' : r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`); e.tooBig = r.status === 413; throw e; }
   return r.json();
 }
 const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filename: 'library.bz', title: deviceName() });
 // Big libraries: the (already compressed + encrypted) file is sent in 6 MB parts, so it never hits the
 // relay's 15 MB per-file limit and a slow connection only has to resend a small piece. Each part is named
 // library.<set>.<i>of<n>.bz; a device only uses a set once every part of it has arrived.
-const PART = 6 * 1024 * 1024;
+let PART = 1536 * 1024, MIN_PART = 64 * 1024; // ntfy.sh's free tier accepts files up to 2 MB; parts shrink by themselves if it says "too big"
 const partOf = m => { const x = /^library\.(\w+)\.(\d+)of(\d+)\.bz$/.exec(m?.attachment?.name || ''); return x ? { set: x[1], i: +x[2], n: +x[3] } : null; };
 async function postLibrary(topic, bytes) {
-  if (bytes.length <= PART) return postFile(topic, bytes);
-  const set = Math.random().toString(36).slice(2, 10), n = Math.ceil(bytes.length / PART);
-  let res = null;
-  for (let i = 0; i < n; i++) {
-    step(`Sending your library… part ${i + 1} of ${n}`, 92 + 7 * i / n);
-    res = await relayPost(topic, new Blob([bytes.subarray(i * PART, (i + 1) * PART)]), { filename: `library.${set}.${i + 1}of${n}.bz`, title: deviceName() });
+  for (;;) {
+    try {
+      if (bytes.length <= PART) return await postFile(topic, bytes);
+      const set = Math.random().toString(36).slice(2, 10), n = Math.ceil(bytes.length / PART);
+      let res = null;
+      for (let i = 0; i < n; i++) {
+        step(`Sending your library… part ${i + 1} of ${n}`, 92 + 7 * i / n);
+        res = await relayPost(topic, new Blob([bytes.subarray(i * PART, (i + 1) * PART)]), { filename: `library.${set}.${i + 1}of${n}.bz`, title: deviceName() });
+      }
+      return res;
+    } catch (e) {
+      // "too big": send smaller pieces (down to 256 KB). Still too big then means the relay's storage for
+      // this connection is full for now — it empties itself within 3 hours, so just try again later.
+      if (!e.tooBig) throw e;
+      if (PART > MIN_PART) { PART = Math.max(MIN_PART, Math.floor(Math.min(PART, bytes.length) / 2)); continue; }
+      const err = new Error('The free sync relay is full for the moment. Your devices will catch up automatically within a few hours.'); err.later = true; throw err;
+    }
   }
-  return res;
 }
 // The newest complete library on the relay: a single file, or every part of a split one (downloaded side by side)
 async function fetchLibrary(topic, latest) {
@@ -153,6 +210,8 @@ async function localSnap() {
   const snap = await backup.snapshot();
   snap.tombstones = store.tombstones();
   snap.tracks = snap.tracks.map(t => { const x = { ...t }; delete x.hadLocalFile; delete x.localFileId; return x; }).sort((a, b) => a.id < b.id ? -1 : 1);
+  // YouTube matches travel as ids only (titles are just for display and get filled in again when needed)
+  snap.ytcache = (snap.ytcache || []).filter(([, v]) => v && (v.video || v.audio)).map(([k, v]) => [k, Object.fromEntries(Object.entries({ video: v.video, audio: v.audio, manual: v.manual, fromSearch: v.fromSearch, guess: v.guess }).filter(([, x]) => x))]);
   snap.albums.sort((a, b) => a.id < b.id ? -1 : 1); snap.playlists.sort((a, b) => a.id < b.id ? -1 : 1);
   const p = snap.profile;
   snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
@@ -243,7 +302,13 @@ async function applyLocal(m) {
   await db.putMany('tracks', m.tracks.map(t => { const c = cur.get(t.id); return c?.localFileId ? { ...t, localFileId: c.localFileId } : t; }));
   await db.clear('albums'); await db.putMany('albums', m.albums);
   await db.clear('playlists'); await db.putMany('playlists', m.playlists);
-  for (const [k, v] of m.ytcache || []) await db.put('ytcache', v, k);
+  // YouTube matches: only write what actually changed, and keep this device's extra details (titles)
+  const ycKeys = await db.keys('ytcache'), ycVals = await db.all('ytcache'), ycNow = new Map(ycKeys.map((k, i) => [k, ycVals[i]]));
+  for (const [k, v] of m.ytcache || []) {
+    const c = ycNow.get(k);
+    if (c && c.video === v.video && c.audio === v.audio && !!c.manual === !!v.manual) continue;
+    await db.put('ytcache', c && c.video === v.video && c.audio === v.audio ? { ...c, ...v } : v, k);
+  }
   await store.setTombstones(m.tombstones);
   if (m.profile) {
     const local = await kv.get('profile');
@@ -294,6 +359,7 @@ export async function syncNow({ interactive = false } = {}) {
       if (isAbort(e)) { setStatus(link?.lastId ? 'synced' : 'off'); S.cancelled = true; return; }
       console.warn('sync failed', e);
       setStatus('error', /Failed to fetch|NetworkError|Load failed/.test(e.message) ? 'Couldn\'t reach the sync server.' : e.message);
+      if (e.later) setTimeout(() => link && syncNow(), 30 * 60e3);
     } finally { running = null; if (interactive) abortCtl = null; }
   })();
   S.cancelled = false;
@@ -330,7 +396,7 @@ async function once() {
   if (msgs.length) { link.seen = msgs.slice(-20).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
   await saveLink();
   const h = hash(base);
-  const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
+  const fresh = Date.now() / 1000 - (link.pubTs || 0) < 140 * 60; // the relay keeps copies ~3 h: refresh every ~2.3 h
   if (h === link.hash && fresh) return;
   step('Sending your library to your other devices…', 92);
   const res = await postLibrary(topic, await seal(base));

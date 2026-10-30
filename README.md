@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v39`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v40`) so phones fetch the new version.
 
 ## Features
 
@@ -38,7 +38,6 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 ### New in v1.6
 - **Theme colors**: Volt (the original yellow), Mint, Violet, Indigo, Ocean, Cyan, Gold, Sunset, Rose and Crimson. Pick one on the welcome card or in Settings → You. Buttons, glows, the logo bolt, the wordmark shadow, the tab icon and the Home Screen icon all follow it, and it's remembered on the device. (Recolored icons live in `icons/theme/`; `build.py` writes one install manifest per color.)
 - **Splash screen** in your theme color while the app starts, with fun lines under the logo that change every few seconds ("Charging the lightning ⚡", "Warming up the speakers 🔊"…).
-- **"What song is this?"**: the voice assistant recognises music playing around you (button in the assistant, or just ask), using [AcoustID](https://acoustid.org). BAZINGA! records with the browser's voice filters switched off, keeps its own music muted, makes a Chromaprint fingerprint on the device (`src/chromaprint.js`, a JavaScript port of Chromaprint's default algorithm, checked against libchromaprint), and looks it up. It checks after ~10 s and again with a longer ~18 s sample, and because AcoustID filters by the song's full length, it tries a spread of typical song lengths (staying under AcoustID's 3 requests/second). Put a free AcoustID application key (acoustid.org/new-application) in `index.html` → `acoustidKey` for everyone, or each user adds one in Settings → Voice assistant. Note: AcoustID is built for identifying whole audio files, so a short clip from a noisy room matches far less often than in Shazam-style services.
 - **"When the queue finishes"** options evenly spaced.
 - **Sleep timer**: timer icon in the full-screen player's top bar (left of ⋯). 5 min to 1.5 hours, or the end of this song. The music fades out gently and pauses; the icon lights up while it's set and the menu shows the time left.
 - **BAZINGA! button** on Home (replaces "Ask BAZINGA!" there): builds a fresh mix (it plays from the queue; it's only saved as a playlist if you tap + in the queue) of songs you don't have yet from your top 50 artists (taking turns, #1 first), then today's top songs in your top genres. The music starts as soon as the first few artists are in; the rest fills in behind it. New listeners pick favorite genres, then favorite artists (top 10 per genre) first.
@@ -60,7 +59,8 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **No more previews**: YouTube matching skips previews, snippets, teasers and Shorts (by title and by length compared with the real song), and earlier matches that were previews are looked up again.
 - **Search**: one row per song (single/album/deluxe, explicit/clean, "feat." and remaster duplicates merged; remixes and live versions kept), and songs already shown under "In your library" aren't repeated.
 - **Sideways phones**: the genre / year / length pills sit at the far right under the heart, next to the album.
-- **Big libraries sync reliably**: the library is compressed (gzip, ~13× smaller) and encrypted, and anything over 6 MB is sent in parts that download side by side, so it never hits the relay's 15 MB file limit.
+- **Big libraries sync reliably**: ntfy.sh's free tier only accepts files up to 2 MB. The library is always compressed (gzip where the browser has it, BAZINGA!'s own LZ compression otherwise, e.g. iPhones before iOS 16.4), YouTube matches travel as ids only, and anything over 1.5 MB goes in parts that download side by side. If the relay still says "too big", the parts shrink automatically (down to 64 KB); if its storage is full, sync quietly retries later. The unchanged library is re-sent only every ~2.3 h, using less of the relay's storage.
+- **Playlist page**: one ⋯ menu (on phones it also holds Find YouTube matches / Save to YouTube).
 - **Sync now includes settings and connections**: API keys, tokens, servers, theme, playback options, Spotify/YouTube connections, YouTube playlist links and your taste picks. Each setting remembers when you changed it and the newest change wins. A device that never set something can't wipe it, and removals only spread when you disconnect on purpose.
 - **Voice assistant**: loud chime when it starts listening; music stays silent until the assistant closes; closes after ~3.5 s if it hears nothing; mic buttons show a theme-colored ring while it's open and go back to normal after. iPhone now speaks with the phone's own (Siri-quality) voice instead of Apple's robotic "compact" voices, in one smooth sentence, after switching audio back from "phone call" mode.
 

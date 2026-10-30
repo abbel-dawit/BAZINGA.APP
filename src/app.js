@@ -258,7 +258,6 @@ async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('
 
 function applySettings() {
   applyTheme(settings.theme || currentTheme());
-  setVoicePrefs({ recognizeKey: settings.acoustidKey || window.BAZINGA_CONFIG?.acoustidKey || '' });
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
@@ -1194,9 +1193,9 @@ function redrawArtists() {
   fillArtistPics(el);
 }
 // On phones these two fold into a ⋯ menu so the action row stays on one line
-const matchBtn = (key, name = 'My BAZINGA! playlist', job = key, offline = '') => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
+const matchBtn = (key, name = 'My BAZINGA! playlist', job = key, offline = '', noMore = false) => `<span class="yt-acts"><button class="btn ghost" data-act="match-list" data-list="${key}" title="Find YouTube versions for every song">${icon('yt')}Find YouTube matches</button>
   <button class="btn yt-save" data-act="yt-export" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}">${icon('upload')}Save to YouTube</button></span>
-  <button class="ib lg yt-more ${offline ? 'always' : ''}" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" ${offline ? `data-offline="${esc(offline)}"` : ''} aria-label="More options" title="More">${icon('more')}</button>`;
+  ${noMore ? '' : `<button class="ib lg yt-more ${offline ? 'always' : ''}" data-act="yt-more" data-list="${key}" data-name="${esc(name)}" data-job="${esc(job)}" ${offline ? `data-offline="${esc(offline)}"` : ''} aria-label="More options" title="More">${icon('more')}</button>`}`;
 
 // ---------- PLAYLIST ----------
 async function vPlaylist([id]) {
@@ -1210,8 +1209,8 @@ async function vPlaylist([id]) {
     ${header(esc(p.name), `${esc(profile.username)} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${p.source ? ' · from ' + esc(p.source) : ''}`, cover(plCover(p), p.name), '', 'Playlist')}
     <div class="actions">${playBtns('play-list', 'pl')}
       <button class="ib lg" data-act="share-playlist" data-id="${p.id}" title="Share">${icon('share')}</button>
-      <button class="ib lg" data-act="playlist-menu" data-id="${p.id}" title="More">${icon('more')}</button>
-      ${matchBtn('pl', p.name, p.id)}</div>
+      <button class="ib lg" data-act="playlist-menu" data-id="${p.id}" aria-label="More options" title="More">${icon('more')}</button>
+      ${matchBtn('pl', p.name, p.id, '', true)}</div>
     ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
   </div>`;
   observeMore();
@@ -1859,9 +1858,6 @@ async function vSettings([section] = []) {
           `;
       })()}
       <p class="tiny muted">Tap a mic button to talk to BAZINGA!. The microphone is only on while the assistant is open, and the music stays quiet until it closes.</p>
-      <div class="sub-panel"><b>🎶 Song recognition</b>
-        <p class="tiny muted">Ask "What song is this?" (or tap <b>What song is playing around me?</b> in the assistant) and BAZINGA! listens to the music around you, fingerprints it on your device and looks it up in <a class="lnk" href="https://acoustid.org" target="_blank" rel="noopener">AcoustID</a>'s open music database. Works best close to the speaker. ${window.BAZINGA_CONFIG?.acoustidKey ? 'It\'s already set up. Add your own key below only if you want to.' : 'Register a free application at <a class="lnk" href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a> and paste its API key here. It\'s kept on your devices and synced to your other devices.'}</p>
-        <form id="recog-form" class="stack"><label class="fld"><span>AcoustID application key</span><input name="acoustidKey" value="${esc(settings.acoustidKey || '')}" autocomplete="off" spellcheck="false" placeholder="Paste your AcoustID key"></label><button class="btn">Save</button></form></div>
     </div>
     <div class="panel" id="backup"><h2>${icon('restore')} Backup & restore</h2>
       <p class="muted">BAZINGA! backs itself up automatically every time something changes. Last backup: <b>${lastB ? new Date(lastB).toLocaleString() : 'not yet'}</b>.</p>
@@ -1916,10 +1912,10 @@ async function vSettings([section] = []) {
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
-  $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); jumpToSection(a.dataset.jump, true); });
+  // (the tab lets go of focus right away, so it can't keep looking selected after you scroll on)
+  $$('.set-jump a').forEach(a => a.onclick = e => { e.preventDefault(); a.blur(); jumpToSection(a.dataset.jump, true); });
   const main = $('#main'); main.removeEventListener('scroll', settingsSpy); main.addEventListener('scroll', settingsSpy, { passive: true });
   if (section) requestAnimationFrame(() => jumpToSection(section, false));
-  $('#recog-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ acoustidKey: e.target.acoustidKey.value.trim() }); toast('Saved: ask "What song is this?" any time 🎶', 'ok'); };
   $('#genius-form').onsubmit = async e => { e.preventDefault(); await saveSettings({ geniusToken: e.target.geniusToken.value.trim() }); lyricsCache.clear(); toast('Saved', 'ok'); };
   $('#yt-form').onsubmit = async e => { e.preventDefault(); await saveSettings(Object.fromEntries(new FormData(e.target))); toast('Saved'); };
   $('#set-enrich').onchange = e => saveSettings({ enrich: e.target.checked });
@@ -2488,7 +2484,12 @@ const stripTransient = t => { const x = { ...t }; delete x.transient; return x; 
 
 async function playlistMenu(btn, id) {
   const p = lib.playlists.get(id); if (!p) return;
+  // One ⋯ for everything: on phones the YouTube buttons live in here too (on computers they're on the page)
+  const narrow = innerWidth <= 700;
   const k = await menu(btn, [
+    narrow ? { k: 'yt-match', label: 'Find YouTube matches', icon: 'yt' } : null,
+    narrow ? { k: 'yt-save', label: 'Save to YouTube', icon: 'upload' } : null,
+    narrow ? '-' : null,
     { k: 'rename', label: 'Rename', icon: 'edit' },
     { k: 'cover', label: 'Change cover', icon: 'file' },
     { k: 'dup', label: 'Duplicate', icon: 'plus' },
@@ -2496,6 +2497,8 @@ async function playlistMenu(btn, id) {
     p.spotifyId ? { k: 'resync', label: 'Re-sync from Spotify', icon: 'restore' } : null,
     '-', { k: 'del', label: 'Delete playlist', icon: 'trash', danger: true }
   ]);
+  if (k === 'yt-match') matchList(lists.get('pl') || p.trackIds);
+  if (k === 'yt-save') ytExport(lists.get('pl') || p.trackIds, p.name, p.id);
   if (k === 'rename') { const n = await promptText('Rename playlist', p.name); if (n) { p.name = n; await store.savePlaylist(p); renderSidebarPlaylists(); } }
   if (k === 'cover') pickFile('image/*', async f => { p.image = await imageToDataURL(f, 400); await store.savePlaylist(p); });
   if (k === 'dup') { const np = await store.createPlaylist(p.name + ' (copy)', p.trackIds); renderSidebarPlaylists(); location.hash = '#/playlist/' + np.id; }

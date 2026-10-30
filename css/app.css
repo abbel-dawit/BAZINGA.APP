@@ -964,7 +964,7 @@ body.np-open .logo-mark img, body.np-open .logo-mark::before, body.np-open .hh-b
 .set-jump { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; position: sticky; top: 0; z-index: 4; background: var(--bg); padding: 6px 0 12px; margin: -6px 0 6px; }
 .set-jump a { display: inline-flex; align-items: center; gap: 7px; flex: none; padding: 8px 14px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--line); font-weight: 650; font-size: 13.5px; }
 .set-jump a .ic { width: 16px; height: 16px; color: var(--volt); }
-.set-jump a:hover { background: var(--surface3); }
+@media (hover: hover) and (pointer: fine) { .set-jump a:not(.on):hover { background: var(--surface3); } }
 .set-group, .settings-page .panel { scroll-margin-top: 64px; }
 .group-h { font-size: 24px; margin: 22px 0 4px; display: flex; gap: 10px; align-items: center; }
 .group-h .ic { width: 24px; height: 24px; color: var(--volt); }
@@ -1885,19 +1885,6 @@ body.np-pulling #np-head::before { opacity: 1; }
 #set-autoplay span { display: flex !important; justify-content: center; white-space: nowrap; overflow: visible; padding: 9px 14px !important; }
 @media (max-width: 700px) { #set-autoplay span { padding: 9px 8px !important; font-size: clamp(11px, 3.1vw, 14px) !important; } }
 
-/* --- Song recognition in the assistant --- */
-.vc-id { margin: 2px auto 10px; display: flex; gap: 8px; border: 2px solid var(--volt); background: rgb(var(--volt-rgb) / .1); color: var(--text); font-weight: 700; }
-.vc-id .ic { width: 18px; height: 18px; color: var(--volt); }
-#voice.identifying .vc-orb { transform: scale(calc(1 + var(--lvl, 0) * .18)); transition: transform .08s linear; animation: none !important; }
-#voice.identifying .vc-orb b { box-shadow: 0 0 calc(30px + var(--lvl, 0) * 60px) rgb(var(--volt-rgb) / .8); }
-#voice.identifying .vc-id { opacity: .5; pointer-events: none; }
-.vc-song { display: flex; align-items: center; gap: 12px; margin: 4px 0 12px; padding: 10px; border-radius: 16px; background: var(--surface2); border: 2px solid var(--volt); box-shadow: 4px 4px 0 #000; text-align: left; animation: drop .3s ease-out; }
-.vc-song img, .vc-song-art { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; flex: none; background: var(--surface3); }
-.vc-song-t { flex: 1; min-width: 0; display: grid; gap: 2px; }
-.vc-song-t b { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vc-song-t span { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vc-song-b { display: flex; flex-direction: column; gap: 6px; flex: none; }
-@media (max-width: 420px) { .vc-song { flex-wrap: wrap; } .vc-song-b { flex-direction: row; width: 100%; } .vc-song-b .btn { flex: 1; } }
 
 /* --- Sleep timer button (full-screen player top bar, left of ⋯) --- */
 .np-head-r { display: flex; align-items: center; gap: 2px; }
@@ -2018,3 +2005,10 @@ body.np-pulling #np-head::before { opacity: 1; }
   .sidebar .nav a.on { box-shadow: 2px 2px 0 #000, inset 0 0 0 2px #000 !important; }
   .sidebar .profile-chip .avatar { width: min(30px, 100%) !important; height: auto !important; max-height: 30px; aspect-ratio: 1; }
 }
+
+/* ===== v1.6.8 ===== */
+/* --- Settings tabs: only the section you're on is highlighted — no leftover tap/hover/focus look --- */
+.set-jump a { -webkit-tap-highlight-color: transparent; transition: color .15s, border-color .15s, background .15s; }
+.set-jump a:focus:not(:focus-visible) { outline: none; }
+.set-jump a:not(.on) { color: var(--text); border-color: var(--line); }
+.set-jump a.on { background: rgb(var(--volt-rgb) / .12); }

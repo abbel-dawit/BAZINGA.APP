@@ -9,7 +9,7 @@ import re, pathlib
 
 ROOT = pathlib.Path(__file__).parent
 SRC = ROOT / 'src'
-ORDER = ['db', 'util', 'ui', 'meta', 'store', 'youtube', 'ytaccount', 'spotify', 'importers', 'player', 'backup', 'sync', 'chromaprint', 'voice', 'legal', 'qr', 'app']
+ORDER = ['db', 'util', 'ui', 'meta', 'store', 'youtube', 'ytaccount', 'spotify', 'importers', 'player', 'backup', 'sync', 'voice', 'legal', 'qr', 'app']
 
 def convert(name, code):
     exports = re.findall(r'^export\s+(?:async\s+)?(?:function\*?|const|let|class)\s+([A-Za-z_$][\w$]*)', code, re.M)
