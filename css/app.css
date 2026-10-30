@@ -1457,3 +1457,100 @@ body.queue-open #to-top { right: calc(var(--queue) + 22px) !important; }
 .p2-sec-h { display: flex; gap: 16px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; }
 .p2-sec-h h2 { margin: 2px 0 6px; } .p2-sec-h p { margin: 0; max-width: 560px; }
 .p2-sec .p2-goal { background: rgb(0 0 0 / .25); }
+
+/* ================= v1.5 ================= */
+/* --- No accidental zooming: no double-tap zoom, and phones never zoom in when a box is tapped --- */
+html, body { touch-action: manipulation; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+@media (pointer: coarse) {
+  input:not([type=range]):not([type=checkbox]):not([type=radio]), textarea, select { font-size: 16px !important; }
+}
+
+/* --- Sort button: label and arrow centred together --- */
+.sort-pick { position: relative; display: inline-flex; align-items: center; justify-content: center; height: 35px; padding: 0 14px; border-radius: 999px; background: var(--surface2); border: 1px solid var(--line); cursor: pointer; min-width: 0; }
+.sort-pick:hover { border-color: var(--surface3); }
+.sort-pick:focus-within { outline: 2px solid var(--volt); outline-offset: 2px; }
+.sort-face { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 0; font-size: 13.5px; font-weight: 600; color: var(--text); pointer-events: none; }
+.sort-lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.sort-face .ic { width: 14px; height: 14px; stroke-width: 2.6; flex: none; }
+.sort-pick select { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; -webkit-appearance: none; appearance: none; border: 0; font-size: 16px; }
+@media (max-width: 700px) { .fctl .sort-pick { flex: 1 1 0; } }
+
+/* --- Home hero: date with the device's time beside it --- */
+.hh-when { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; }
+.hh-time { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px 2px 7px; border-radius: 999px; background: rgb(255 214 10 / .12); border: 1px solid rgb(255 214 10 / .3); color: var(--volt); font-variant-numeric: tabular-nums; letter-spacing: .06em; }
+.hh-time .ic { width: 13px; height: 13px; stroke-width: 2.4; }
+.hh-time time { line-height: 1.5; }
+
+/* --- Screen lock --- */
+.lock-side { display: flex; align-items: center; gap: 13px; padding: 10px 12px; margin-top: 6px; border-radius: 10px; font-weight: 700; color: var(--text); border: 1px solid var(--line); width: 100%; }
+.lock-side:hover { background: var(--surface2); }
+@media (max-width: 1000px) { .lock-side { font-size: 0; justify-content: center; padding: 12px; } .lock-side .ic { width: 22px; height: 22px; } }
+.lock-top { color: var(--text) !important; }
+body.lock-off .lock-top, body.lock-off .lock-side, body.lock-off .lock-np { display: none !important; }
+#lock-layer { position: fixed; inset: 0; z-index: 2147483000; background: rgb(0 0 0 / .18); touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+#lock-layer .lock-pill { position: absolute; left: 50%; top: calc(env(safe-area-inset-top) + 18px); transform: translate(-50%, -8px); display: flex; align-items: center; gap: 12px; padding: 10px 18px 10px 14px; border-radius: 999px; background: rgb(12 12 14 / .92); border: 1px solid rgb(255 214 10 / .45); box-shadow: 0 10px 30px rgb(0 0 0 / .5); color: var(--text); opacity: 0; transition: opacity .25s, transform .25s; pointer-events: none; white-space: nowrap; }
+#lock-layer .lock-pill.show { opacity: 1; transform: translate(-50%, 0); }
+#lock-layer .lock-pill .ic { width: 22px; height: 22px; color: var(--volt); }
+#lock-layer .lock-pill b { display: block; font-size: 15px; }
+#lock-layer .lock-pill small { display: block; font-size: 12.5px; color: var(--muted); }
+body.app-locked { overscroll-behavior: none; }
+
+/* --- Sync your devices --- */
+.link-dlg { display: grid; gap: 14px; text-align: center; }
+.link-dlg h3 { justify-content: center; }
+.qr-box { width: min(240px, 68vw); margin: 0 auto; padding: 10px; background: #fff; border-radius: 16px; border: 3px solid var(--volt); box-shadow: 4px 4px 0 #000; }
+.qr-box svg { display: block; width: 100%; height: auto; }
+.row-btns.center, .modal-actions.center { justify-content: center; }
+.code-box { display: grid; gap: 8px; justify-items: center; padding: 12px; border-radius: 14px; background: var(--surface2); border: 1px solid var(--line); }
+.code-box .kicker { margin: 0; }
+.code-out { display: grid; gap: 2px; justify-items: center; }
+.code-big { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 30px; letter-spacing: .14em; color: var(--volt); font-variant-numeric: tabular-nums; user-select: all; }
+.code-short { word-break: break-all; user-select: all; }
+.danger-t { color: #ff6b5e !important; }
+.acct-panel .row-btns { flex-wrap: wrap; }
+
+/* --- Artist page: Top 10 albums grid --- */
+#artist-topalb:not(:empty) { margin-top: 28px; }
+#artist-topalb .sec-h { margin-bottom: 12px; }
+@media (min-width: 1181px) { .top-albums { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .top-albums { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* --- Logo v1.5: white letters, thick black outline, yellow 3D depth (sizes with the text) --- */
+.wordmark { color: #fff; letter-spacing: .045em; text-shadow: 0.080em 0.000em 0 #000, 0.074em 0.031em 0 #000, 0.057em 0.057em 0 #000, 0.031em 0.074em 0 #000, 0.000em 0.080em 0 #000, -0.031em 0.074em 0 #000, -0.057em 0.057em 0 #000, -0.074em 0.031em 0 #000, -0.080em 0.000em 0 #000, -0.074em -0.031em 0 #000, -0.057em -0.057em 0 #000, -0.031em -0.074em 0 #000, -0.000em -0.080em 0 #000, 0.031em -0.074em 0 #000, 0.057em -0.057em 0 #000, 0.074em -0.031em 0 #000, 0.110em 0.110em 0 var(--volt, #ffd60a), 0.140em 0.140em 0 var(--volt, #ffd60a), 0.170em 0.170em 0 var(--volt, #ffd60a), 0.200em 0.200em 0 var(--volt, #ffd60a), 0.230em 0.230em 0 var(--volt, #ffd60a), 0.310em 0.280em 0 #000, 0.301em 0.301em 0 #000, 0.280em 0.310em 0 #000, 0.259em 0.301em 0 #000, 0.250em 0.280em 0 #000, 0.259em 0.259em 0 #000, 0.280em 0.250em 0 #000, 0.301em 0.259em 0 #000; }
+.brand-row .wordmark { padding: 0 .12em .2em .02em; margin-bottom: -.2em; } /* room for the depth so it never clips */
+.ob-card h1.wordmark { color: #fff; letter-spacing: .045em; padding-bottom: .12em; text-shadow: 0.080em 0.000em 0 #000, 0.074em 0.031em 0 #000, 0.057em 0.057em 0 #000, 0.031em 0.074em 0 #000, 0.000em 0.080em 0 #000, -0.031em 0.074em 0 #000, -0.057em 0.057em 0 #000, -0.074em 0.031em 0 #000, -0.080em 0.000em 0 #000, -0.074em -0.031em 0 #000, -0.057em -0.057em 0 #000, -0.031em -0.074em 0 #000, -0.000em -0.080em 0 #000, 0.031em -0.074em 0 #000, 0.057em -0.057em 0 #000, 0.074em -0.031em 0 #000, 0.110em 0.110em 0 var(--volt, #ffd60a), 0.140em 0.140em 0 var(--volt, #ffd60a), 0.170em 0.170em 0 var(--volt, #ffd60a), 0.200em 0.200em 0 var(--volt, #ffd60a), 0.230em 0.230em 0 var(--volt, #ffd60a), 0.310em 0.280em 0 #000, 0.301em 0.301em 0 #000, 0.280em 0.310em 0 #000, 0.259em 0.301em 0 #000, 0.250em 0.280em 0 #000, 0.259em 0.259em 0 #000, 0.280em 0.250em 0 #000, 0.301em 0.259em 0 #000; }
+
+/* ================= v1.5.1 ================= */
+/* --- Account card counters: small, all four on one line (2×2 on very narrow phones) --- */
+.ah-stats { display: grid; grid-template-columns: repeat(4, auto); gap: 6px; justify-content: start; }
+.ah-stats span { flex-direction: column; align-items: center; justify-content: center; gap: 0; padding: 5px 10px; border-radius: 12px; font-size: 10.5px; line-height: 1.2; text-transform: uppercase; letter-spacing: .05em; min-width: 0; }
+.ah-stats b { font-size: 15px; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+@media (max-width: 700px) { .ah-stats { justify-content: center; width: 100%; grid-template-columns: repeat(4, minmax(0, 1fr)); max-width: 360px; margin: 0 auto; } }
+@media (max-width: 340px) { .ah-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 220px; } }
+
+/* --- Logo glow: sized to the bolt, never wider than the space around it, so it isn't cut off --- */
+.logo-mark::before { inset: -38%; }
+.logo-mark.big { width: min(120px, 30vw); height: min(120px, 30vw); margin: 12% 0 4%; }
+.brand-m { padding-left: 4px !important; }
+.sidebar .brand { overflow: visible; }
+#onboarding { padding-top: calc(env(safe-area-inset-top) + 40px); }
+.ob-logo { filter: drop-shadow(0 6px 18px rgb(255 214 10 / .45)); }
+
+/* --- Installed app (Home Screen): tab bar sits right on the bottom edge --- */
+@media (display-mode: standalone) and (max-width: 700px) {
+  :root { --safe-b: max(env(safe-area-inset-bottom) - 12px, 4px); }
+  .tabbar { height: calc(var(--tab) + max(env(safe-area-inset-bottom) - 12px, 4px)); padding-bottom: max(env(safe-area-inset-bottom) - 12px, 4px); align-content: start; }
+  .tabbar a { padding-top: 6px; }
+  #playerbar { bottom: calc(var(--tab) + max(env(safe-area-inset-bottom) - 12px, 4px) + 6px); }
+  body.has-track #main { padding-bottom: calc(var(--tab) + var(--bar) + max(env(safe-area-inset-bottom) - 12px, 4px) + 18px); }
+  #yt-dock { bottom: calc(var(--tab) + var(--bar) + max(env(safe-area-inset-bottom) - 12px, 4px) + 14px); }
+  #toasts { bottom: calc(var(--tab) + var(--bar) + max(env(safe-area-inset-bottom) - 12px, 4px) + 16px); }
+  body.has-track #to-top { bottom: calc(var(--tab) + var(--bar) + max(env(safe-area-inset-bottom) - 12px, 4px) + 16px); }
+}
+
+/* --- Popups: "Don't show again" --- */
+.p2-btns { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.a2-never { display: block; margin: 12px auto 0; color: var(--muted); }
+.a2-never:hover { color: var(--text); }
+.modal-x { z-index: 3; opacity: .75; }
+.modal-x:hover { opacity: 1; }

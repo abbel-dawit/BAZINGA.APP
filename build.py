@@ -9,7 +9,7 @@ import re, pathlib
 
 ROOT = pathlib.Path(__file__).parent
 SRC = ROOT / 'src'
-ORDER = ['db', 'util', 'ui', 'meta', 'store', 'youtube', 'ytaccount', 'spotify', 'importers', 'player', 'backup', 'cloud', 'sync', 'voice', 'legal', 'app']
+ORDER = ['db', 'util', 'ui', 'meta', 'store', 'youtube', 'ytaccount', 'spotify', 'importers', 'player', 'backup', 'sync', 'voice', 'legal', 'qr', 'app']
 
 def convert(name, code):
     exports = re.findall(r'^export\s+(?:async\s+)?(?:function\*?|const|let|class)\s+([A-Za-z_$][\w$]*)', code, re.M)
@@ -42,6 +42,12 @@ for rel in ['css/app.css', 'js/bazinga.js']:
     txt = re.sub(re.escape(rel) + r'(\?v=[0-9a-f]+)?"', rel + '?v=' + h + '"', idx.read_text())
     idx.write_text(txt)
 print('stamped index.html')
+# version.json: the installed app checks this on every launch and reloads itself when it changes
+import json
+js_hash = hashlib.sha1((ROOT / 'js' / 'bazinga.js').read_bytes()).hexdigest()[:10]
+css_hash = hashlib.sha1((ROOT / 'css' / 'app.css').read_bytes()).hexdigest()[:10]
+(ROOT / 'version.json').write_text(json.dumps({'v': js_hash + '.' + css_hash}) + '\n')
+print('wrote version.json')
 
 # Standalone privacy page (Google's OAuth review needs a normal URL for it)
 import subprocess, html as _html

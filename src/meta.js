@@ -213,7 +213,7 @@ export async function albumTracks(itunesAlbumId) {
 export async function artistAlbums(itunesArtistId, o) {
   const res = await call('lookup', { id: itunesArtistId, entity: 'album', limit: 200 }, { ttl: 3 * DAY, ...o });
   const seen = new Set();
-  return res.filter(r => r.wrapperType === 'collection' && r.collectionType === 'Album').map(albumFromItunes)
+  return res.filter(r => r.wrapperType === 'collection' && r.collectionType === 'Album').map((r, i) => ({ ...albumFromItunes(r), rank: i })) // rank = Apple's own order (roughly most popular first)
     .filter(a => { const k = norm(a.title); if (seen.has(k)) return false; seen.add(k); return true; })
     .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
 }

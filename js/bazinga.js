@@ -296,7 +296,11 @@ const I = {
   spotify: '<circle cx="12" cy="12" r="10"/><path d="M7 9.5c3.5-1 7-.7 10 1M7.5 12.8c3-.8 5.6-.5 8 .9M8 16c2.3-.5 4.3-.3 6 .7"/>',
   grip: '<circle cx="9" cy="7" r="1.2" fill="currentColor"/><circle cx="15" cy="7" r="1.2" fill="currentColor"/><circle cx="9" cy="12" r="1.2" fill="currentColor"/><circle cx="15" cy="12" r="1.2" fill="currentColor"/><circle cx="9" cy="17" r="1.2" fill="currentColor"/><circle cx="15" cy="17" r="1.2" fill="currentColor"/>',
   expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
-  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>'
+  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
+  lock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
+  unlock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.6-1.7"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
+  qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
 };
 const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n] || ''}</svg>`;
 
@@ -466,12 +470,14 @@ function filterBar(f, tracks, { showSort = true, keepOrder = false, likedSort = 
       <div class="fsearch"><label class="searchbox sm">${icon('search')}<input data-f="q" placeholder="Filter songs" value="${esc(f.q || '')}" enterkeyhint="search" aria-label="Filter songs"></label>
         <button class="round-search" data-act="filter-go" aria-label="Search these songs" title="Search">${icon('search')}</button></div>
       <div class="fctl"><button class="chip ${f.open ? 'on' : ''}" data-act="toggle-filters">${icon('filter')}Filters${active ? ` <b>${active}</b>` : ''}</button>
-      ${showSort ? `<select data-f="sort" class="select" aria-label="Sort">
-        ${keepOrder ? `<option value="" ${!f.sort ? 'selected' : ''}>Custom order</option>` : ''}
-        ${likedSort ? `<option value="liked" ${f.sort === 'liked' ? 'selected' : ''}>Recently liked</option>` : ''}
-        ${[['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']]
-          .map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}
-      </select>` : ''}</div>
+      ${showSort ? (() => {
+        const opts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
+          ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
+        const cur = opts.find(([v]) => v === (f.sort || '')) || opts.find(([v]) => v === 'added');
+        // The label + arrow are drawn centred together; the real <select> sits invisibly on top to open the list
+        return `<label class="sort-pick"><span class="sort-face"><span class="sort-lbl">${esc(cur[1])}</span>${icon('down')}</span>
+          <select data-f="sort" aria-label="Sort">${opts.map(([v, l]) => `<option value="${v}" ${cur[0] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
+      })() : ''}</div>
     </div>
     ${f.open ? `<div class="filter-panel">
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
@@ -720,7 +726,7 @@ async function albumTracks(itunesAlbumId) {
 async function artistAlbums(itunesArtistId, o) {
   const res = await call('lookup', { id: itunesArtistId, entity: 'album', limit: 200 }, { ttl: 3 * DAY, ...o });
   const seen = new Set();
-  return res.filter(r => r.wrapperType === 'collection' && r.collectionType === 'Album').map(albumFromItunes)
+  return res.filter(r => r.wrapperType === 'collection' && r.collectionType === 'Album').map((r, i) => ({ ...albumFromItunes(r), rank: i })) // rank = Apple's own order (roughly most popular first)
     .filter(a => { const k = norm(a.title); if (seen.has(k)) return false; seen.add(k); return true; })
     .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || ''));
 }
@@ -2134,7 +2140,7 @@ function loadYT() {
           onStateChange: e => {
             if (P.source !== 'yt') return;
             if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
-            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); changed(); }
+            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
             else if (e.data === YT.PlayerState.PAUSED) {
               if (isRerouting()) return;
               // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
@@ -2309,7 +2315,7 @@ function ended() {
   next(true);
 }
 audio.addEventListener('ended', () => P.source === 'local' && ended());
-audio.addEventListener('play', () => { P.playing = true; changed(); });
+audio.addEventListener('play', () => { P.playing = true; if (!tick) startTick(); changed(); });
 audio.addEventListener('pause', () => { if (isRerouting()) return; P.playing = false; changed(); });
 audio.addEventListener('error', () => { if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
 
@@ -2607,239 +2613,105 @@ async function restoreFromFile(file) { await restore(JSON.parse(await file.text(
 
 return { fsSupported, snapshot, restore, linkedFileState, runBackup, startAuto, linkFile, regrant, unlinkFile, download, listInternal, restoreInternal, restoreFromFile };
 })();
-// ---------- cloud.js ----------
-const __m_cloud = (() => {
-// Optional BAZINGA! accounts, powered by Supabase (Auth + Database + Storage).
-// A tiny built-in client for Supabase's documented REST APIs — no extra library to download.
-// Sign-in methods: Google, Discord, email + password (with email verification and password reset).
-// Uses the secure PKCE flow; sessions are kept on this device and refreshed automatically.
-const { kv } = __m_db;
-const { emit } = __m_util;
-
-let URL_ = '', KEY = '';
-let session = null; // {access_token, refresh_token, expires_at(ms), user}
-
-function configure(url, anonKey) { URL_ = (url || '').replace(/\/$/, ''); KEY = anonKey || ''; }
-const configured = () => !!(URL_ && KEY);
-const user = () => session?.user || null;
-const signedIn = () => !!session?.user;
-const redirectBase = () => location.origin + location.pathname;
-
-const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-async function newPkce() {
-  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
-  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
-  try { localStorage.setItem('bz_sb_verifier', verifier); } catch { }
-  return challenge;
-}
-
-function errText(d, status) {
-  const code = d?.error_code || d?.code || d?.error;
-  const msg = d?.msg || d?.error_description || d?.message || '';
-  const nice = {
-    invalid_credentials: 'Wrong email or password.', invalid_grant: 'Wrong email or password.',
-    email_not_confirmed: 'Please verify your email first — check your inbox (and spam folder).',
-    user_already_exists: 'An account with this email already exists. Try logging in.', email_exists: 'An account with this email already exists. Try logging in.',
-    weak_password: 'That password is too weak — use at least 8 characters with a mix of letters and numbers.',
-    over_email_send_rate_limit: 'Too many emails were sent just now. Please wait a few minutes and try again.',
-    over_request_rate_limit: 'Too many attempts. Please wait a minute and try again.',
-    email_address_invalid: 'That email address doesn\'t look right.', validation_failed: msg || 'Please check the details you entered.',
-    signup_disabled: 'New sign-ups are turned off right now.', provider_disabled: 'That sign-in method isn\'t turned on yet.',
-    same_password: 'Your new password must be different from the old one.'
-  };
-  if (/invalid login credentials/i.test(msg)) return nice.invalid_credentials;
-  if (/email not confirmed/i.test(msg)) return nice.email_not_confirmed;
-  if (/already registered/i.test(msg)) return nice.user_already_exists;
-  const e = new Error(nice[code] || msg || `Account service error (${status})`);
-  e.code = code; e.status = status;
-  return e.message;
-}
-async function req(method, path, { body, auth = false, query = {}, headers = {}, raw = false } = {}) {
-  if (!configured()) throw new Error('Accounts aren\'t set up for this copy of BAZINGA! yet.');
-  if (auth) await fresh();
-  const q = new URLSearchParams(query).toString();
-  const r = await fetch(`${URL_}${path}${q ? (path.includes('?') ? '&' : '?') + q : ''}`, {
-    method,
-    headers: { apikey: KEY, ...(auth && session ? { Authorization: 'Bearer ' + session.access_token } : { Authorization: 'Bearer ' + KEY }), ...(body !== undefined && !(body instanceof Blob) ? { 'Content-Type': 'application/json' } : {}), ...headers },
-    body: body === undefined ? undefined : body instanceof Blob ? body : JSON.stringify(body)
-  });
-  if (raw) { if (!r.ok) { const d = await r.json().catch(() => ({})); const e = new Error(errText(d, r.status)); e.status = r.status; throw e; } return r; }
-  const text = await r.text();
-  let d = {}; try { d = text ? JSON.parse(text) : {}; } catch { d = { msg: text }; }
-  if (!r.ok) { const e = new Error(errText(d, r.status)); e.status = r.status; e.code = d?.error_code || d?.code || d?.error; throw e; }
-  return d;
-}
-
-async function setSession(d) {
-  if (!d?.access_token) return;
-  session = { access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000 - 60e3, user: d.user || session?.user };
-  if (!session.user) session.user = await req('GET', '/auth/v1/user', { auth: true });
-  await kv.set('sbSession', session);
-  emit('account', session.user);
-}
-let refreshing = null;
-async function fresh() {
-  if (!session) return;
-  if (Date.now() < session.expires_at) return;
-  if (!refreshing) refreshing = (async () => {
-    try {
-      const d = await fetch(`${URL_}/auth/v1/token?grant_type=refresh_token`, { method: 'POST', headers: { apikey: KEY, 'Content-Type': 'application/json' }, body: JSON.stringify({ refresh_token: session.refresh_token }) });
-      if (d.status === 400 || d.status === 401) { await clearSession(); throw new Error('Your session expired — please log in again.'); }
-      if (!d.ok) throw new Error('offline');
-      await setSession(await d.json());
-    } finally { refreshing = null; }
-  })();
-  return refreshing;
-}
-async function clearSession() { session = null; await kv.del('sbSession'); emit('account', null); }
-
-async function restore() {
-  const s = await kv.get('sbSession');
-  if (s?.user) { session = s; emit('account', s.user); fresh().catch(() => { }); }
-}
-
-// ---------- sign-in methods ----------
-async function signInWithProvider(provider) { // 'google' | 'discord'
-  if (!configured()) throw new Error('Accounts aren\'t set up for this copy of BAZINGA! yet.');
-  if (!location.protocol.startsWith('http')) throw new Error('Signing in only works on the hosted (GitHub Pages) version of BAZINGA!.');
-  const challenge = await newPkce();
-  const p = new URLSearchParams({ provider, redirect_to: redirectBase() + '?auth=sb', code_challenge: challenge, code_challenge_method: 's256' });
-  if (provider === 'google') p.set('scopes', 'email profile');
-  if (provider === 'discord') p.set('scopes', 'identify email');
-  location.href = `${URL_}/auth/v1/authorize?${p}`;
-}
-async function signUp(email, password, username) {
-  const challenge = await newPkce();
-  const d = await req('POST', '/auth/v1/signup', { query: { redirect_to: redirectBase() + '?auth=sb' }, body: { email, password, data: { username }, code_challenge: challenge, code_challenge_method: 's256' } });
-  if (d.access_token) { await setSession(d); return { needsVerify: false }; } // email confirmation turned off
-  return { needsVerify: true };
-}
-async function signInWithPassword(email, password) {
-  await setSession(await req('POST', '/auth/v1/token?grant_type=password', { body: { email, password } }));
-}
-async function resendVerification(email) {
-  await req('POST', '/auth/v1/resend', { query: { redirect_to: redirectBase() + '?auth=sb' }, body: { type: 'signup', email } });
-}
-async function sendPasswordReset(email) {
-  const challenge = await newPkce();
-  await req('POST', '/auth/v1/recover', { query: { redirect_to: redirectBase() + '?auth=sb&type=recovery' }, body: { email, code_challenge: challenge, code_challenge_method: 's256' } });
-}
-async function updatePassword(password) {
-  const u = await req('PUT', '/auth/v1/user', { auth: true, body: { password } });
-  if (session) { session.user = u; await kv.set('sbSession', session); }
-}
-async function signOut() {
-  try { if (session) await req('POST', '/auth/v1/logout', { auth: true, query: { scope: 'local' } }); } catch { }
-  await clearSession();
-}
-
-// Finish a sign-in that came back from Google/Discord or from an email link.
-// Returns {kind: 'signin'|'recovery'|'verified'} or null if this page load isn't a sign-in return.
-async function handleRedirect() {
-  const q = new URLSearchParams(location.search);
-  if (q.get('auth') !== 'sb') return null;
-  const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
-  const clean = () => history.replaceState(null, '', redirectBase() + (location.hash.startsWith('#/') ? location.hash : '#/home'));
-  const err = q.get('error_description') || hash.get('error_description') || q.get('error') || hash.get('error');
-  if (err) { clean(); throw new Error(/expired|invalid/i.test(err) ? 'That link has expired or was already used. Request a new one.' : err.replace(/\+/g, ' ')); }
-  const code = q.get('code');
-  const type = q.get('type');
-  let verifier = null; try { verifier = localStorage.getItem('bz_sb_verifier'); } catch { }
-  if (!code) {
-    // Older-style link that puts the session in the URL hash
-    if (hash.get('access_token')) { await setSession({ access_token: hash.get('access_token'), refresh_token: hash.get('refresh_token'), expires_in: +hash.get('expires_in') || 3600 }); clean(); return { kind: hash.get('type') === 'recovery' ? 'recovery' : 'signin' }; }
-    clean(); return null;
-  }
-  try {
-    if (!verifier) throw Object.assign(new Error('no verifier'), { noVerifier: true });
-    const d = await req('POST', '/auth/v1/token?grant_type=pkce', { body: { auth_code: code, code_verifier: verifier } });
-    try { localStorage.removeItem('bz_sb_verifier'); } catch { }
-    await setSession(d);
-    clean();
-    return { kind: type === 'recovery' ? 'recovery' : 'signin' };
-  } catch (e) {
-    clean();
-    // The email was verified, but the link was opened on a different device/browser than sign-up
-    if (e.noVerifier || /verifier|flow state/i.test(e.message)) return { kind: 'verified' };
-    throw e;
-  }
-}
-
-// ---------- database (profiles) ----------
-async function getProfile() {
-  const rows = await req('GET', '/rest/v1/profiles', { auth: true, query: { id: 'eq.' + user().id, select: '*' } });
-  return rows[0] || null;
-}
-async function saveProfile(patch) {
-  const rows = await req('POST', '/rest/v1/profiles', { auth: true, headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: { id: user().id, ...patch, updated_at: new Date().toISOString() } });
-  return rows[0];
-}
-// Public (signed-out) read, e.g. the tippers leaderboard
-async function publicRpc(fn, args = {}) { return req('POST', '/rest/v1/rpc/' + fn, { body: args }); }
-async function rpc(fn, args = {}) { return req('POST', '/rest/v1/rpc/' + fn, { auth: true, body: args }); }
-
-// ---------- storage (the synced library file) ----------
-async function uploadFile(bucket, path, blob) {
-  return req('POST', `/storage/v1/object/${bucket}/${path}`, { auth: true, body: blob, headers: { 'x-upsert': 'true', 'Content-Type': blob.type || 'application/octet-stream', 'cache-control': 'no-cache' } });
-}
-async function downloadFile(bucket, path) {
-  const r = await req('GET', `/storage/v1/object/authenticated/${bucket}/${path}`, { auth: true, raw: true });
-  return r.blob();
-}
-async function deleteFiles(bucket, paths) {
-  if (!paths.length) return;
-  return req('DELETE', `/storage/v1/object/${bucket}`, { auth: true, body: { prefixes: paths } });
-}
-async function listFiles(bucket, prefix) {
-  return req('POST', `/storage/v1/object/list/${bucket}`, { auth: true, body: { prefix, limit: 100, offset: 0 } });
-}
-
-return { configure, configured, user, signedIn, redirectBase, restore, signInWithProvider, signUp, signInWithPassword, resendVerification, sendPasswordReset, updatePassword, signOut, handleRedirect, getProfile, saveProfile, publicRpc, rpc, uploadFile, downloadFile, deleteFiles, listFiles };
-})();
 // ---------- sync.js ----------
 const __m_sync = (() => {
-// Cross-device sync for signed-in users.
-// The whole library (songs, likes, playlists, albums, YouTube matches, settings) is saved as one
-// compressed file in the user's private Supabase Storage folder. Every change bumps a revision
-// number in their profile; devices compare revisions, download what's new, MERGE it with what
-// they have (newest edit wins per item, likes merge separately, deletions are remembered), and
-// upload the result. Two devices saving at the same moment can't overwrite each other: the
-// revision bump only succeeds if nobody else saved in between, otherwise we merge and retry.
+// No-login, no-setup device sync.
+// A "sync key" (a long random secret made on the first device) is the only thing that ties
+// devices together. Other devices and browsers join by scanning a QR code, opening a link, or
+// typing a short code that works for 15 minutes. Nothing about the person is ever asked for.
+//
+// Transport: the free public ntfy.sh relay (no account, nothing for the app owner to set up).
+// The whole library (songs, likes, playlists, albums, YouTube matches, name & picture) is
+// compressed and ENCRYPTED on the device with a key derived from the sync key, then posted to a
+// topic whose name is a one-way hash of that key. ntfy.sh only ever sees unreadable bytes.
+// Copies on the relay last about 3 hours, so every open device re-posts its library at least once
+// an hour, and devices merge whatever is newer (newest edit wins per item, likes merge
+// separately, deletions are remembered). Your own device always keeps the full library.
 const { db, kv } = __m_db;
-const { emit, on, debounce, sleep } = __m_util;
-const cloud = __m_cloud;
+const { emit, on, debounce } = __m_util;
 const store = __m_store;
 const backup = __m_backup;
 
-const BUCKET = 'libraries';
 const S = { status: 'off', lastSync: 0, error: '', rev: 0 };
 const state = () => S;
-let st = null; // persisted per user: {rev, hash}
-let running = null, again = false, started = false, timer = null;
+let link = null;         // { secret, since, lastId, lastTs, pubTs, hash }
+let keys = null;         // { id, key } derived from link.secret
+let running = null, again = false, started = false;
 
-const device = () => {
+const available = () => !!window.crypto?.subtle && location.protocol.startsWith('http');
+const RELAY = () => ((window.BAZINGA_CONFIG || {}).syncRelay || 'https://ntfy.sh').replace(/\/$/, '');
+const linked = () => !!link?.secret;
+const linkInfo = () => link;
+
+const deviceName = () => {
   const ua = navigator.userAgent;
-  const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'device';
-  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'device';
+  const br = /EdgA?\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /OPR\//.test(ua) ? 'Opera' : /Firefox\/|FxiOS/.test(ua) ? 'Firefox' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
   return `${br} on ${os}`;
 };
 function setStatus(status, error = '') { S.status = status; S.error = error; if (status === 'synced') S.lastSync = Date.now(); emit('sync', S); }
 
-// ---------- file format ----------
-async function pack(obj) {
-  const bytes = new TextEncoder().encode(JSON.stringify(obj));
-  if ('CompressionStream' in window) return new Blob([await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()], { type: 'application/gzip' });
-  return new Blob([bytes], { type: 'application/json' });
+// ---------- keys & links ----------
+const b64url = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+const sha = s => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+async function derive(secret) {
+  const id = hex(await sha('bazinga-sync-id:' + secret));
+  const key = await crypto.subtle.importKey('raw', await sha('bazinga-sync-key:' + secret), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { id, key };
 }
-async function unpack(blob) {
-  const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
-  const stream = head[0] === 0x1f && head[1] === 0x8b ? blob.stream().pipeThrough(new DecompressionStream('gzip')) : blob.stream();
-  return JSON.parse(await new Response(stream).text());
+const newSecret = () => b64url(crypto.getRandomValues(new Uint8Array(16)));
+const cleanSecret = s => String(s || '').trim().replace(/[^A-Za-z0-9_-]/g, '');
+const cleanCode = c => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+const appBase = () => location.origin + location.pathname;
+const linkURL = () => link ? `${appBase()}#/link/${link.secret}` : '';
+const codeURL = code => `${appBase()}#/c/${code}`;
+// "K7M2-Q9XA"
+const prettyCode = c => c.length === 8 ? c.slice(0, 4) + '-' + c.slice(4) : c;
+
+// ---------- file format: gzip → AES-GCM → base64 ----------
+function toB64(u8) { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+function fromB64(b) { const s = atob(b), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+async function gz(bytes) { return 'CompressionStream' in window ? new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()) : bytes; }
+async function gunz(u8) { return u8[0] === 0x1f && u8[1] === 0x8b ? new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()) : u8; }
+async function seal(obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, keys.key, await gz(new TextEncoder().encode(JSON.stringify(obj)))));
+  const out = new Uint8Array(13 + ct.length); out[0] = 1; out.set(iv, 1); out.set(ct, 13);
+  return out;
 }
-const newFileName = rev => `${cloud.user().id}/lib-${rev}-${Math.random().toString(36).slice(2, 10)}.bz`;
+async function open(u, key = keys.key) {
+  if (u[0] !== 1) throw new Error('This library was saved by a newer BAZINGA! — refresh to update.');
+  const plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u.subarray(1, 13) }, key, u.subarray(13)));
+  return JSON.parse(new TextDecoder().decode(await gunz(plain)));
+}
+async function sealWith(key, obj) { const k0 = keys; keys = { key }; try { return await seal(obj); } finally { keys = k0; } }
+
+// ---------- the relay (ntfy.sh) ----------
+// Only "simple" requests (no custom headers), so browsers don't need a CORS pre-check.
+const topicOf = id => 'bz' + id.slice(0, 40);
+async function relayList(topic, since = 'all') {
+  const r = await fetch(`${RELAY()}/${topic}/json?poll=1&since=${since}`, { cache: 'no-store' });
+  if (!r.ok) throw new Error(r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
+  return (await r.text()).split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(m => m && m.event === 'message').sort((a, b) => a.time - b.time);
+}
+async function relayPost(topic, body, params) {
+  const r = await fetch(`${RELAY()}/${topic}?${new URLSearchParams({ firebase: 'no', ...params })}`, { method: 'POST', body });
+  if (!r.ok) throw new Error(r.status === 413 ? 'Your library is too big for the free sync relay.' : r.status === 429 ? 'Sync is busy — will try again shortly.' : `Sync relay error (${r.status})`);
+  return r.json();
+}
+const postFile = (topic, bytes) => relayPost(topic, new Blob([bytes]), { filename: 'library.bz', title: deviceName() });
+const postNote = (topic, text) => relayPost(topic, text, {});
+const liveFile = m => m.attachment?.url && (!m.attachment.expires || m.attachment.expires * 1000 > Date.now() + 30e3);
+async function fetchFile(m) {
+  const r = await fetch(m.attachment.url, { cache: 'no-store' });
+  if (!r.ok) throw new Error('Couldn\'t download the synced library — will try again.');
+  return new Uint8Array(await r.arrayBuffer());
+}
 
 function hash(snap) {
-  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.settings]);
+  const s = JSON.stringify([snap.tracks, snap.albums, snap.playlists, snap.tombstones, snap.ytcache?.length, snap.profile]);
   let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
   return (h >>> 0).toString(36) + ':' + s.length;
 }
@@ -2849,9 +2721,10 @@ async function localSnap() {
   snap.tombstones = store.tombstones();
   snap.tracks = snap.tracks.map(t => { const x = { ...t }; delete x.hadLocalFile; delete x.localFileId; return x; }).sort((a, b) => a.id < b.id ? -1 : 1);
   snap.albums.sort((a, b) => a.id < b.id ? -1 : 1); snap.playlists.sort((a, b) => a.id < b.id ? -1 : 1);
-  delete snap.player; delete snap.profile; delete snap.createdAt;
-  // never upload private keys/tokens; they stay on the device they were typed into
-  if (snap.settings) { snap.settings = { ...snap.settings }; for (const k of ['ytKey', 'geniusToken', 'googleClientId', 'customInstance']) delete snap.settings[k]; }
+  const p = snap.profile;
+  snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
+  delete snap.player; delete snap.createdAt;
+  delete snap.settings; // settings (and any private keys/tokens) stay on the device they were set on
   return snap;
 }
 
@@ -2886,14 +2759,14 @@ function merge(L, R) {
   const albums = unite(L.albums, R.albums, 'a', newerOf(x => x.updatedAt || x.savedAt || 0), x => x.updatedAt || x.savedAt || 0);
   const yc = new Map(R.ytcache || []);
   for (const [k, v] of L.ytcache || []) { const r = yc.get(k); if (!r || v?.manual || !r.manual) yc.set(k, v); }
-  // keep songs that playlists/albums still point at
   const ids = new Set(tracks.map(t => t.id));
   for (const p of playlists) p.trackIds = (p.trackIds || []).filter(i => ids.has(i));
   for (const a of albums) a.trackIds = (a.trackIds || []).filter(i => ids.has(i));
+  const lp = L.profile, rp = R.profile;
+  const profile = lp && rp ? ((rp.updatedAt || 0) > (lp.updatedAt || 0) ? rp : lp) : (lp || rp || null);
   return {
-    app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb,
-    ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1),
-    settings: { ...(R.settings || {}), ...(L.settings || {}) } // this device's own settings win
+    app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb, profile,
+    ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1)
   };
 }
 
@@ -2905,35 +2778,28 @@ async function applyLocal(m) {
   await db.clear('playlists'); await db.putMany('playlists', m.playlists);
   for (const [k, v] of m.ytcache || []) await db.put('ytcache', v, k);
   await store.setTombstones(m.tombstones);
+  if (m.profile) {
+    const local = await kv.get('profile');
+    if (local && (m.profile.updatedAt || 0) > (local.updatedAt || 0)) {
+      Object.assign(local, { username: m.profile.username || local.username, picture: m.profile.picture ?? local.picture, updatedAt: m.profile.updatedAt });
+      await kv.set('profile', local); emit('profile-changed', local);
+    }
+  }
   await store.load();
   emit('library'); emit('synced-in');
 }
 
-// ---------- profile (username + picture) ----------
-async function syncProfile(prof) {
-  const local = await kv.get('profile');
-  if (!local) return;
-  const remoteTs = prof?.updated_at ? Date.parse(prof.updated_at) : 0;
-  if (prof && remoteTs > (local.updatedAt || 0) && (prof.username || prof.avatar)) {
-    local.username = prof.username || local.username;
-    local.picture = prof.avatar ?? local.picture;
-    local.updatedAt = remoteTs;
-    await kv.set('profile', local); emit('profile-changed', local);
-  } else if (!prof || (local.updatedAt || 0) > remoteTs || !prof.username) {
-    await cloud.saveProfile({ username: local.username, avatar: local.picture || null, terms_version: local.termsAccepted || null });
-  }
-}
-async function pushProfile() { if (cloud.signedIn()) { try { const l = await kv.get('profile'); await cloud.saveProfile({ username: l.username, avatar: l.picture || null }); } catch { } } }
-
 // ---------- the sync itself ----------
+async function saveLink() { if (link) await kv.set('syncLink', link); else await kv.del('syncLink'); }
 function syncNow() {
-  if (!cloud.signedIn() || !navigator.onLine) { if (cloud.signedIn()) setStatus('offline'); return Promise.resolve(); }
+  if (!link || !available()) return Promise.resolve();
+  if (!navigator.onLine) { setStatus('offline'); return Promise.resolve(); }
   if (running) { again = true; return running; }
   running = (async () => {
     setStatus('syncing');
     try {
-      do { again = false; await once(); } while (again);
-      setStatus('synced');
+      do { again = false; await once(); } while (again && link);
+      if (link) setStatus('synced');
     } catch (e) {
       console.warn('sync failed', e);
       setStatus('error', /Failed to fetch|NetworkError|Load failed/.test(e.message) ? 'Couldn\'t reach the sync server.' : e.message);
@@ -2942,84 +2808,122 @@ function syncNow() {
   return running;
 }
 async function once() {
-  const uid = cloud.user().id;
-  st = st || (await kv.get('sync:' + uid)) || { rev: 0, hash: '' };
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let prof = await cloud.getProfile();
-    if (!prof) prof = await cloud.saveProfile({});
-    if (attempt === 0) await syncProfile(prof);
-    const remoteRev = prof.library_rev || 0;
-    let local = await localSnap(), base = local, remoteHash = st.hash;
-    if (remoteRev > st.rev) {
-      let remote = null;
-      if (prof.library_file) {
-        try { remote = await unpack(await cloud.downloadFile(BUCKET, prof.library_file)); } catch (e) { if (e.status !== 400 && e.status !== 404) throw e; }
-      }
-      if (remote) {
-        base = merge(local, remote);
-        remoteHash = hash(remote);
-        if (hash(base) !== hash(local)) await applyLocal(base);
-      }
-      st.rev = remoteRev; st.hash = remoteHash; await kv.set('sync:' + uid, st);
-    }
-    S.rev = st.rev;
-    const h = hash(base);
-    if (h === st.hash && remoteRev === st.rev) return; // nothing new to upload
-    // Upload under a brand-new file name, then claim the next revision for it.
-    // The claim only succeeds if no other device saved in between, so nothing is ever overwritten.
-    const next = remoteRev + 1, file = newFileName(next);
-    await cloud.uploadFile(BUCKET, file, await pack(base));
-    const got = await cloud.rpc('bump_library_rev', { expected: remoteRev, device: device(), file });
-    if (got === null || got === undefined || got === '' || (Array.isArray(got) && !got.length)) {
-      cloud.deleteFiles(BUCKET, [file]).catch(() => { }); // someone else saved first: drop ours, merge theirs, retry
-      continue;
-    }
-    st.rev = next; st.hash = h; S.rev = next;
-    await kv.set('sync:' + uid, st);
-    if (prof.library_file) cloud.deleteFiles(BUCKET, [prof.library_file]).catch(() => { });
-    return;
+  keys = keys || await derive(link.secret);
+  const topic = topicOf(keys.id);
+  const msgs = (await relayList(topic, link.lastTs ? Math.max(0, link.lastTs - 5) : 'all')).filter(m => m.id !== link.lastId && (!link.seen || !link.seen.includes(m.id)));
+  // "Turn off sync everywhere" from another device
+  for (const m of msgs) if (!m.attachment && m.message && m.time * 1000 > (link.since || 0)) {
+    try { const note = await open(fromB64(m.message)); if (note?.t === 'off') { await leave(); emit('sync-removed'); return; } } catch { }
   }
-  throw new Error('Another device keeps saving — will try again shortly.');
+  const latest = [...msgs].reverse().find(liveFile);
+  const local = await localSnap();
+  let base = local;
+  if (latest) {
+    const remote = await open(await fetchFile(latest));
+    base = merge(local, remote);
+    if (hash(base) !== hash(local)) await applyLocal(base);
+    link.hash = hash(remote); link.lastId = latest.id; link.lastTs = latest.time; link.pubTs = Math.max(link.pubTs || 0, latest.time);
+  }
+  if (msgs.length) { link.seen = msgs.slice(-20).map(m => m.id); link.lastTs = Math.max(link.lastTs || 0, msgs[msgs.length - 1].time); }
+  await saveLink();
+  const h = hash(base);
+  const fresh = Date.now() / 1000 - (link.pubTs || 0) < 50 * 60; // the relay keeps copies ~3 h: refresh hourly
+  if (h === link.hash && fresh) return;
+  const res = await postFile(topic, await seal(base));
+  link.hash = h; link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
+  await saveLink();
 }
 
-// When this device's library belonged to someone else (or to nobody), decide what to do with it
-async function ownerOf() { return kv.get('syncOwner'); }
-async function claim(mode) { // 'merge' | 'replace'
-  const uid = cloud.user().id;
-  if (mode === 'replace') {
+// ---------- start / join / leave ----------
+// Turn sync on for the first time on this device (makes a new sync key and posts the library)
+async function create() {
+  if (!available()) throw new Error('Device sync needs the online (GitHub Pages) version of BAZINGA!.');
+  link = { secret: newSecret(), since: Date.now() }; keys = null;
+  await saveLink();
+  await syncNow();
+  if (S.status === 'error') { const err = S.error; link = null; keys = null; await saveLink(); setStatus('off'); throw new Error(err); }
+  start();
+  return link;
+}
+// Is there a recent library posted under this key? (shown before joining)
+async function peek(secret) {
+  const k = await derive(secret);
+  const m = [...await relayList(topicOf(k.id))].reverse().find(liveFile);
+  return m ? { device: m.title || '', updatedAt: m.time * 1000 } : null;
+}
+// Join an existing sync key. mode: 'merge' (combine with what's here) | 'replace' (use only the linked library)
+async function join(secret, mode = 'merge') {
+  secret = cleanSecret(secret);
+  if (secret.length < 16) throw new Error('That sync link isn\'t complete — copy the whole link and try again.');
+  const found = await peek(secret).catch(() => null);
+  if (mode === 'replace' && found) {
     for (const s of ['tracks', 'albums', 'playlists']) await db.clear(s);
     await store.setTombstones({ t: {}, p: {}, a: {} });
+    const p = await kv.get('profile'); if (p) { p.updatedAt = 0; await kv.set('profile', p); }
     await store.load(); emit('library');
   }
-  await kv.set('syncOwner', uid);
-  st = { rev: 0, hash: '' }; await kv.set('sync:' + uid, st);
+  link = { secret, since: Date.now() }; keys = null;
+  await saveLink();
+  await syncNow();
+  start();
+  return found;
+}
+// Short codes: an 8-character code that hands this device's sync key to another device (15 minutes)
+const CODE_ABC = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+async function codeKeys(code) {
+  const topic = 'bzc' + hex(await sha('bazinga-code-id:' + code)).slice(0, 40);
+  const key = await crypto.subtle.importKey('raw', await sha('bazinga-code-key:' + code), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { topic, key };
+}
+async function makeCode() {
+  if (!link) await create();
+  const r = crypto.getRandomValues(new Uint8Array(8));
+  const code = [...r].map(b => CODE_ABC[b % 32]).join('');
+  const k = await codeKeys(code);
+  await postNote(k.topic, toB64(await sealWith(k.key, { s: link.secret, exp: Date.now() + 15 * 60e3 })));
+  return code;
+}
+async function redeemCode(code) {
+  const c = cleanCode(code);
+  if (c.length !== 8) throw new Error('Codes have 8 letters and numbers, like K7M2-Q9XA.');
+  const k = await codeKeys(c);
+  const msgs = await relayList(k.topic, '20m');
+  for (const m of msgs.reverse()) {
+    try { const d = await open(fromB64(m.message), k.key); if (d?.s && d.exp > Date.now()) return d.s; } catch { }
+  }
+  throw new Error('That code didn\'t work — check it, or make a new one on your other device (codes last 15 minutes).');
+}
+// Stop syncing on this device (its music stays here)
+async function leave() { link = null; keys = null; await saveLink(); setStatus('off'); }
+// Tell every linked device to stop syncing (each keeps its music)
+async function removeEverywhere() {
+  if (!link) return;
+  keys = keys || await derive(link.secret);
+  await postNote(topicOf(keys.id), toB64(await seal({ t: 'off', at: Date.now() })));
+  await leave();
 }
 
 let lastPush = 0;
 const schedule = debounce(() => {
-  const wait = Math.max(0, lastPush + 30e3 - Date.now());
+  const wait = Math.max(0, lastPush + 20e3 - Date.now());
   setTimeout(() => { lastPush = Date.now(); syncNow(); }, wait);
-}, 6000);
+}, 5000);
+async function restore() { link = await kv.get('syncLink'); if (link?.secret) start(); else setStatus('off'); }
 function start() {
-  if (!cloud.signedIn()) { setStatus('off'); return; }
-  st = null;
+  if (!link) { setStatus('off'); return; }
   syncNow();
   if (started) return; started = true;
-  on('dirty', why => { if (cloud.signedIn() && why !== 'synced') schedule(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && cloud.signedIn() && Date.now() - S.lastSync > 20e3) syncNow(); });
-  window.addEventListener('online', () => cloud.signedIn() && syncNow());
-  timer = setInterval(() => { if (document.visibilityState === 'visible' && cloud.signedIn()) syncNow(); }, 120e3);
-}
-function stop() { st = null; setStatus('off'); }
-
-// Delete everything this user has in the cloud
-async function deleteCloudData() {
-  const uid = cloud.user().id;
-  try { const files = await cloud.listFiles(BUCKET, uid + '/'); await cloud.deleteFiles(BUCKET, files.map(f => `${uid}/${f.name}`)); } catch { }
-  await cloud.rpc('delete_my_account');
+  on('dirty', why => { if (link && why !== 'synced') schedule(); });
+  document.addEventListener('visibilitychange', () => {
+    if (!link) return;
+    if (document.visibilityState === 'visible' && Date.now() - S.lastSync > 15e3) syncNow();
+    if (document.visibilityState === 'hidden') syncNow(); // save before the browser is closed
+  });
+  window.addEventListener('online', () => link && syncNow());
+  setInterval(() => { if (document.visibilityState === 'visible' && link) syncNow(); }, 90e3);
 }
 
-return { state, merge, pushProfile, syncNow, ownerOf, claim, start, stop, deleteCloudData };
+return { state, available, linked, linkInfo, deviceName, cleanSecret, cleanCode, linkURL, codeURL, prettyCode, merge, syncNow, create, peek, join, makeCode, redeemCode, leave, removeEverywhere, restore, start };
 })();
 // ---------- voice.js ----------
 const __m_voice = (() => {
@@ -3641,11 +3545,11 @@ return { canListen, voiceOptions, setVoicePrefs, previewVoice, initVoice, openVo
 const __m_legal = (() => {
 // Privacy Policy & Terms of Use. Bump TERMS_VERSION whenever the text changes —
 // every user will then be asked to accept again.
-const TERMS_VERSION = '2026-10-23.3';
+const TERMS_VERSION = '2026-10-30.2';
 const OWNER = 'Abbel Dawit';
 
 const LEGAL_HTML = `
-<p class="tiny muted">Last updated: 23 October 2026 · Version ${TERMS_VERSION}</p>
+<p class="tiny muted">Last updated: 30 October 2026 · Version ${TERMS_VERSION}</p>
 
 <h3>Terms of Use</h3>
 <p>BAZINGA! ("the App") is a free, personal project made available by ${OWNER} ("we", "us"). By creating a profile or otherwise using the App you agree to these Terms and the Privacy Policy below. If you do not agree, do not use the App.</p>
@@ -3680,18 +3584,18 @@ const LEGAL_HTML = `
 <p>You agree to defend, indemnify and hold harmless ${OWNER} and any contributors from any claims, damages, costs and expenses (including reasonable legal fees) arising from your use of the App, your content, or your breach of these Terms or of any third party's rights or terms.</p>
 
 <h4>8. Changes and ending use</h4>
-<p>We may change, suspend or discontinue the App, or update these Terms, at any time without notice. If the Terms change, the App will ask you to accept the new version before continuing. You can stop using the App at any time and delete your account and all its data from Settings.</p>
+<p>We may change, suspend or discontinue the App, or update these Terms, at any time without notice. If the Terms change, the App will ask you to accept the new version before continuing. You can stop using the App at any time and delete all its data from Settings.</p>
 
 <h4>9. General</h4>
 <p>If any part of these Terms is found unenforceable, the rest remains in effect. These Terms are the entire agreement between you and us about the App.</p>
 
 <h3>Privacy Policy</h3>
 <h4>What we collect</h4>
-<p><b>If you use BAZINGA! without an account: nothing.</b> There are no analytics and no advertising, and we never receive your username, profile picture, music library, listening history or backups.</p>
-<p><b>If you create an account</b> (optional), we store, in our Supabase database and storage: your email address (or the name and email your Google or Discord account shares with us), your username and profile picture, the date you accepted these terms, and a copy of your music library (songs, likes, playlists, albums, YouTube matches and app settings, but never your API keys, tokens or offline music files) so it can sync between your devices. Passwords are handled by Supabase and stored only as secure hashes. We don't sell or share this data with anyone, and only you can read it. You can delete your account and all of this data at any time in <b>Settings → Delete account</b>; signing out lets you keep or remove the copy on a device.</p>
+<p><b>There are no accounts, no sign-in and no analytics.</b> We never ask for your name, email or password, and there is no advertising.</p>
+<p><b>If you turn on device sync</b> (optional, Settings → Sync your devices), your device makes a random sync key and encrypts a copy of your music library (songs, likes, playlists, albums, YouTube matches, your display name and picture, and app settings, but never your API keys, tokens or offline music files) <b>before</b> it leaves the device. The encrypted copy is passed between your devices through ntfy.sh, a free public relay service, under a topic name derived from the key, together with a short device label such as "Safari on iPhone". Copies there expire after about 3 hours. Neither we nor ntfy.sh receive the key itself, so nobody else can read your library. If you create an 8-character short code, your sync key is posted to the relay encrypted with that code, and the app only accepts it for 15 minutes. Anyone you give your sync link, QR code or short code to can see and change your synced library, so share them only with your own devices. You can stop syncing at any time in <b>Settings → Sync your devices</b>.</p>
 
 <h4>What is stored on your device</h4>
-<p>Your username, profile picture, library, playlists, albums, YouTube matches, settings, any music files you add, any Spotify sign-in token, and automatic backups are stored only in your browser's storage on your device (and in any backup file you choose to save). You can erase all of it at any time with <b>Settings → Delete account</b>.</p>
+<p>Your display name, profile picture, library, playlists, albums, YouTube matches, settings, any music files you add, any Spotify sign-in token, and automatic backups are stored only in your browser's storage on your device (and in any backup file you choose to save). You can erase all of it at any time with <b>Settings → Erase this device</b>.</p>
 
 <h4>Third-party services your device talks to</h4>
 <p>To work, the App sends requests directly from your device to these services, which receive your IP address and the search terms or IDs needed. Their own privacy policies apply:</p>
@@ -3702,8 +3606,7 @@ const LEGAL_HTML = `
 <li><b>Deezer API</b> — to find missing cover art and artist photos.</li>
 <li><b>Genius</b> — only when you open lyrics: to find the song and show Genius's official lyrics widget (and, if you add one, using your own Genius access token).</li>
 <li><b>Spotify</b> — only if you choose to connect it, to read your Liked Songs and playlists.</li>
-<li><b>Supabase</b> — only if you create an account: hosts accounts, sign-in emails and your synced library.</li>
-<li><b>Google or Discord sign-in</b> — only if you choose "Continue with Google/Discord": shares your name, email and picture with BAZINGA! for your account.</li>
+<li><b>ntfy.sh</b> — only if you turn on device sync: relays the encrypted copy of your library between your devices (<a href="https://docs.ntfy.sh/privacy/" target="_blank" rel="noopener">ntfy.sh privacy policy</a>).</li>
 <li><b>Google / YouTube account</b> — only if you choose to connect it (see below).</li>
 <li><b>Buy Me a Coffee</b> — only if you choose to send a tip; payments happen on their site and BAZINGA! never sees your payment details.</li>
 <li><b>Google Fonts</b> and <b>GitHub Pages</b> — to load the App's fonts and files.</li>
@@ -3728,6 +3631,158 @@ const LEGAL_HTML = `
 
 return { TERMS_VERSION, OWNER, LEGAL_HTML };
 })();
+// ---------- qr.js ----------
+const __m_qr = (() => {
+// Tiny QR code maker (byte mode, error correction M), drawn as an SVG.
+// Self-contained so the app needs no extra download. Based on the QR Code spec (ISO/IEC 18004).
+const ECC_PER_BLOCK_M = [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28];
+const BLOCKS_M = [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29, 31, 33, 35, 37, 38, 40, 43, 45, 47, 49];
+const FORMAT_M = 0;
+
+function rawModules(ver) {
+  let r = (16 * ver + 128) * ver + 64;
+  if (ver >= 2) { const n = Math.floor(ver / 7) + 2; r -= (25 * n - 10) * n - 55; if (ver >= 7) r -= 36; }
+  return r;
+}
+const dataCodewords = ver => Math.floor(rawModules(ver) / 8) - ECC_PER_BLOCK_M[ver] * BLOCKS_M[ver];
+
+function gfMul(x, y) {
+  let z = 0;
+  for (let i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >>> 7) * 0x11D); z ^= ((y >>> i) & 1) * x; }
+  return z & 0xFF;
+}
+function rsDivisor(deg) {
+  const r = new Array(deg).fill(0); r[deg - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < deg; i++) {
+    for (let j = 0; j < deg; j++) { r[j] = gfMul(r[j], root); if (j + 1 < deg) r[j] ^= r[j + 1]; }
+    root = gfMul(root, 0x02);
+  }
+  return r;
+}
+function rsRemainder(data, div) {
+  const r = div.map(() => 0);
+  for (const b of data) {
+    const f = b ^ r.shift(); r.push(0);
+    div.forEach((c, i) => { r[i] ^= gfMul(c, f); });
+  }
+  return r;
+}
+function alignPositions(ver, size) {
+  if (ver === 1) return [];
+  const n = Math.floor(ver / 7) + 2;
+  const step = ver === 32 ? 26 : Math.ceil((ver * 4 + 4) / (n * 2 - 2)) * 2;
+  const out = [6];
+  for (let pos = size - 7; out.length < n; pos -= step) out.splice(1, 0, pos);
+  return out;
+}
+
+function qrMatrix(text) {
+  const bytes = [...new TextEncoder().encode(text)];
+  let ver = 1;
+  for (; ver <= 40; ver++) {
+    const cc = ver < 10 ? 8 : 16;
+    if (4 + cc + bytes.length * 8 <= dataCodewords(ver) * 8) break;
+  }
+  if (ver > 40) throw new Error('Too long for a QR code');
+  const cap = dataCodewords(ver) * 8;
+  // bit stream
+  const bits = [];
+  const put = (v, n) => { for (let i = n - 1; i >= 0; i--) bits.push((v >>> i) & 1); };
+  put(4, 4); put(bytes.length, ver < 10 ? 8 : 16); bytes.forEach(b => put(b, 8));
+  put(0, Math.min(4, cap - bits.length));
+  put(0, (8 - bits.length % 8) % 8);
+  for (let p = 0xEC; bits.length < cap; p ^= 0xEC ^ 0x11) put(p, 8);
+  const data = [];
+  for (let i = 0; i < bits.length; i += 8) data.push(bits.slice(i, i + 8).reduce((a, b) => (a << 1) | b, 0));
+  // error correction + interleave
+  const nBlocks = BLOCKS_M[ver], eccLen = ECC_PER_BLOCK_M[ver], raw = Math.floor(rawModules(ver) / 8);
+  const nShort = nBlocks - raw % nBlocks, shortLen = Math.floor(raw / nBlocks);
+  const div = rsDivisor(eccLen), blocks = [];
+  for (let i = 0, k = 0; i < nBlocks; i++) {
+    const dat = data.slice(k, k + shortLen - eccLen + (i < nShort ? 0 : 1)); k += dat.length;
+    const ecc = rsRemainder(dat, div);
+    if (i < nShort) dat.push(0);
+    blocks.push(dat.concat(ecc));
+  }
+  const all = [];
+  for (let i = 0; i < blocks[0].length; i++) blocks.forEach((b, j) => { if (i !== shortLen - eccLen || j >= nShort) all.push(b[i]); });
+
+  // modules
+  const size = ver * 4 + 17;
+  const M = Array.from({ length: size }, () => new Array(size).fill(false));
+  const F = Array.from({ length: size }, () => new Array(size).fill(false));
+  const fn = (x, y, dark) => { M[y][x] = dark; F[y][x] = true; };
+  for (let i = 0; i < size; i++) { fn(6, i, i % 2 === 0); fn(i, 6, i % 2 === 0); }
+  for (const [cx, cy] of [[3, 3], [size - 4, 3], [3, size - 4]])
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const x = cx + dx, y = cy + dy, d = Math.max(Math.abs(dx), Math.abs(dy));
+      if (x >= 0 && x < size && y >= 0 && y < size) fn(x, y, d !== 2 && d !== 4);
+    }
+  const al = alignPositions(ver, size), last = al.length - 1;
+  al.forEach((ax, i) => al.forEach((ay, j) => {
+    if ((i === 0 && j === 0) || (i === 0 && j === last) || (i === last && j === 0)) return;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) fn(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }));
+  const drawFormat = mask => {
+    const d = FORMAT_M << 3 | mask;
+    let r = d; for (let i = 0; i < 10; i++) r = (r << 1) ^ ((r >>> 9) * 0x537);
+    const b = ((d << 10) | r) ^ 0x5412, bit = i => ((b >>> i) & 1) === 1;
+    for (let i = 0; i <= 5; i++) fn(8, i, bit(i));
+    fn(8, 7, bit(6)); fn(8, 8, bit(7)); fn(7, 8, bit(8));
+    for (let i = 9; i < 15; i++) fn(14 - i, 8, bit(i));
+    for (let i = 0; i < 8; i++) fn(size - 1 - i, 8, bit(i));
+    for (let i = 8; i < 15; i++) fn(8, size - 15 + i, bit(i));
+    fn(8, size - 8, true);
+  };
+  drawFormat(0);
+  if (ver >= 7) {
+    let r = ver; for (let i = 0; i < 12; i++) r = (r << 1) ^ ((r >>> 11) * 0x1F25);
+    const b = ver << 12 | r;
+    for (let i = 0; i < 18; i++) { const bit = ((b >>> i) & 1) === 1, a = size - 11 + i % 3, c = Math.floor(i / 3); fn(a, c, bit); fn(c, a, bit); }
+  }
+  // data, zig-zag
+  let i = 0;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let v = 0; v < size; v++) for (let j = 0; j < 2; j++) {
+      const x = right - j, up = ((right + 1) & 2) === 0, y = up ? size - 1 - v : v;
+      if (!F[y][x] && i < all.length * 8) { M[y][x] = ((all[i >>> 3] >>> (7 - (i & 7))) & 1) === 1; i++; }
+    }
+  }
+  // pick the mask that's easiest to scan
+  const maskFn = [(x, y) => (x + y) % 2 === 0, (x, y) => y % 2 === 0, x => x % 3 === 0, (x, y) => (x + y) % 3 === 0,
+    (x, y) => (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0, (x, y) => x * y % 2 + x * y % 3 === 0,
+    (x, y) => (x * y % 2 + x * y % 3) % 2 === 0, (x, y) => ((x + y) % 2 + x * y % 3) % 2 === 0];
+  const apply = m => { for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!F[y][x] && maskFn[m](x, y)) M[y][x] = !M[y][x]; };
+  const penalty = () => {
+    let p = 0, dark = 0;
+    for (let y = 0; y < size; y++) for (const horiz of [true, false]) {
+      let run = 0, prev = null;
+      for (let x = 0; x < size; x++) {
+        const c = horiz ? M[y][x] : M[x][y];
+        if (c === prev) { run++; if (run === 5) p += 3; else if (run > 5) p++; } else { run = 1; prev = c; }
+      }
+    }
+    for (let y = 0; y < size - 1; y++) for (let x = 0; x < size - 1; x++) { const c = M[y][x]; if (c === M[y][x + 1] && c === M[y + 1][x] && c === M[y + 1][x + 1]) p += 3; }
+    for (const row of M) for (const c of row) if (c) dark++;
+    return p + Math.floor(Math.abs(dark * 20 - size * size * 10) / (size * size)) * 10;
+  };
+  let best = 0, bestP = Infinity;
+  for (let m = 0; m < 8; m++) { apply(m); drawFormat(m); const p = penalty(); if (p < bestP) { bestP = p; best = m; } apply(m); }
+  apply(best); drawFormat(best);
+  return M;
+}
+
+function qrSVG(text, { dark = '#000', light = '#fff', quiet = 4 } = {}) {
+  const M = qrMatrix(text), n = M.length + quiet * 2;
+  let d = '';
+  M.forEach((row, y) => row.forEach((c, x) => { if (c) d += `M${x + quiet} ${y + quiet}h1v1h-1z`; }));
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n} ${n}" shape-rendering="crispEdges" role="img" aria-label="QR code"><rect width="${n}" height="${n}" fill="${light}"/><path d="${d}" fill="${dark}"/></svg>`;
+}
+
+return { qrMatrix, qrSVG };
+})();
 // ---------- app.js ----------
 const __m_app = (() => {
 // BAZINGA — app shell, router and views
@@ -3740,7 +3795,6 @@ const { lib } = __m_store;
 const meta = __m_meta;
 const yt = __m_youtube;
 const ya = __m_ytaccount;
-const cloud = __m_cloud;
 const sync = __m_sync;
 const sp = __m_spotify;
 const imp = __m_importers;
@@ -3748,6 +3802,7 @@ const player = __m_player;
 const { P } = __m_player;
 const backup = __m_backup;
 const { LEGAL_HTML, TERMS_VERSION } = __m_legal;
+const { qrSVG } = __m_qr;
 
 const view = () => $('#view');
 const lists = new Map();      // listKey -> [trackIds] for "play from here"
@@ -3764,195 +3819,186 @@ let routeToken = 0;
 async function boot() {
   window.__bzStarted = true;
   if (location.protocol === 'file:') setTimeout(() => toast('Opened from a file: library & offline files work, but YouTube playback, Spotify and sharing need the GitHub Pages link.', 'err'), 1500);
-  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => { });
+  if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').then(r => r.update().catch(() => { })).catch(() => { });
+  checkForUpdate(true);
   settings = { ...settings, ...(await kv.get('settings', {})) };
   applySettings();
   yt.startInstances(); // warm up the YouTube server list in the background
   ya.restoreSession();
-  const cfg = window.BAZINGA_CONFIG || {};
-  cloud.configure(cfg.supabaseUrl, cfg.supabaseAnonKey);
-  await cloud.restore();
-  let authResult = null;
-  try { authResult = await cloud.handleRedirect(); } catch (e) { setTimeout(() => toast(e.message, 'err'), 300); }
+  const joinReq = readJoinLink();
   try { if (await sp.handleRedirect()) { toast('Spotify connected ✓'); location.hash = '#/import'; } }
   catch (e) { toast(e.message, 'err'); }
   await store.load();
   profile = await kv.get('profile');
-  if (!profile && cloud.signedIn()) profile = await profileFromAccount();
   await player.restore();
   player.setEndHook(queueEnded);
   (window.requestIdleCallback || (f => setTimeout(f, 1200)))(() => player.warmup());
   backup.startAuto();
   wireGlobal();
-  on('account', () => { if (profile) renderProfileChip(); });
+  wireLock();
   on('sync', () => { renderProfileChip(); const el = $('#sync-line'); if (el) el.innerHTML = syncLine(); });
+  on('sync-removed', () => { toast('Sync was turned off on another device — your music stays here'); if (location.hash.startsWith('#/settings')) rerender(); });
+  on('synced-in', () => { if (location.hash.startsWith('#/settings') && !$('.modal-wrap')) rerender(); });
   on('profile-changed', p => { profile = p; renderProfileChip(); });
-  if (!profile) {
-    onboarding();
-    if (authResult?.kind === 'verified') { toast('Email verified ✓ — log in to continue', 'ok'); openAuth('login'); }
-    return;
-  }
+  if (!profile) { welcome(joinReq); return; }
+  await sync.restore();
   await showApp();
-  afterSignIn(authResult?.kind);
+  if (joinReq) joinFlow(joinReq);
 }
 
-// ---------- accounts ----------
-async function profileFromAccount() {
-  const u = cloud.user(); if (!u) return null;
-  let cp = null; try { cp = await cloud.getProfile(); } catch { }
-  const md = u.user_metadata || {};
-  let termsOk = null; try { termsOk = localStorage.getItem('bz_terms_ok'); } catch { }
-  const p = {
-    username: (cp?.username || md.username || md.full_name || md.name || md.user_name || (u.email || 'listener').split('@')[0]).slice(0, 30),
-    picture: cp?.avatar || md.avatar_url || md.picture || '',
-    createdAt: Date.now(), updatedAt: cp?.updated_at ? Date.parse(cp.updated_at) : 0,
-    termsAccepted: termsOk === TERMS_VERSION || cp?.terms_version === TERMS_VERSION ? TERMS_VERSION : (cp?.terms_version || null),
-    termsAcceptedAt: termsOk ? new Date().toISOString() : null
-  };
-  await kv.set('profile', p);
-  return p;
+// ---------- Always run the newest version ----------
+// Every time BAZINGA! is opened (or comes back to the screen) it asks the site which version is
+// live (version.json, written by build.py). If you've pushed an update to GitHub, it reloads into it
+// straight away — or, if music is playing, at the next pause or the next time the app is opened.
+const RUNNING_VERSION = (() => {
+  const v = el => (el?.match(/[?&]v=([0-9a-f]+)/) || [])[1] || '';
+  const js = v([...document.scripts].find(x => /js\/bazinga\.js\?v=/.test(x.src))?.src);
+  const css = v([...document.querySelectorAll('link[rel=stylesheet]')].find(x => /css\/app\.css\?v=/.test(x.href))?.href);
+  return js && css ? js + '.' + css : '';
+})();
+let updateReady = '', lastUpdateCheck = 0;
+async function checkForUpdate(atLaunch = false) {
+  if (!RUNNING_VERSION || !location.protocol.startsWith('http') || !navigator.onLine) return;
+  if (!atLaunch && Date.now() - lastUpdateCheck < 60e3) return;
+  lastUpdateCheck = Date.now();
+  try {
+    const r = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) return;
+    const live = (await r.json())?.v;
+    if (!live || live === RUNNING_VERSION) { try { sessionStorage.removeItem('bz_upd'); } catch { } return; }
+    updateReady = live;
+    applyUpdate(atLaunch);
+  } catch { }
 }
-async function afterSignIn(kind) {
-  if (kind === 'recovery') { await setNewPassword(); }
-  if (kind === 'verified') { toast('Email verified ✓ — log in to continue', 'ok'); if (!cloud.signedIn()) openAuth('login'); }
-  if (!cloud.signedIn()) return;
-  // Whose music is on this device?
-  const owner = await sync.ownerOf(), uid = cloud.user().id;
-  if (owner !== uid) {
-    const hasLocal = store.saved().length || lib.playlists.size || lib.albums.size;
-    let mode = 'merge';
-    if (hasLocal) {
-      mode = await modal(`<h3>${icon('cloud')} Sync this device</h3>
-        <p class="muted">${owner ? 'This device has music from a different BAZINGA! account.' : 'You already have music on this device.'} What should happen to it?</p>
-        <div class="pick-list">
-          <button class="pick wrap" data-resolve="merge">${cover('', '+', 'sm')}<span><b>Add it to my account</b><small>Combine this device's music with your account (recommended)</small></span></button>
-          <button class="pick wrap" data-resolve="replace">${cover('', '↺', 'sm')}<span><b>Use only my account's music</b><small>Replace what's on this device with your synced library</small></span></button>
-        </div>`, { locked: true }) || 'merge';
-    }
-    // A brand-new account created from guest mode keeps the name/picture chosen on this device
-    if (!owner && hasLocal && mode === 'merge') {
-      try { const cp = await cloud.getProfile(); if (!cp || !(cp.library_rev > 0)) { profile.updatedAt = Date.now(); await kv.set('profile', profile); } } catch { }
-    }
-    await sync.claim(mode);
-  }
-  if (kind === 'signin') toast(`Signed in as ${cloud.user().email || profile.username} — syncing your music`, 'ok');
-  sync.start();
+async function applyUpdate(atLaunch) {
+  if (!updateReady) return;
+  const busy = player.isOn?.() && !atLaunch;
+  if (busy) return; // don't cut the music off — happens at the next pause or launch
+  let tried = null; try { tried = sessionStorage.getItem('bz_upd'); } catch { }
+  if (tried === updateReady + ':done') { updateReady = ''; return; } // already tried twice — give up quietly until the next launch
+  if (tried === updateReady) {
+    // A normal reload didn't pick it up: clear the app's saved files (never your music) and try once more
+    try { for (const k of await caches.keys()) if (k !== 'bazinga-img') await caches.delete(k); } catch { }
+    try { for (const r of await navigator.serviceWorker.getRegistrations()) await r.update(); } catch { }
+    try { sessionStorage.setItem('bz_upd', updateReady + ':done'); } catch { }
+  } else { try { sessionStorage.setItem('bz_upd', updateReady); } catch { } }
+  try { saveSpot(); } catch { }
+  location.reload();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { if (updateReady && !player.isOn()) applyUpdate(false); else checkForUpdate(); } });
+on('player', () => { if (updateReady && !player.isOn()) setTimeout(() => { if (!player.isOn()) applyUpdate(false); }, 1500); });
+
+// ---------- Sync your devices (no login: QR code, link or short code) ----------
+// Links look like  …/#/link/<sync key>  (QR code / copy link)  or  …/#/c/<8-letter code>  (short link)
+function readJoinLink() {
+  const m = location.hash.match(/^#\/(link|c)\/([A-Za-z0-9_-]+)/);
+  if (!m) return null;
+  history.replaceState(null, '', location.pathname + location.search + '#/home');
+  return m[1] === 'link' ? { secret: m[2] } : { code: m[2] };
 }
 function syncLine() {
   const S = sync.state();
-  if (!cloud.signedIn()) return '';
+  if (!sync.linked()) return '';
   const ago = S.lastSync ? Math.max(0, Math.round((Date.now() - S.lastSync) / 60e3)) : null;
   return S.status === 'syncing' ? `<span class="sync-st busy">${icon('cloud')} Syncing…</span>`
     : S.status === 'error' ? `<span class="sync-st err">${icon('cloudOff')} ${esc(S.error || 'Sync failed')} — will retry</span>`
     : S.status === 'offline' ? `<span class="sync-st">${icon('cloudOff')} Offline — will sync when you're back online</span>`
     : `<span class="sync-st ok">${icon('check')} Synced${ago === null ? '' : ago < 1 ? ' just now' : ` ${ago} min ago`}</span>`;
 }
-const providerOf = u => (u?.app_metadata?.provider || 'email');
-const PROVIDER_NAME = { google: 'Google', discord: 'Discord', email: 'email & password' };
-
-function startProvider(provider) {
-  try { localStorage.setItem('bz_terms_ok', TERMS_VERSION); } catch { }
-  cloud.signInWithProvider(provider).catch(e => toast(e.message, 'err'));
+// Join another device's library (from a link, QR code or short code)
+async function joinFlow(req) {
+  if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
+  let secret = req.secret;
+  try {
+    if (!secret) { toast('Checking your code…'); secret = await sync.redeemCode(req.code); }
+    secret = sync.cleanSecret(secret);
+    if (sync.linked() && sync.linkInfo().secret === secret) return toast('This device is already synced ✓', 'ok');
+    const found = await sync.peek(secret).catch(() => null);
+    const hasLocal = store.saved().length || lib.playlists.size || lib.albums.size;
+    let mode = req.mode || 'merge';
+    if (hasLocal && !req.mode) {
+      mode = await modal(`<h3>${icon('cloud')} Sync this device</h3>
+        <p class="muted">Linking to the library from <b>${esc(found?.device || 'your other device')}</b>. This ${sync.linked() ? 'device is already synced with a different library' : 'device already has music'}. What should happen to it?</p>
+        <div class="pick-list">
+          <button class="pick wrap" data-resolve="merge">${cover('', '+', 'sm')}<span><b>Combine both</b><small>Keep this device's music and add the other device's (recommended)</small></span></button>
+          <button class="pick wrap" data-resolve="replace">${cover('', '↺', 'sm')}<span><b>Use only the synced library</b><small>Replace the music on this device with the other device's</small></span></button>
+        </div>`);
+      if (!mode) return;
+    }
+    if (sync.linked()) await sync.leave();
+    toast('Syncing your music…');
+    await sync.join(secret, mode);
+    const S = sync.state();
+    if (S.status === 'error') throw new Error(S.error);
+    toast(found ? `Synced ✓ — ${store.saved().length} songs on this device` : 'Linked ✓ — your music arrives the next time BAZINGA! is open on your other device', 'ok');
+    renderProfileChip(); rerender();
+  } catch (e) { toast(e.message, 'err'); }
 }
-const brandBtn = (p, label) => `<button type="button" class="btn sso sso-${p}" data-act="sso" data-p="${p}">${p === 'google' ? icon('google') : p === 'discord' ? icon('discord') : icon('mail')}<span>${label}</span></button>`;
-const ssoButtons = () => `${brandBtn('google', 'Continue with Google')}${brandBtn('discord', 'Continue with Discord')}${brandBtn('email', 'Continue with email')}`;
-
-// Email + password: log in, sign up (with verification), forgot password
-async function openAuth(mode = 'login') {
-  let cooldown = 0;
-  const html = m => `<div class="auth">
-    <div class="auth-tabs"><button class="${m === 'login' ? 'on' : ''}" data-mode="login">Log in</button><button class="${m === 'signup' ? 'on' : ''}" data-mode="signup">Create account</button></div>
-    ${m === 'forgot' ? `<h3>Reset your password</h3><p class="muted tiny">We'll email you a link to choose a new password.</p>
-      <form data-form="forgot"><label class="fld"><span>Email</span><input name="email" type="email" required autocomplete="email"></label>
-      <button class="btn primary big">Send reset link</button><button type="button" class="btn ghost block" data-mode="login">Back to log in</button></form>`
-    : m === 'sent' ? `<div class="auth-sent">${icon('mail')}<h3>Check your inbox</h3><p class="muted">We sent a verification link to <b class="sent-to"></b>. Open it on this device to finish signing up. (Check spam too.)</p>
-      <button class="btn block" data-resend>Resend email</button><button class="btn ghost block" data-mode="login">I've verified — log in</button></div>`
-    : `<form data-form="${m}">
-      ${m === 'signup' ? `<label class="fld"><span>Username</span><input name="username" required maxlength="30" value="${esc(profile?.username || '')}" autocomplete="nickname"></label>` : ''}
-      <label class="fld"><span>Email</span><input name="email" type="email" required autocomplete="email"></label>
-      <label class="fld"><span>Password</span><span class="pw"><input name="password" type="password" required minlength="8" autocomplete="${m === 'signup' ? 'new-password' : 'current-password'}"><button type="button" class="ib sm" data-pw aria-label="Show password">${icon('eye')}</button></span></label>
-      ${m === 'signup' ? '<p class="tiny muted">At least 8 characters. We\'ll send you an email to verify your address.</p>' : '<button type="button" class="lnk tiny forgot" data-mode="forgot">Forgot password?</button>'}
-      <p class="err-text auth-err" hidden></p>
-      <button class="btn primary big">${m === 'signup' ? 'Create account' : 'Log in'}</button>
-      </form>
-      <div class="or"><span>or</span></div>
-      <div class="sso-row">${brandBtn('google', 'Google')}${brandBtn('discord', 'Discord')}</div>`}
-  </div>`;
-  await modal(`<div class="auth-wrap">${html(mode)}</div>`, {
-    ownForms: true,
-    onMount: (m, close) => {
-      const wrap = m.querySelector('.auth-wrap');
-      let sentTo = '';
-      const show = md => { wrap.innerHTML = html(md); if (md === 'sent') wrap.querySelector('.sent-to').textContent = sentTo; wire(); wrap.querySelector('input')?.focus(); };
-      const fail = (f, msg, extra = '') => { const e = f.querySelector('.auth-err'); if (e) { e.hidden = false; e.innerHTML = esc(msg) + extra; } };
-      const wire = () => {
-        wrap.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => show(b.dataset.mode));
-        wrap.querySelectorAll('[data-act="sso"]').forEach(b => b.onclick = e => { e.stopPropagation(); startProvider(b.dataset.p); });
-        wrap.querySelectorAll('[data-pw]').forEach(b => b.onclick = () => { const i = b.previousElementSibling; i.type = i.type === 'password' ? 'text' : 'password'; });
-        const rs = wrap.querySelector('[data-resend]');
-        if (rs) rs.onclick = async () => {
-          if (Date.now() < cooldown) return toast('Please wait a minute before resending', 'err');
-          try { await cloud.resendVerification(sentTo); cooldown = Date.now() + 60e3; toast('Verification email sent again ✓', 'ok'); } catch (e) { toast(e.message, 'err'); }
-        };
-        const f = wrap.querySelector('form'); if (!f) return;
-        f.onsubmit = async e => {
-          e.preventDefault(); e.stopPropagation();
-          const fd = Object.fromEntries(new FormData(f));
-          const btn = f.querySelector('button.primary'); btn.disabled = true;
-          try { localStorage.setItem('bz_terms_ok', TERMS_VERSION); } catch { }
-          try {
-            if (f.dataset.form === 'signup') {
-              sentTo = fd.email.trim();
-              const r = await cloud.signUp(sentTo, fd.password, fd.username.trim());
-              if (r.needsVerify) { show('sent'); return; }
-              close(); finishLogin();
-            } else if (f.dataset.form === 'login') {
-              await cloud.signInWithPassword(fd.email.trim(), fd.password);
-              close(); finishLogin();
-            } else if (f.dataset.form === 'forgot') {
-              await cloud.sendPasswordReset(fd.email.trim());
-              wrap.innerHTML = `<div class="auth-sent">${icon('mail')}<h3>Check your inbox</h3><p class="muted">If an account exists for that email, a password reset link is on its way.</p><button class="btn block" data-close>Done</button></div>`;
-            }
-          } catch (err) {
-            btn.disabled = false;
-            if (err.code === 'email_not_confirmed' || /verify your email/.test(err.message)) {
-              sentTo = fd.email.trim();
-              fail(f, err.message, ' <button type="button" class="lnk" data-resend-now>Resend verification email</button>');
-              f.querySelector('[data-resend-now]').onclick = async () => { try { await cloud.resendVerification(sentTo); toast('Verification email sent ✓', 'ok'); } catch (e2) { toast(e2.message, 'err'); } };
-            } else fail(f, err.message);
-          }
-        };
+async function enterCodeDialog() {
+  const r = await modal(`<h3>${icon('link')} Link this device</h3>
+    <p class="muted tiny">On the device that has your music: <b>Settings → Sync your devices → Link a device</b>. Then scan the QR code with this device's camera, open the link, or type the short code here.</p>
+    <form><label class="fld"><span>Short code or sync link</span><input name="c" required autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="K7M2-Q9XA"></label>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">Link</button></div></form>`);
+  if (!r?.c) return null;
+  const v = r.c.trim();
+  const m = v.match(/#\/(link|c)\/([A-Za-z0-9_-]+)/);
+  if (m) return m[1] === 'link' ? { secret: m[2] } : { code: m[2] };
+  if (sync.cleanSecret(v).length >= 20) return { secret: v };
+  return { code: v };
+}
+// Show the QR code + link + short code so another phone/browser can join
+async function linkDeviceDialog() {
+  if (!sync.available()) return toast('Device sync needs the online (GitHub Pages) version of BAZINGA!.', 'err');
+  if (!sync.linked()) {
+    try { await sync.create(); renderProfileChip(); }
+    catch (e) { return toast(e.message, 'err'); }
+  }
+  const url = sync.linkURL();
+  let timer = null;
+  await modal(`<div class="link-dlg">
+    <h3>${icon('link')} Link another device</h3>
+    <p class="muted tiny">Scan with the other phone's camera, or open the link in any browser — another browser on this phone works too. That device then stays in sync automatically.</p>
+    <div class="qr-box">${qrSVG(url)}</div>
+    <div class="row-btns center"><button class="btn primary" data-copy-link>${icon('link')}Copy link</button>${navigator.share ? `<button class="btn" data-share-link>${icon('share')}Share</button>` : ''}</div>
+    <div class="code-box">
+      <div class="kicker">Typing it in instead?</div>
+      <div class="code-out" hidden><b class="code-big"></b><span class="tiny muted code-short"></span><span class="tiny muted code-left"></span></div>
+      <button class="btn ghost" data-make-code>Get a short code</button>
+    </div>
+    <p class="tiny muted">Anyone with this link or code can see and change your library — only use it on your own devices.</p>
+    <div class="modal-actions center"><button class="btn" data-close>Done</button></div></div>`, {
+    onMount: m => {
+      m.querySelector('[data-copy-link]').onclick = () => copyText(url);
+      const sh = m.querySelector('[data-share-link]');
+      if (sh) sh.onclick = () => navigator.share({ title: 'BAZINGA! sync link', text: 'Open this to sync your BAZINGA! music:', url }).catch(() => { });
+      const mk = m.querySelector('[data-make-code]');
+      mk.onclick = async () => {
+        mk.disabled = true; mk.textContent = 'Making a code…';
+        try {
+          const code = await sync.makeCode(), until = Date.now() + 15 * 60e3;
+          const out = m.querySelector('.code-out'); out.hidden = false;
+          out.querySelector('.code-big').textContent = sync.prettyCode(code);
+          out.querySelector('.code-short').textContent = sync.codeURL(code).replace(/^https?:\/\//, '');
+          const tick = () => { const s = Math.max(0, Math.round((until - Date.now()) / 1000)); out.querySelector('.code-left').textContent = s ? `Works once, for ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : 'Expired — get a new code'; if (!s) clearInterval(timer); };
+          tick(); clearInterval(timer); timer = setInterval(tick, 1000);
+          mk.textContent = 'Get a new code';
+        } catch (e) { toast(e.message, 'err'); mk.textContent = 'Get a short code'; }
+        mk.disabled = false;
       };
-      wire();
     }
   });
+  clearInterval(timer);
+  if (location.hash.startsWith('#/settings')) rerender();
 }
-async function finishLogin() {
-  if (!profile) { profile = await profileFromAccount(); await showApp(); }
-  else { if (!profile.termsAccepted) { profile.termsAccepted = TERMS_VERSION; await kv.set('profile', profile); } renderProfileChip(); }
-  await afterSignIn('signin');
-  route();
-}
-async function setNewPassword() {
-  const r = await modal(`<h3>${icon('shield')} Choose a new password</h3><form>
-    <label class="fld"><span>New password</span><input name="pw" type="password" minlength="8" required autocomplete="new-password"></label>
-    <label class="fld"><span>Repeat new password</span><input name="pw2" type="password" minlength="8" required autocomplete="new-password"></label>
-    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Later</button><button class="btn primary">Save password</button></div></form>`);
-  if (!r) return;
-  if (r.pw !== r.pw2) { toast('Passwords didn\'t match — try again', 'err'); return setNewPassword(); }
-  try { await cloud.updatePassword(r.pw); toast('Password updated ✓', 'ok'); } catch (e) { toast(e.message, 'err'); }
-}
-async function signOutFlow() {
-  const r = await modal(`<h3>Sign out?</h3><p class="muted">Your music stays safe in your account. What should happen on this device?</p>
-    <div class="pick-list">
-      <button class="pick wrap" data-resolve="keep">${cover('', '✓', 'sm')}<span><b>Keep my music here</b><small>Keep using BAZINGA! on this device without syncing</small></span></button>
-      <button class="pick wrap" data-resolve="wipe">${cover('', '✕', 'sm')}<span><b>Remove it from this device</b><small>Good for shared or borrowed devices</small></span></button>
-    </div>`);
-  if (!r) return;
-  await sync.syncNow().catch(() => { });
-  await cloud.signOut(); sync.stop();
-  if (r === 'wipe') return wipeDevice();
-  toast('Signed out — your music is still on this device'); route(); renderProfileChip();
+async function syncMenu(kind) {
+  if (kind === 'leave') {
+    if (!await confirmBox('Stop syncing this device?', 'Your music stays on this device, but changes won\'t reach your other devices any more.', 'Stop syncing')) return;
+    await sync.leave(); toast('This device is no longer synced'); renderProfileChip(); rerender();
+  }
+  if (kind === 'forget') {
+    if (!await confirmBox('Turn off sync everywhere?', 'Every linked device stops syncing the next time it opens. Each device keeps the music it has.', 'Turn off everywhere', true)) return;
+    try { await sync.removeEverywhere(); toast('Sync is off on every device'); renderProfileChip(); rerender(); } catch (e) { toast(e.message, 'err'); }
+  }
 }
 async function wipeDevice() {
   player.stopAll();
@@ -3962,7 +4008,7 @@ async function wipeDevice() {
   if (navigator.serviceWorker) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
   location.replace(location.pathname);
 }
-async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('profile', profile); emit('dirty', 'profile'); renderProfileChip(); sync.pushProfile(); }
+async function profileChanged() { profile.updatedAt = Date.now(); await kv.set('profile', profile); emit('dirty', 'profile'); renderProfileChip(); }
 
 function applySettings() {
   ya.setGoogleClientId(settings.googleClientId || window.BAZINGA_CONFIG?.googleClientId || '');
@@ -4010,11 +4056,86 @@ async function termsGate() {
       <form><label class="agree"><input type="checkbox" name="ok" required><span>I have read and agree to the Privacy Policy and Terms of Use, and I understand BAZINGA! is provided as-is with no liability.</span></label>
       <div class="modal-actions"><button type="button" class="btn ghost" data-resolve="no">Decline</button><button class="btn primary">Accept</button></div></form>`, { wide: true, locked: true });
     if (r && r.ok) { profile.termsAccepted = TERMS_VERSION; profile.termsAcceptedAt = new Date().toISOString(); await kv.set('profile', profile); emit('dirty', 'terms'); }
-    else if (r === 'no') await modal(`<h3>You need to accept to use BAZINGA!</h3><p class="muted">If you don't agree, you can delete your account and all its data from this device.</p>
+    else if (r === 'no') await modal(`<h3>You need to accept to use BAZINGA!</h3><p class="muted">If you don't agree, you can erase all of BAZINGA!'s data from this device.</p>
       <div class="modal-actions"><button class="btn danger" data-resolve="del">Delete my data</button><button class="btn primary" data-resolve="back">Go back</button></div>`, { locked: true })
       .then(x => x === 'del' && deleteAccount());
   }
 }
+
+// ---------- Screen lock: ignore touches while the music plays ----------
+// Lock with the 🔒 button (top bar / sidebar / full-screen player) or by tapping an empty spot of
+// the screen 3 times quickly. Tap 3 times anywhere to unlock. Settings → Playback turns it off.
+let appLocked = false;
+const lockFeature = () => settings.lockFeature !== false;
+function setLocked(on) {
+  appLocked = !!on;
+  document.body.classList.toggle('app-locked', appLocked);
+  let ov = $('#lock-layer');
+  if (!ov) {
+    ov = document.createElement('div'); ov.id = 'lock-layer'; ov.hidden = true;
+    ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-label', 'Screen locked');
+    ov.innerHTML = `<div class="lock-pill">${icon('lock')}<span><b>Locked</b><small>Tap 3 times to unlock</small></span></div>`;
+    document.body.appendChild(ov);
+  }
+  ov.hidden = !appLocked;
+  if (appLocked) { try { document.activeElement?.blur(); } catch { } closeMenuSafe(); flashLockPill(); }
+  else toast('Unlocked', 'ok');
+}
+function closeMenuSafe() { const m = $('#menu-root'); if (m) m.innerHTML = ''; }
+let pillT = null;
+function flashLockPill() {
+  const p = $('#lock-layer .lock-pill'); if (!p) return;
+  p.classList.add('show'); clearTimeout(pillT); pillT = setTimeout(() => p.classList.remove('show'), 2600);
+}
+function applyLockSetting() { document.body.classList.toggle('lock-off', !lockFeature()); }
+function wireLock() {
+  applyLockSetting();
+  let taps = [];
+  const interactive = 'button, a, input, select, textarea, label, summary, [data-act], [data-p], [contenteditable], .row, .card, .qrow, .modal-wrap, .menu, .menu-back, #yt-dock, .seek, .vol';
+  document.addEventListener('pointerdown', e => {
+    if (!appLocked && (!lockFeature() || !e.isPrimary || e.target.closest(interactive))) { taps = []; return; }
+    const now = Date.now(), last = taps[taps.length - 1];
+    if (last && (now - last.t > 500 || Math.hypot(e.clientX - last.x, e.clientY - last.y) > 60)) taps = [];
+    taps.push({ t: now, x: e.clientX, y: e.clientY });
+    if (appLocked) flashLockPill();
+    if (taps.length >= 3) { taps = []; setLocked(!appLocked); }
+  }, true);
+  // While locked, nothing underneath reacts: no taps, keys, scrolling or zooming
+  const block = e => { if (appLocked) { e.preventDefault(); e.stopPropagation(); } };
+  ['click', 'dblclick', 'contextmenu', 'keydown', 'keypress', 'wheel', 'touchmove', 'gesturestart'].forEach(ev => document.addEventListener(ev, block, { capture: true, passive: false }));
+}
+
+// ---------- Keep the page pinned to the screen ----------
+// iPhones scroll the whole page when the keyboard opens (or after a bounce) and sometimes leave it
+// there, which lifts the bottom tab bar and leaves a gap under it — most visible in the installed app.
+// Only the full-screen player scrolls the page on purpose, so everywhere else snap it back.
+function pinPage() {
+  if (document.body.classList.contains('np-open')) return;
+  if (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop) { window.scrollTo(0, 0); document.documentElement.scrollTop = 0; document.body.scrollTop = 0; }
+}
+const pinSoon = () => { setTimeout(pinPage, 60); setTimeout(pinPage, 350); };
+document.addEventListener('focusout', pinSoon);
+window.addEventListener('orientationchange', pinSoon);
+window.addEventListener('pageshow', pinSoon);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pinSoon(); });
+window.visualViewport?.addEventListener('resize', pinSoon);
+window.addEventListener('scroll', () => { if (!document.body.classList.contains('np-open') && !isTypingNow()) pinSoon(); }, { passive: true });
+const isTypingNow = () => document.activeElement?.matches?.('input,textarea,select');
+
+// ---------- Live clock on the home hero (the device's own time zone & 12/24-hour setting) ----------
+const clockText = () => new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+let clockTimer = null;
+function startClock() {
+  clearTimeout(clockTimer);
+  const tick = () => {
+    const els = $$('[data-clock]'); if (!els.length) return; // stops when you leave Home
+    const t = clockText(); els.forEach(el => { if (el.textContent !== t) el.textContent = t; });
+    const d = $('[data-date]'); if (d) d.textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+    clockTimer = setTimeout(tick, 60000 - Date.now() % 60000 + 50);
+  };
+  tick();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && $('[data-clock]')) startClock(); });
 
 // ---------- Remember where you were (refresh / reopening the app lands on the same spot) ----------
 const SPOT_KEY = 'bz_spot';
@@ -4046,7 +4167,7 @@ async function showApp() {
   $$('.ni').forEach(el => { const n = [...el.classList].find(c => c.startsWith('ni-')).slice(3); el.outerHTML = icon(n); });
   $('#main').addEventListener('scroll', saveSpotSoon, { passive: true });
   wireToTop();
-  setTimeout(() => maybeInstallPrompt(), 25000);
+  setTimeout(launchPopups, 3500);
   renderProfileChip(); renderSidebarPlaylists(); renderPlayer();
   initVoice({
     go: h => { location.hash = h; }, back: () => goBack(),
@@ -4057,7 +4178,6 @@ async function showApp() {
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
   if (settings.wake && wakeSupported) setWake(true);
-  loadP2();
   if (navigator.storage?.persist) navigator.storage.persist();
 }
 
@@ -4083,15 +4203,28 @@ window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); instal
 window.addEventListener('appinstalled', () => { installEvt = null; kv.set('a2hs', { done: true }); toast('BAZINGA! is on your Home Screen ⚡', 'ok'); });
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+// Counts each time the app is opened (a reload in the same tab doesn't count again)
+async function countLaunch() {
+  let fresh = true; try { fresh = !sessionStorage.getItem('bz_launch'); sessionStorage.setItem('bz_launch', '1'); } catch { }
+  const n = ((await kv.get('launches')) || 0) + (fresh ? 1 : 0);
+  if (fresh) await kv.set('launches', n);
+  return { n, fresh };
+}
+const isInstalled = async () => isStandalone() || !!((await kv.get('a2hs')) || {}).done;
+// First visit: "Add to Home Screen". Then every 5th visit until it's installed or "Don't show again".
+// Every 10th visit: Buy Me a Coffee, until "Don't show again" (if both land on the same visit, coffee waits one visit).
+async function launchPopups() {
+  const { n, fresh } = await countLaunch();
+  if (!fresh || !profile || $('.modal-wrap') || document.body.classList.contains('np-open')) return;
+  const a2 = (await kv.get('a2hs')) || {}, cof = (await kv.get('phase2')) || {};
+  const wantA2 = !a2.never && !(await isInstalled()) && (n === 1 || n % 5 === 0);
+  const wantCoffee = !cof.never && (n % 10 === 0 || (cof.pending && n > 1));
+  if (wantA2) { if (wantCoffee) { cof.pending = true; await kv.set('phase2', cof); } return maybeInstallPrompt(); }
+  if (wantCoffee) { cof.pending = false; await kv.set('phase2', cof); phase2Popup(); }
+}
 async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
   const st = (await kv.get('a2hs')) || {};
-  if (!force) {
-    if (st.done || Date.now() < (st.snooze || 0)) return;
-    const touch = matchMedia('(pointer: coarse)').matches;
-    if (!touch && !installEvt) return;                       // desktops only when the browser can install
-    if ($('.modal-wrap') || document.body.classList.contains('np-open') || $('#voice.on')) return;
-  }
   const ios = isIOS(), ua = navigator.userAgent;
   const shareIc = '<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M5 11v9h14v-9"/></svg>';
   const dots = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="19" r="1.8" fill="currentColor"/></svg>';
@@ -4104,67 +4237,53 @@ async function maybeInstallPrompt(force = false) {
       <h3>Add BAZINGA! to your Home Screen</h3>
       <p class="muted">One tap away, full screen like a real app, and music keeps going better in the background.</p>
       ${steps}
-      <div class="modal-actions center">${installEvt ? `<button class="btn ghost" data-resolve="later">Not now</button><button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : `<button class="btn ghost" data-resolve="never">Don't show again</button><button class="btn primary" data-resolve="later">Got it</button>`}</div>
+      <div class="modal-actions center">${installEvt ? `<button class="btn primary" data-resolve="install">${icon('plus')}Add to Home Screen</button>` : `<button class="btn primary" data-resolve="later">Got it</button>`}</div>
+      <button class="lnk tiny a2-never" data-resolve="never">Don't show this again</button>
     </div>`);
   if (r === 'install' && installEvt) {
     installEvt.prompt();
-    try { const c = await installEvt.userChoice; if (c.outcome === 'accepted') st.done = true; else st.snooze = Date.now() + 14 * 864e5; } catch { }
+    try { const c = await installEvt.userChoice; if (c.outcome === 'accepted') st.done = true; } catch { }
     installEvt = null;
-  } else if (r === 'never') st.done = true;
-  else st.snooze = Date.now() + 10 * 864e5;
+  } else if (r === 'never') st.never = true;
   kv.set('a2hs', st);
 }
 
-// ================= ONBOARDING =================
-function onboarding() {
+// ================= WELCOME (no sign-up, no login) =================
+// One tap to start. Name and photo are optional and can be set any time in Settings.
+function welcome(joinReq = null) {
   $('#app').hidden = true;
   const ob = $('#onboarding'); ob.hidden = false;
-  let pic = '';
+  const canSync = sync.available();
   ob.innerHTML = `<div class="ob-card">
     <div class="ob-brand"><span class="logo-mark big"><img src="icons/icon-512.png" class="ob-logo" alt=""></span><h1 class="wordmark">BAZINGA!</h1></div>
-    <p class="muted">Your Spotify library, turned into YouTube music videos & audio — with a full player, albums, offline files and backups.</p>
+    <p class="muted">${joinReq ? 'Almost there — this browser will sync with your music from your other device.' : 'Your Spotify & Apple Music library as YouTube music videos & audio — with a full player, albums, offline files and backups. No sign-up, no login.'}</p>
     <label class="agree ob-terms"><input type="checkbox" id="ob-terms"><span>I agree to the <a class="lnk" href="#" id="ob-legal">Privacy Policy & Terms of Use</a>. BAZINGA! is provided as-is and isn't liable for anything.</span></label>
-    ${cloud.configured() ? `<div class="ob-acct">
-      <div class="ob-h">${icon('cloud')}<div><b>Sync across all your devices</b><small>Free account · log in or sign up</small></div></div>
-      ${ssoButtons()}
-    </div>
-    <div class="or"><span>or use without an account</span></div>` : ''}
-    <form id="ob-form">
-      <label class="ob-pic" title="Add a profile picture">
-        <input type="file" accept="image/*" id="ob-file" hidden>
-        <div class="avatar xl" id="ob-avatar">${icon('user')}</div>
-        <span>Add photo</span>
-      </label>
-      <label class="fld"><span>Pick a username</span><input name="username" required maxlength="30" autocomplete="nickname" placeholder="e.g. thunderkid"></label>
-      <button class="btn primary big">Let's go ${icon('play')}</button>
-      <p class="tiny muted">No email, no password. Just a name and a picture, saved only on this device. You can create an account later to sync, or delete everything any time in Settings.</p>
-    </form>
-    <button class="btn ghost" id="ob-restore">${icon('restore')}Restore from a backup file</button>
+    <button class="btn primary big" id="ob-go">${joinReq ? `${icon('link')}Sync this browser` : `Let's go ${icon('play')}`}</button>
+    ${!joinReq && canSync ? `<button class="btn" id="ob-link">${icon('qr')}I use BAZINGA! on another device</button>` : ''}
+    ${!joinReq ? `<button class="btn ghost" id="ob-restore">${icon('restore')}Restore from a backup file</button>` : ''}
+    <p class="tiny muted">Everything is saved on this device. You can add your name and photo later in Settings.</p>
     <p class="copyright">© 2026 Abbel Dawit · BAZINGA!</p>
   </div>`;
   $('#ob-legal').onclick = e => { e.preventDefault(); showLegal(); };
-  $$('#onboarding [data-act="sso"]').forEach(b => b.onclick = e => {
-    e.preventDefault(); e.stopPropagation();
-    if (!$('#ob-terms').checked) { $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600); return toast('Please accept the Privacy Policy & Terms first', 'err'); }
-    if (b.dataset.p === 'email') openAuth('signup'); else startProvider(b.dataset.p);
-  });
-  $('#ob-file').onchange = async e => {
-    const f = e.target.files[0]; if (!f) return;
-    pic = await imageToDataURL(f, 256);
-    $('#ob-avatar').innerHTML = `<img src="${pic}" alt="">`;
+  const termsOk = () => {
+    if ($('#ob-terms').checked) return true;
+    $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600);
+    toast('Please accept the Privacy Policy & Terms first', 'err'); return false;
   };
-  $('#ob-form').onsubmit = async e => {
-    e.preventDefault();
-    const username = new FormData(e.target).get('username').trim();
-    if (!username) return;
-    if (!$('#ob-terms').checked) { $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600); return toast('Please accept the Privacy Policy & Terms first', 'err'); }
-    profile = { username, picture: pic, createdAt: Date.now(), termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
+  const start = async req => {
+    profile = { username: 'Listener', picture: '', createdAt: Date.now(), updatedAt: 0, termsAccepted: TERMS_VERSION, termsAcceptedAt: new Date().toISOString() };
     await kv.set('profile', profile);
     emit('dirty', 'profile');
     location.hash = '#/home';
-    showApp();
+    await sync.restore();
+    await showApp();
+    if (req) joinFlow({ ...req, mode: 'replace' });
   };
-  $('#ob-restore').onclick = () => pickFile('.json,application/json', async f => {
+  $('#ob-go').onclick = () => { if (termsOk()) start(joinReq); };
+  const lk = $('#ob-link');
+  if (lk) lk.onclick = async () => { if (!termsOk()) return; const req = await enterCodeDialog(); if (req) start(req); };
+  const rs = $('#ob-restore');
+  if (rs) rs.onclick = () => pickFile('.json,application/json', async f => {
     try { await backup.restoreFromFile(f); location.reload(); } catch (err) { toast(err.message, 'err'); }
   });
 }
@@ -4186,6 +4305,7 @@ function goBack() {
 }
 
 async function route() {
+  if (/^#\/(link|c)\//.test(location.hash)) { const req = readJoinLink(); if (req) joinFlow(req); return route(); }
   const my = ++routeToken;
   const full = location.hash || '#/home';
   if (navStack[navStack.length - 2] === full) navStack.pop(); else if (navStack[navStack.length - 1] !== full) navStack.push(full);
@@ -4305,10 +4425,11 @@ async function vHome(_, my) {
   const greet = hr < 5 ? 'Late night vibes' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   if (!all.length) {
     view().innerHTML = `<div class="page home">
-      <section class="home-hero empty-hero"><div class="hh-bg"></div><div class="hh-txt"><div class="kicker">BAZINGA!</div><h1>${greet}, ${esc(profile.username)}</h1>
+      <section class="home-hero empty-hero"><div class="hh-bg"></div><div class="hh-txt"><div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div><h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
         <p>Bring in your Spotify, Apple Music or YouTube favourites and play them as music videos or audio.</p>
         <div class="row-btns"><a class="btn primary" href="#/import">${icon('import')}Import music</a><a class="btn" href="#/search">${icon('search')}Search</a><button class="btn" data-act="voice">${icon('mic')}Ask BAZINGA!</button></div>
-        <p class="tiny muted hh-note">You can import any time from Settings → Import music.</p></div></section></div>`;
+        <p class="tiny muted hh-note">You can import any time from Settings → Import music.${sync.available() && !sync.linked() ? ' Already using BAZINGA! somewhere else? <button class="lnk" data-act="enter-code">Link this device</button>.' : ''}</p></div></section></div>`;
+    startClock();
     return;
   }
   const liked = all.filter(t => t.liked);
@@ -4329,8 +4450,8 @@ async function vHome(_, my) {
     <section class="home-hero">
       <div class="hh-bg" ${heroArt ? `style="background-image:url('${esc(sized(heroArt, 300))}')"` : ''}></div>
       <div class="hh-txt">
-        <div class="kicker">${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</div>
-        <h1>${greet}, ${esc(profile.username)}</h1>
+        <div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div>
+        <h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
         <p>${all.length} songs · ${lib.playlists.size} playlists · ${store.artists().length} artists</p>
         <div class="row-btns">
           ${liked.length ? `<button class="btn primary" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
@@ -4358,6 +4479,7 @@ async function vHome(_, my) {
   lists.set('home-liked', liked.sort((a, b) => (b.likedAt || 0) - (a.likedAt || 0)).map(t => t.id));
   lists.set('home-all', all.map(t => t.id));
   fillArtistPics();
+  startClock();
   newReleases(my);
 }
 
@@ -4624,6 +4746,7 @@ async function vArtist([name], my) {
     ${mine.length ? `<h2>In your library</h2>${tracksSection('artist-mine', mine, { defaultSort: 'newest' })}`
       : `<div class="panel artist-empty">${icon('heart')}<div><b>No songs by ${esc(name)} in your library yet</b><p class="muted tiny">Tap the ♡ on any song below to add it, or <a class="lnk" href="#/search" data-artist-search="${esc(name)}">search for more</a>.</p></div></div>`}
     <div id="artist-top">${loader(mine.length ? 'Loading popular songs…' : `Finding the top songs by ${name}…`, 'sm')}</div>
+    <div id="artist-topalb"></div>
     <div id="artist-albums"></div></div>`;
   // The big photo is fetched right now (ahead of anything else), not when it scrolls into view
   const heroPic = view().querySelector('.page [data-apic][data-cls="hero round"]');
@@ -4650,6 +4773,17 @@ async function vArtist([name], my) {
     if (!i) return;
     const albums = await meta.withTimeout(meta.artistAlbums(i).catch(() => []), 12000, []);
     if (stale(my) || !$alb() || !albums.length) return;
+    // Top 10 albums (card grid under the top songs): albums holding the artist's most popular songs
+    // come first, then full albums in Apple's popularity order. Singles are left to the discography.
+    const top = await Promise.race([topP, sleep(6000).then(() => [])]);
+    if (stale(my) || !$('#artist-topalb')) return;
+    const base = x => norm(String(x || '').replace(/\s*[\(\[].*?[\)\]]/g, '').replace(/\s*-\s*(single|ep)$/i, ''));
+    const hit = new Map();
+    top.slice(0, 10).forEach((t, r) => { for (const k of [t.itunesAlbumId && 'id:' + t.itunesAlbumId, t.album && 't:' + base(t.album)]) if (k && !hit.has(k)) hit.set(k, r); });
+    const songRank = a => Math.min(hit.get('id:' + a.itunesAlbumId) ?? 99, hit.get('t:' + base(a.title)) ?? 99);
+    const full = albums.filter(a => (a.trackCount || 0) >= 5 || songRank(a) < 99);
+    const topAlb = [...full].sort((a, b) => (songRank(a) - songRank(b)) || ((a.rank ?? 0) - (b.rank ?? 0))).slice(0, 10);
+    if (topAlb.length >= 2) $('#artist-topalb').innerHTML = `<div class="sec-h"><h2>Top 10 albums</h2></div><div class="cards top-albums">${topAlb.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: [al.year, `${al.trackCount} songs`].filter(Boolean).join(' · ') })).join('')}</div>`;
     $alb().innerHTML = `<h2>Discography</h2>${pagedGrid('artist-alb', albums.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: `${al.year || ''} · ${al.trackCount} songs` })))}`;
   });
   await Promise.race([topP, sleep(50)]);
@@ -5048,26 +5182,28 @@ async function vSettings([section] = []) {
   const ytPanel = await ytBackupPanel();
   view().innerHTML = `<div class="page settings-page"><h1 class="page-h">Settings</h1>
     <nav class="set-jump" aria-label="Settings sections">
-      <a href="#account" data-jump="account">${icon('user')}Account</a><a href="#import" data-jump="import">${icon('import')}Import music</a><a href="#yt-backup" data-jump="yt-backup">${icon('yt')}YouTube backup</a>
+      <a href="#account" data-jump="account">${icon('user')}You</a><a href="#sync" data-jump="sync">${icon('link')}Sync</a><a href="#import" data-jump="import">${icon('import')}Import music</a><a href="#yt-backup" data-jump="yt-backup">${icon('yt')}YouTube backup</a>
       <a href="#playback" data-jump="playback">${icon('play')}Playback</a><a href="#voice-set" data-jump="voice-set">${icon('mic')}Voice</a><a href="#backup" data-jump="backup">${icon('restore')}Backup</a></nav>
     <section class="acct-hero" id="account">
       <div class="ah-bg" ${profile.picture ? `style="background-image:url('${esc(profile.picture)}')"` : ''}></div>
       <label class="ah-pic" title="Change photo"><input type="file" accept="image/*" id="pf-file" hidden>
         <span class="avatar xl ah-av">${profile.picture ? `<img src="${esc(profile.picture)}" alt="" referrerpolicy="no-referrer">` : icon('user')}</span><span class="ah-cam">${icon('edit')}</span></label>
       <div class="ah-txt">
-        <div class="kicker">${cloud.signedIn() ? `${icon('cloud')} Synced account` : 'Your account'}</div>
+        <div class="kicker">${sync.linked() ? `${icon('cloud')} Synced across your devices` : 'On this device · no login needed'}</div>
         <h2 class="pf-name">${esc(profile.username)}</h2>
         <div class="ah-stats">${(() => { const all = store.saved(); return [[all.length, 'songs'], [all.filter(t => t.liked).length, 'liked'], [lib.playlists.size, 'playlists'], [store.artists().length, 'artists']].map(([n, l]) => `<span><b>${n}</b>${l}</span>`).join(''); })()}</div>
-        <div class="row-btns"><button class="btn" data-act="rename-user">${icon('edit')}Change username</button>${profile.picture ? `<button class="btn ghost" data-act="remove-pic">Remove photo</button>` : ''}</div>
+        <div class="row-btns"><button class="btn" data-act="rename-user">${icon('edit')}Change name</button>${profile.picture ? `<button class="btn ghost" data-act="remove-pic">Remove photo</button>` : ''}</div>
       </div>
     </section>
-    ${cloud.configured() ? `<div class="panel acct-panel"><h2>${icon('cloud')} Account & sync</h2>
-      ${cloud.signedIn() ? `<p class="muted">Signed in as <b>${esc(cloud.user().email || profile.username)}</b> with ${PROVIDER_NAME[providerOf(cloud.user())] || providerOf(cloud.user())}. Your library, likes, playlists and albums sync automatically across every device you sign in on.</p>
+    <div class="panel acct-panel" id="sync"><h2>${icon('link')} Sync your devices</h2>
+      ${!sync.available() ? `<p class="muted">Device sync works on the online (GitHub Pages) version of BAZINGA!. Here, use <b>Download backup now</b> below and <b>Restore from file</b> on the other device.</p>`
+      : sync.linked() ? `<p class="muted">This device is synced. Your library, likes, playlists, albums and name stay the same on every phone, computer and browser you link — no login. To add another, tap <b>Link a device</b> and scan the QR code (another browser on this phone counts as a device too).</p>
         <div id="sync-line">${syncLine()}</div>
-        <div class="row-btns"><button class="btn" data-act="sync-now">${icon('restore')}Sync now</button>${providerOf(cloud.user()) === 'email' ? `<button class="btn ghost" data-act="change-pw">${icon('shield')}Change password</button>` : ''}<button class="btn ghost" data-act="sign-out">Sign out</button></div>`
-      : `<p class="muted">Create a free account to keep your music in sync on your phone, laptop and any other device — and never lose it. Your music on this device will be added to your account.</p>
-        <div class="sso-col">${ssoButtons()}</div>`}
-    </div>` : ''}
+        <div class="row-btns"><button class="btn primary" data-act="link-device">${icon('qr')}Link a device</button><button class="btn" data-act="sync-now">${icon('restore')}Sync now</button><button class="btn ghost" data-act="enter-code">I have a code</button></div>
+        <details class="howto"><summary>Stop syncing</summary><div class="row-btns"><button class="btn ghost" data-act="sync-leave">Stop syncing this device</button><button class="btn ghost danger-t" data-act="sync-forget">Turn off sync everywhere</button></div><p class="tiny muted">Synced copies pass through the free ntfy.sh relay, encrypted on your device first. Keep BAZINGA! open on a device now and then (at least every few hours when you've made changes) so your other devices can pick them up.</p><div></div></details>`
+      : `<p class="muted">Use your music on your phone, computer and every browser — no account, no password. Scan a QR code or open a link on the other device and everything stays in sync automatically. Your library is encrypted on your device before it's sent.</p>
+        <div class="row-btns"><button class="btn primary" data-act="link-device">${icon('qr')}Link a device</button><button class="btn" data-act="enter-code">${icon('link')}I have a code or link</button></div>`}
+    </div>
     <div class="panel support-panel only-m">${supportPanelInner()}</div>
     ${imports}
     ${ytPanel}
@@ -5078,6 +5214,7 @@ async function vSettings([section] = []) {
       <p class="tiny muted">Autoplay keeps the music going: after the last song it starts your Liked Songs (shuffled), or plays the same queue again from the top. If the queue already was your Liked Songs, it replays them.</p>
       <label class="toggle"><input type="checkbox" id="set-prefoff" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label>
       <label class="toggle"><input type="checkbox" id="set-awake" ${settings.keepAwake !== false ? 'checked' : ''}><span></span><div>Keep the screen on while BAZINGA! is open<small class="tiny muted" style="display:block">Phones stop web music when they lock — this keeps your songs playing.</small></div></label>
+      <label class="toggle"><input type="checkbox" id="set-lock" ${settings.lockFeature !== false ? 'checked' : ''}><span></span><div>Screen lock<small class="tiny muted" style="display:block">Shows a lock button (top bar on phones, sidebar on computers), and tapping an empty spot 3 times quickly locks the app so pocket touches and accidental taps do nothing. Tap 3 times again to unlock — the music keeps playing.</small></div></label>
       <button class="btn" data-act="a2hs">${icon('plus')}Add BAZINGA! to your Home Screen</button>
       <p class="tiny muted">Lock screen & background: for now, keep BAZINGA! open to keep the music going — phones pause web players when they lock or you switch apps. Songs with an offline file keep playing. Lock-screen listening is Phase 2: <a class="lnk" href="#/support" data-act="phase2">help us unlock it ☕</a></p>
     </div>
@@ -5089,7 +5226,7 @@ async function vSettings([section] = []) {
           <option value="">Automatic — most natural voice (${esc(vs[0].name)})</option>
           ${vs.map(v => `<option value="${esc(v.name)}" ${settings.voiceName === v.name ? 'selected' : ''}>${esc(v.name)} · ${v.quality}</option>`).join('')}
           </select><button class="btn" id="voice-try" type="button">${icon('play')}Try it</button></div></div>
-          <p class="tiny muted">Browsers can't use Siri's voice itself, but these come close: on iPhone/iPad/Mac download a <b>Premium</b> or <b>Enhanced</b> voice (Settings → Accessibility → Spoken Content → Voices → English, e.g. "Ava (Premium)"); on Windows use Edge for the "Natural" voices; Chrome has Google voices. BAZINGA! picks the best one automatically.</p>`;
+          `;
       })()}
       ${wakeSupported ? `<label class="toggle"><input type="checkbox" id="set-wake" ${settings.wake ? 'checked' : ''}><span></span><div>Hands-free: say <b>"Hey Bazinga"</b> to start the assistant</div></label>
       <p class="tiny muted">While BAZINGA! is open on screen, your browser listens for "Hey Bazinga" or "Bazinga" — then just say what you want ("Hey Bazinga, play my liked songs"). Your browser's speech service does the listening; BAZINGA! doesn't record anything. Phones may play a short chime when listening restarts, and iPhones can make music sound thinner while the mic is on — turn it off any time.</p>`
@@ -5130,10 +5267,9 @@ async function vSettings([section] = []) {
       <p class="tiny muted" id="enrich-status"></p>
     </div>
 
-    <div class="panel danger-zone"><h2>${icon('trash')} Delete account</h2>
-      ${cloud.signedIn() ? '<p class="muted"><b>You\'re signed in:</b> this also permanently deletes your BAZINGA! account and your synced music from the cloud, on every device.</p>' : ''}
-      <p class="muted">Erases your profile, library, playlists, albums, offline files and on-device backups from this device. A backup file you saved elsewhere is not touched.</p>
-      <button class="btn danger" data-act="delete-account">Delete my account</button></div>
+    <div class="panel danger-zone"><h2>${icon('trash')} Erase this device</h2>
+      <p class="muted">Erases your name, library, playlists, albums, offline files and on-device backups from this browser. ${sync.linked() ? 'Your other synced devices keep their music. ' : ''}A backup file you saved elsewhere is not touched.</p>
+      <button class="btn danger" data-act="delete-account">Erase everything here</button></div>
     <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a></p>
   </div>`;
   $('#pf-file').onchange = async e => { const f = e.target.files[0]; if (!f) return; profile.picture = await imageToDataURL(f, 256); await profileChanged(); rerender(); };
@@ -5141,6 +5277,7 @@ async function vSettings([section] = []) {
   wireImport();
   $$('#set-autoplay input').forEach(i => i.onchange = () => saveSettings({ autoplay: i.value }));
   $('#set-prefoff').onchange = e => player.setPreferOffline(e.target.checked);
+  $('#set-lock').onchange = e => { saveSettings({ lockFeature: e.target.checked }); applyLockSetting(); toast(e.target.checked ? 'Screen lock is on — tap 3 times or use the lock button' : 'Screen lock is off', e.target.checked ? 'ok' : 'info'); };
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
   $('#voice-try')?.addEventListener('click', () => previewVoice($('#set-voice').value));
@@ -5471,15 +5608,10 @@ async function ytImportLink(link) {
 }
 
 // ---------- Support (Buy Me a Coffee) ----------
-const supportPanelInner = () => `<h2>${icon('coffee')} Support BAZINGA!</h2><p class="muted tiny">Free, no ads, made by one person. Tips keep it going — and land you on the <a class="lnk" href="#/support">Top tippers board</a>.</p>${coffeeButton()}`;
+const supportPanelInner = () => `<h2>${icon('coffee')} Support BAZINGA!</h2><p class="muted tiny">Free, no ads, made by one person. Tips keep it going.</p>${coffeeButton()}`;
 const coffeeButton = (label = 'Buy me a coffee', cls = '') => `<a class="coffee-btn ${cls}" href="${BMC_URL}" target="_blank" rel="noopener">
   <span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>${label}</b><small>buymeacoffee.com/bazinga.app</small></span><span class="cb-shine"></span></a>`;
 async function vSupport() {
-  if (!lbCache) lbCache = await kv.get('lbCache');
-  clearInterval(lbTimer);
-  lbTimer = setInterval(() => { if (location.hash.startsWith('#/support') && !document.hidden) loadLeaderboard(); else clearInterval(lbTimer); }, 60000);
-  setTimeout(loadLeaderboard, 50);
-  setTimeout(async () => { const old = p2Data?.raised || 0; await loadP2(); if ((p2Data?.raised || 0) !== old) refreshP2Everywhere(); else { const sec = $('.p2-sec'); if (sec) animateP2(sec, 0); } }, 60);
   view().innerHTML = `<div class="page support">
     <section class="sup-hero">
       <div class="sup-bg"></div>
@@ -5497,11 +5629,6 @@ async function vSupport() {
       <button class="btn primary" data-act="phase2">${icon('coffee')}Support Phase 2</button></div>
       ${p2GoalHTML()}
     </section>
-    <section class="lb" id="leaderboard" aria-label="Top tippers">
-      <div class="lb-head"><div><div class="kicker">Hall of fame</div><h2>Top 5 tippers</h2></div>${cloud.configured() ? '<span class="lb-live"><i></i>Live</span>' : ''}</div>
-      <div class="lb-body">${leaderboardHTML(lbCache)}</div>
-      <p class="tiny muted lb-note">Ranked by total tips. Names appear as entered on Buy Me a Coffee — choose to stay anonymous there and you'll show as "Anonymous".</p>
-    </section>
     <div class="sup-grid">
       <div class="panel"><h2>${icon('heart')} What your tip does</h2><p class="muted">Keeps the app free for everyone, pays for testing devices and time spent on new features like the voice assistant and YouTube sync.</p></div>
       <div class="panel"><h2>${icon('share')} Free ways to help</h2><p class="muted">Share a playlist with a friend, follow along, and tell people about BAZINGA!</p>
@@ -5509,82 +5636,21 @@ async function vSupport() {
     </div>
   </div>`;
 }
-// ---------- Live top-5 tippers leaderboard (Supabase, fed by the Buy Me a Coffee webhook) ----------
-let lbCache = null, lbTimer = null;
-const money = (n, cur = 'USD') => { try { return new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, maximumFractionDigits: n % 1 ? 2 : 0 }).format(n); } catch { return '$' + n; } };
-function leaderboardHTML(list) {
-  const rows = (list || []).slice(0, 5);
-  const medal = ['gold', 'silver', 'bronze'];
-  const slot = (t, i) => t ? `<li class="lb-row r${i + 1} ${medal[i] || ''}" style="--d:${i * 70}ms">
-      <span class="lb-rank">${i === 0 ? '<span class="lb-crown">👑</span>' : ''}${i + 1}</span>
-      <span class="lb-av" style="--c:${genreColorSafe(t.name)}">${esc((t.name || 'A')[0].toUpperCase())}</span>
-      <span class="lb-name"><b>${esc(t.name || 'Anonymous')}</b><small>${t.coffees ? `${t.coffees} coffee${t.coffees > 1 ? 's' : ''} ☕` : 'Supporter ⚡'}</small></span>
-      <span class="lb-amt">${money(+t.total, t.currency || 'USD')}</span></li>`
-    : `<li class="lb-row open" style="--d:${i * 70}ms"><span class="lb-rank">${i + 1}</span><span class="lb-av">?</span><span class="lb-name"><b>Your name here</b><small>${i === 0 ? 'Claim the crown 👑' : 'Open spot'}</small></span><a class="lb-claim" href="${BMC_URL}" target="_blank" rel="noopener">Tip</a></li>`;
-  return `<ol class="lb-list">${Array.from({ length: 5 }, (_, i) => slot(rows[i], i)).join('')}</ol>
-    ${!rows.length ? `<p class="lb-empty">The board is wide open — be the first legend on it. ⚡</p>` : ''}`;
-}
-const genreColorSafe = n => { let h = 7; for (const c of String(n)) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 45%)`; };
-async function loadLeaderboard() {
-  if (!cloud.configured()) return;
-  try {
-    const list = await cloud.publicRpc('top_tippers');
-    if (!Array.isArray(list)) return;
-    const changed = JSON.stringify(list) !== JSON.stringify(lbCache);
-    lbCache = list; kv.set('lbCache', list);
-    const el = $('#leaderboard .lb-body'); if (el && changed) el.innerHTML = leaderboardHTML(list);
-  } catch (e) { console.warn('leaderboard', e.message); }
-}
-
 // ---------- Phase 2 goal: lock-screen listening ----------
-// Live total of all tips (Supabase, fed by the Buy Me a Coffee webhook) toward the license that lets
-// BAZINGA! keep playing on the lock screen.
-const P2_GOAL = 1500000;
-let p2Data = null;
-async function loadP2() {
-  if (!p2Data) p2Data = (await kv.get('p2Cache')) || { raised: 0, supporters: 0 };
-  if (!cloud.configured()) return p2Data;
-  try {
-    const r = await cloud.publicRpc('phase2_progress');
-    const row = Array.isArray(r) ? r[0] : r;
-    if (row) { p2Data = { raised: +row.raised || 0, supporters: +row.supporters || 0 }; kv.set('p2Cache', p2Data); }
-  } catch (e) { console.warn('phase2', e.message); }
-  return p2Data;
-}
-const usd0 = n => '$' + Math.round(n).toLocaleString('en-US');
-const p2Pct = d => Math.min(100, (d.raised / P2_GOAL) * 100);
-const p2PctTxt = d => { const v = p2Pct(d); return (v && v < 0.01 ? '<0.01' : v < 10 ? v.toFixed(2) : v.toFixed(1)) + '%'; };
-const p2GoalHTML = (d = p2Data || { raised: 0, supporters: 0 }) => `<div class="p2-goal">
-    <div class="p2-amt"><b data-p2-count="${d.raised}">${usd0(d.raised)}</b><span>raised of ${usd0(P2_GOAL)} goal</span></div>
-    <div class="p2-bar" role="progressbar" aria-valuemin="0" aria-valuemax="${P2_GOAL}" aria-valuenow="${Math.round(d.raised)}"><i style="--p:${Math.max(p2Pct(d), 0.6).toFixed(3)}%"></i></div>
-    <div class="p2-meta"><span>${icon('heart')}<b data-p2-sup>${(d.supporters || 0).toLocaleString('en-US')}</b> supporter${d.supporters === 1 ? '' : 's'}</span><span data-p2-pct>${p2PctTxt(d)}</span>${cloud.configured() ? '<span class="lb-live"><i></i>Live</span>' : ''}</div>
-  </div>`;
-// Count the amount up and grow the bar (feels alive; respects reduced motion)
-function animateP2(root, from = 0) {
-  const b = root.querySelector('[data-p2-count]'); if (!b) return;
-  const to = +b.dataset.p2Count || 0;
-  const bar = root.querySelector('.p2-bar i');
-  if (matchMedia('(prefers-reduced-motion: reduce)').matches || to === from) { b.textContent = usd0(to); return; }
-  if (bar) { const w = bar.style.getPropertyValue('--p'); bar.style.setProperty('--p', '0.6%'); requestAnimationFrame(() => requestAnimationFrame(() => bar.style.setProperty('--p', w))); }
-  const t0 = performance.now(), dur = 1400;
-  const step = now => { const k = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - k, 3); b.textContent = usd0(from + (to - from) * e); if (k < 1 && b.isConnected) requestAnimationFrame(step); };
-  requestAnimationFrame(step);
-}
-function refreshP2Everywhere() {
-  for (const g of $$('.p2-goal')) { const old = +g.querySelector('[data-p2-count]')?.dataset.p2Count || 0; const tmp = document.createElement('div'); tmp.innerHTML = p2GoalHTML(); const n = tmp.firstElementChild; g.replaceWith(n); animateP2(n.parentNode, old); }
-}
+// Phase 2 is explained in the Support page and the coffee popup (no live totals — that would need a database).
+const p2GoalHTML = () => '';
+const animateP2 = () => { };
 
 async function phase2Popup() {
   const st = (await kv.get('phase2')) || {};
   st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
-  await loadP2();
   const ask = () => `
       <div class="kicker">Phase 2 ⚡ Lock-screen listening</div>
       <h3>Help unlock music on your lock screen</h3>
       <p>Right now your phone pauses BAZINGA! when the screen locks or you leave the app. To let everyone enjoy music and streams on the lock screen, BAZINGA! needs a music license — and that's what Phase 2 is for.</p>
       ${p2GoalHTML()}
       <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Support Phase 2</b><small>Every coffee counts ☕</small></span><span class="cb-shine"></span></a>
-      <button class="btn ghost p2-later" data-p2="later">Not now</button>`;
+      <div class="p2-btns"><button class="btn ghost p2-later" data-p2="later">Not now</button><button class="btn ghost p2-never" data-p2="never">Don't show this again</button></div>`;
   const later = () => `
       <div class="p2-icon">${icon('play')}</div>
       <h3>No worries — enjoy the music 💛</h3>
@@ -5609,10 +5675,8 @@ async function phase2Popup() {
   const show = (k, html) => {
     state = k; body.dataset.step = k; body.innerHTML = html;
     body.classList.remove('in'); void body.offsetWidth; body.classList.add('in');
-    if (body.querySelector('.p2-goal')) animateP2(body, k === 'thanks' ? Math.max(0, (p2Data?.raised || 0) * 0.97) : 0);
   };
   const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
-    locked: true, // no accidental close: you choose "Support" or "Not now"
     onMount: m => {
       m.classList.add('p2-modal');
       body = m.querySelector('.p2-body'); show('ask', ask());
@@ -5627,6 +5691,7 @@ async function phase2Popup() {
         }
         const b = e.target.closest('[data-p2]'); if (!b) return;
         if (b.dataset.p2 === 'later') show('later', later());
+        if (b.dataset.p2 === 'never') { st.never = true; kv.set('phase2', st); toast('Got it — you won\'t see this again. The ☕ button is always in the top bar.'); m.closest('.modal-wrap')?.querySelector('[data-close]')?.click(); }
         if (b.dataset.p2 === 'thanks') thank();
         if (b.dataset.p2 === 'back') show('later', later());
       });
@@ -5636,27 +5701,10 @@ async function phase2Popup() {
     if (state === 'thanks') return;
     st.supportedAt = Date.now(); kv.set('phase2', st);
     show('thanks', thanks());
-    // the tip reaches our server a few seconds later — update the total when it lands
-    for (const ms of [2500, 9000]) setTimeout(async () => { await loadP2(); refreshP2Everywhere(); }, ms);
   }
   if (onBack) { document.removeEventListener('visibilitychange', onBack); window.removeEventListener('focus', onBack); }
   if (state === 'later') { st.declinedAt = Date.now(); kv.set('phase2', st); }
 }
-// Shown once a day, a few seconds after your first song starts (weekly if you've supported recently)
-let p2Armed = false;
-async function maybePhase2() {
-  if (p2Armed) return; p2Armed = true;
-  const st = (await kv.get('phase2')) || {};
-  const today = new Date().toISOString().slice(0, 10);
-  if (st.lastShown === today) return;
-  if (st.supportedAt && Date.now() - st.supportedAt < 7 * 864e5) return;
-  setTimeout(() => {
-    if (document.hidden || document.querySelector('.modal-wrap') || $('#voice:not([hidden])') || !player.current()) { p2Armed = false; return; }
-    phase2Popup();
-  }, 6000);
-}
-on('player', () => { if (P.playing && !p2Armed && profile) maybePhase2(); });
-
 // ================= SHARING =================
 async function shareTracks(kind, name, tracks, artwork) {
   const t = [];
@@ -5985,12 +6033,14 @@ function wireGlobal() {
         if (k === 'save') ytExport(lists.get(a.dataset.list) || [], a.dataset.name, a.dataset.job);
         break;
       }
-      case 'rename-user': { const n = await promptText('Change username', profile.username, 'Username'); if (n) { profile.username = n; await profileChanged(); rerender(); } break; }
+      case 'rename-user': { const n = await promptText('Change your name', profile.username, 'Name'); if (n) { profile.username = n; await profileChanged(); rerender(); } break; }
       case 'remove-pic': profile.picture = ''; await profileChanged(); rerender(); break;
-      case 'sso': e.preventDefault(); if (a.dataset.p === 'email') openAuth(cloud.signedIn() ? 'login' : 'signup'); else startProvider(a.dataset.p); break;
+      case 'lock': setLocked(true); break;
+      case 'link-device': linkDeviceDialog(); break;
+      case 'enter-code': { const req = await enterCodeDialog(); if (req) joinFlow(req); break; }
+      case 'sync-leave': syncMenu('leave'); break;
+      case 'sync-forget': syncMenu('forget'); break;
       case 'sync-now': sync.syncNow().then(() => { const S = sync.state(); toast(S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.status === 'synced' ? 'ok' : 'err'); }); break;
-      case 'change-pw': setNewPassword(); break;
-      case 'sign-out': signOutFlow(); break;
       case 'bk-link': try { await backup.linkFile(); rerender(); } catch (err) { if (err.name !== 'AbortError') toast(err.message, 'err'); } break;
       case 'bk-regrant': await backup.regrant(); rerender(); renderBackupNag(); break;
       case 'bk-unlink': await backup.unlinkFile(); rerender(); break;
@@ -6079,23 +6129,20 @@ function softRefresh() {
 }
 
 async function deleteAccount() {
-  const ok = await modal(`<h3>Delete your account?</h3>
-    <p class="muted">This permanently erases <b>${esc(profile.username)}</b> and everything BAZINGA! saved on this device: library, playlists, albums, offline files and on-device backups${cloud.signedIn() ? ', <b>plus your online account and synced music on every device</b>' : ''}. This can't be undone.</p>
-    <form><label class="fld"><span>Type your username to confirm</span><input name="u" required autocomplete="off"></label>
-    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn danger">Delete everything</button></div></form>`);
+  const ok = await modal(`<h3>Erase this device?</h3>
+    <p class="muted">This permanently erases everything BAZINGA! saved in this browser: library, playlists, albums, offline files and on-device backups.${sync.linked() ? ' Your other synced devices keep their music.' : ''} This can't be undone.</p>
+    <form><label class="fld"><span>Type ERASE to confirm</span><input name="u" required autocomplete="off" autocapitalize="characters"></label>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn danger">Erase everything</button></div></form>`);
   if (!ok) return;
-  if (ok.u.trim() !== profile.username) return toast('Username didn\'t match — nothing was deleted', 'err');
-  if (cloud.signedIn()) {
-    try { await sync.deleteCloudData(); await cloud.signOut(); }
-    catch (e) { return toast('Couldn\'t delete your cloud account: ' + e.message + ' — nothing was deleted. Try again when online.', 'err'); }
-  }
+  if (ok.u.trim().toUpperCase() !== 'ERASE') return toast('Nothing was erased — type ERASE to confirm', 'err');
+  await sync.leave();
   await wipeDevice();
 }
 
 // ================= SIDEBAR / PROFILE =================
 function renderProfileChip() {
   const S = sync.state();
-  const dot = cloud.signedIn() ? `<i class="sync-dot ${S.status}" title="${S.status === 'synced' ? 'Synced' : S.status === 'syncing' ? 'Syncing…' : S.status === 'error' ? 'Sync problem' : 'Signed in'}"></i>` : '';
+  const dot = sync.linked() ? `<i class="sync-dot ${S.status}" title="${S.status === 'synced' ? 'Synced' : S.status === 'syncing' ? 'Syncing…' : S.status === 'error' ? 'Sync problem' : 'Synced device'}"></i>` : '';
   const html = `<div class="avatar">${profile.picture ? `<img src="${esc(profile.picture)}" alt="" referrerpolicy="no-referrer">` : esc(profile.username[0].toUpperCase())}${dot}</div><span>${esc(profile.username)}</span>`;
   $$('.profile-chip').forEach(el => el.innerHTML = html);
 }
@@ -6143,10 +6190,7 @@ function wirePlayerUI() {
   const head = $('#np-head');
   bar.addEventListener('click', handle); np.addEventListener('click', handle); head.addEventListener('click', handle);
   $('#yt-dock').addEventListener('click', handle);
-  for (const r of $$('.seek')) {
-    r.addEventListener('input', () => { seeking = true; $$('.t-now').forEach(x => x.textContent = fmtTime(r.value * P.duration / 1000)); });
-    r.addEventListener('change', () => { player.seek(r.value * P.duration / 1000); seeking = false; });
-  }
+  for (const r of $$('.seek')) wireSeek(r);
   $$('.vol').forEach(v => v.addEventListener('input', () => player.setVolume(+v.value)));
   // Swipe down to close now-playing on phones
   let y0 = null;
@@ -6176,7 +6220,30 @@ function wirePlayerUI() {
   document.addEventListener('touchstart', warmArtist, { passive: true });
   document.addEventListener('click', e => { const b = e.target.closest('[data-p-ext]'); if (!b) return; if (b.dataset.pExt === 'toggle') player.toggle(); if (b.dataset.pExt === 'open') openNP(); });
 }
-let seeking = false;
+// The yellow progress bar pauses its updates only while a finger/mouse is actually dragging it.
+// Before, a drag that never "finished" (the page scrolled instead, the bar was redrawn when the next
+// song started, or the browser cancelled the touch) left it frozen while the music kept playing.
+let seeking = null; // the slider being dragged, or null
+let seekIdle = null;
+function endSeek(r, commit) {
+  if (seeking !== r) return;
+  clearTimeout(seekIdle);
+  seeking = null;
+  if (commit && P.duration) player.seek(r.value * P.duration / 1000);
+  renderTime();
+}
+function wireSeek(r) {
+  if (!r || r._wired) return; r._wired = true;
+  r.addEventListener('input', () => {
+    seeking = r;
+    const t = fmtTime(r.value * P.duration / 1000);
+    (r.closest('.pb-seek, .np-seek')?.querySelectorAll('.t-now') || []).forEach(x => x.textContent = t);
+    clearTimeout(seekIdle); seekIdle = setTimeout(() => endSeek(r, true), 1500); // safety net
+  });
+  r.addEventListener('change', () => endSeek(r, true));
+  ['pointercancel', 'touchcancel', 'blur'].forEach(ev => r.addEventListener(ev, () => endSeek(r, false)));
+  ['pointerup', 'touchend'].forEach(ev => r.addEventListener(ev, () => setTimeout(() => endSeek(r, true), 0)));
+}
 // Full-screen player. Opening it adds a history step, so the phone's Back button/gesture closes it
 // instead of leaving the page. Any navigation closes it properly (the video goes back to its corner).
 function openNP() {
@@ -6250,9 +6317,8 @@ function renderPlayer() {
       <button class="ib" data-p="mute" aria-label="Mute">${icon(P.volume > 0 ? 'volume' : 'mute')}</button>
       <input type="range" class="vol" min="0" max="1" step="0.01" value="${P.volume}" aria-label="Volume">
     </div>`;
-  bar.querySelector('.seek')?.addEventListener('input', e => { seeking = true; }, { once: false });
   const s = bar.querySelector('.seek');
-  if (s) { s.addEventListener('input', () => { seeking = true; bar.querySelector('.t-now').textContent = fmtTime(s.value * P.duration / 1000); }); s.addEventListener('change', () => { player.seek(s.value * P.duration / 1000); seeking = false; }); }
+  if (s) wireSeek(s);
   bar.querySelector('.vol')?.addEventListener('input', e => player.setVolume(+e.target.value));
   bar.querySelector('.vol')?.style.setProperty('--p', (P.volume * 100) + '%');
   renderTime();
@@ -6300,7 +6366,8 @@ function markNow() {
 }
 
 function renderTime() {
-  const pct = P.duration ? Math.min(1, P.time / P.duration) : 0;
+  if (seeking && !seeking.isConnected) { clearTimeout(seekIdle); seeking = null; } // the bar was redrawn mid-drag
+  const pct = P.duration ? Math.max(0, Math.min(1, (P.time || 0) / P.duration)) : 0;
   $$('.pb-progress i').forEach(i => i.style.width = (pct * 100) + '%');
   if (seeking) return;
   $$('.seek').forEach(s => { s.value = Math.round(pct * 1000); s.style.setProperty('--p', (pct * 100).toFixed(2) + '%'); });
@@ -6358,14 +6425,13 @@ function renderNP(full = false) {
     const lk = np.querySelector('.np-info .like'), liked = t.liked && !t.transient;
     if (lk && lk.classList.contains('on') !== !!liked) lk.outerHTML = npLike(t);
     const err = np.querySelector('.np-err'); err.textContent = P.error || ''; err.hidden = !P.error;
-    const tap = np.querySelector('.np-tap'); if (tap) tap.hidden = !(P.needsTap && showVid);
     if (qOn) renderQueue(np.querySelector('.np-q-body'));
     renderTime(); placeDock();
     return;
   }
   np.dataset.key = key;
   const keep = { sc: scrollY || 0, q: $('.np-q-body')?.scrollTop || 0 };
-  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib" data-p="more" aria-label="More">${icon('more')}</button>`;
+  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button>`;
   // Layout: the top bar and the video/cover stay put; everything below scrolls on its own.
   // On wide screens the queue is a panel on the right with its own scroll.
   np.innerHTML = `<div class="np-bg ${t.artwork ? '' : 'none'}" ${t.artwork ? `style="background-image:url('${esc(sized(t.artwork, 300))}')"` : ''}></div>
@@ -6373,7 +6439,6 @@ function renderNP(full = false) {
     <div class="np-main">
       <div class="np-scroll"><div class="np-inner">
         <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
-        <p class="np-tap" ${P.needsTap && showVid ? '' : 'hidden'}>${icon('play')}Tap the video once to start playing</p>
         <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
           ${npLike(t)}</div>
         <p class="err-text np-err" ${P.error ? '' : 'hidden'}>${esc(P.error || '')}</p>
@@ -6387,9 +6452,7 @@ function renderNP(full = false) {
     </div>
     ${qOn && !narrow ? npQueueHTML() : ''}
     </div>`;
-  const sk = np.querySelector('.seek');
-  sk.addEventListener('input', () => { seeking = true; np.querySelector('.t-now').textContent = fmtTime(sk.value * P.duration / 1000); });
-  sk.addEventListener('change', () => { player.seek(sk.value * P.duration / 1000); seeking = false; });
+  wireSeek(np.querySelector('.seek'));
   if (qOn) renderQueue(np.querySelector('.np-q-body'));
   if (document.body.classList.contains('np-lyr')) showLyrics(t);
   if (keep.sc) window.scrollTo(0, keep.sc);
@@ -6537,7 +6600,13 @@ function renderQueue(el, force = false) {
   };
 }
 
-boot().catch(e => { console.error(e); const f = document.getElementById('boot-fail'); if (f) { f.hidden = false; f.style.display = 'grid'; f.querySelector('code').textContent = e.message; } });
+boot().then(() => { const f = document.getElementById('boot-fail'); if (f) f.hidden = true; }).catch(e => {
+  console.error(e); // details stay in the console; people just see a friendly "sorry" with Try again / Help
+  const f = document.getElementById('boot-fail'); if (!f) return;
+  f.hidden = false;
+  const st = f.querySelector('.bf-status');
+  if (st) st.textContent = /storage|indexeddb|private|blocked|quota/i.test(e?.message || '') ? 'This browser is blocking the storage BAZINGA! needs — Private mode or a full device can cause this.' : '';
+});
 
 return { APP_VERSION };
 })();

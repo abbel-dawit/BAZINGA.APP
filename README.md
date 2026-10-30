@@ -17,11 +17,12 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v11`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v22`) so phones fetch the new version.
 
 ## Features
 
-- **Account**: just a username + profile picture, saved on the device. Delete it any time (Settings → Delete account) — wipes everything.
+- **No login**: open it and press *Let's go*. An optional name + picture live on the device (Settings). *Erase this device* wipes everything.
+- **Sync your devices (no account)**: Settings → Sync your devices → *Link a device* shows a QR code, a link and an 8-character short code. Scan / open / type it on another phone, computer or another browser on the same phone, and they stay in sync automatically.
 - **Import**: Apple Music (library `.xml` or playlist `.txt` exported from the Music app on Mac/Windows — playlists, Favorite songs, genres, years), Spotify Liked Songs & playlists (each user connects with their own free Spotify developer Client ID, so there is no shared rate limit), CSV files (e.g. from exportify.net — no Spotify key needed), pasted "Artist - Title" lists, and music files/folders on the device.
 - **YouTube**: finds an official **music video** and an **audio** version (Topic channel / official audio) for every song. Switch between Video and Audio any time in the player. "Open on YouTube" turns any playlist into YouTube playlist links (50 songs per link). Any match can be fixed by pasting a link.
 - **Player**: play/pause, next/prev, seek, shuffle, repeat (all/one), volume, lock-screen controls, Add to queue, Play next, drag-to-reorder queue.
@@ -34,6 +35,22 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
 
+### New in v1.5
+- **No more logins.** Google / Discord / email sign-in is gone. The welcome screen is one tap (accept the terms → *Let's go*), with *I use BAZINGA! on another device* for joining an existing library.
+- **Sync with a QR code, link or short code.** Settings → *Sync your devices* → *Link a device*. Scan the QR code with the other phone's camera, open the link in any browser (another browser on the same phone counts too), or type the short code (e.g. `K7M2-Q9XA`, works once for 15 minutes; short link `…/#/c/K7M2Q9XA`). After that, songs, likes, playlists, albums, YouTube matches and your name/photo sync automatically. The library is **encrypted on the device** before it leaves; the relay only carries unreadable bytes. *Stop syncing this device* / *Turn off sync everywhere* are under Settings. No setup: it uses the free ntfy.sh relay (see below).
+- **Screen lock**: lock button in the phone top bar, the sidebar and the full-screen player, or tap an empty spot 3 times quickly. Tap 3 times anywhere to unlock; music keeps playing. On/off in Settings → Playback.
+- **Home**: the device's time (its own time zone and 12/24-hour format) sits beside the date and updates every minute.
+- **Artist pages**: *Top 10 albums* card grid under the top 10 songs (albums holding the most popular songs first).
+- **Sort button**: label centred with the arrow right next to it.
+- **No more zooming**: pinch/double-tap zoom and the iPhone zoom-in when tapping a search box are off.
+- **Progress bar fix**: the yellow timeline could freeze while music kept playing (after a drag that got interrupted by scrolling, or when the next song started mid-drag). Fixed, plus the timer now always restarts when playback starts.
+- **"Couldn't start" fix**: the old 4-second check showed an error on slow connections even while the app was still downloading. Now the app retries the script, then repairs its cached files once by itself, and only then shows a friendly *Sorry* screen with *Try again* and *Help* (step-by-step fixes + *Repair app*). The service worker also falls back to the saved copy after 4 s on a slow network.
+- **Home Screen app**: the bottom menu sits right on the bottom edge (no gap), and the page snaps back if the phone leaves it scrolled after the keyboard closes.
+- **Popups**: "Add to Home Screen" on the first visit, then every 5th visit until installed or *Don't show this again*. Buy Me a Coffee every 10th visit until *Don't show this again*. Both close with the × or by tapping outside.
+- **Auto-update on launch** (see below). **Account card**: the four counters are smaller and on one line (2×2 on very narrow phones). **Logo glow** sized so it's never cut off.
+- **Removed**: the Top 5 tippers board and live Phase 2 totals (they needed a database).
+- Removed the "Tap the video once to start" notice and the Siri voice explanation text. Bigger bolt on the Home Screen app icon.
+
 ### New in v1.3
 - **Logo** in Bungee; yellow search buttons have a black magnifying glass; Settings' section bar starts with Account (same order as the page).
 - **More natural voice**: BAZINGA! ranks every voice your device has and uses the most human-sounding one (Apple Premium/Enhanced, Edge "Natural", Google voices), skips robotic/novelty voices and speaks sentence by sentence at a natural pace. Pick or preview a voice in Settings → Voice assistant. (Web apps can't use Siri's own voice; on iPhone/Mac download a Premium voice for the best result.)
@@ -45,7 +62,7 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Phones: songs play again.** The hidden video player is back to YouTube's minimum size (200×200), and if a browser (mostly iPhone Safari) still refuses to start YouTube without a tap on the video itself, the full-screen player opens with a "Tap the video once to start playing" hint — after that one tap everything plays normally for the rest of the visit.
 - **Full screen**: no more stuck/floating video (lyrics & queue no longer shift the frame, and leaving the page always puts the video back), the phone's Back button/gesture closes full screen, smoother scrolling (queue renders 100 songs at a time and only when it changes; decorative animations pause).
 - **Spotify import via Exportify (default)**: Settings → Import music → From Spotify → *Open Exportify* → *Export All* → come back and choose the file (BAZINGA! asks for it automatically when you return). Reads Exportify's `.zip` (all playlists + Liked Songs) or single `.csv` files. The developer-key connection is still there under "Advanced". Spotify doesn't allow its login page inside other apps, so Exportify opens in a small window / new tab.
-- **Top 5 tippers leaderboard** (Support page), live — see "Set up the tippers leaderboard" below.
+- **Top 5 tippers leaderboard** (removed in v1.5 — it needed a database).
 - **Voice assistant** understands your library: typo- and sound-alike-tolerant matching against your playlists, artists, albums and songs (checks every way the browser heard you), asks "Did you mean …?" when it isn't sure (Yes/No by voice or buttons; on No it offers the next best match, then asks again).
 - **Logo**: Quicksand Bold wordmark centred on the bolt; no version number; taller phone top bar so the glow isn't cut off.
 - **App icon & Add to Home Screen**: new black app icon with a glowing bolt (`icons/app-*.png`), and a one-time "Add to Home Screen" pop-up (real install button on Chrome/Edge/Samsung/Brave; step-by-step for iPhone/iPad and Firefox). Also in Settings → Playback.
@@ -73,49 +90,24 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **New from your artists** on Home: latest albums, EPs and singles from the artists you listen to most (refreshed every 12 hours).
 - **Lyrics** in the full-screen player via Genius's official lyrics widget. If Genius blocks the lookup from the browser, a one-tap "Open lyrics on Genius" button appears; adding a free Genius access token in Settings → Lyrics lets them load inside the app.
 - **Faster everything**: one YouTube search per song (two only when needed), several songs matched at once on different servers, fastest servers used first, upcoming songs looked up in advance, all lookups cached on the device, right-sized images, and a rate limiter that stays under Apple's limits so your IP never gets blocked.
-- **Optional accounts & cross-device sync**: Google, Discord or email + password (with email verification and password reset), powered by Supabase. Guests can keep using the app without an account and upgrade any time; their music is merged in.
+- **Optional accounts & cross-device sync** (replaced by no-login QR/link sync in v1.5): Google, Discord or email + password (with email verification and password reset), powered by Supabase (removed). Guests can keep using the app without an account and upgrade any time; their music is merged in.
 - **YouTube account sync**: save any playlist, album or your Liked Songs to your YouTube account (music videos or audio, private/unlisted/public, updates add only new songs), and import your YouTube playlists and Liked videos back in.
 - **Better covers**: Deezer and the song's YouTube thumbnail fill in any missing cover art; artists get real photos.
 
 
 
-## Set up accounts & sync (Supabase, one time, by the app owner)
+## Device sync — nothing to set up
 
-Accounts are optional — people can always use BAZINGA! without one. With accounts set up, the welcome screen and Settings offer **Continue with Google**, **Continue with Discord** and **Continue with email** (sign-up with email verification, log in, forgot password). Signed-in users' library, likes, playlists, albums, YouTube matches and profile sync automatically across all their devices.
+Sync works as soon as the site is on GitHub Pages. There's no database and nothing to sign up for: devices pass the library to each other through the free public relay **ntfy.sh**, encrypted on the device first (ntfy.sh only sees unreadable bytes under a random topic name).
 
-1. Create a free project at https://supabase.com (pick a region close to your users).
-2. **SQL Editor → New query** → paste everything in `supabase/setup.sql` → **Run**. This creates the profiles table, the private storage for synced libraries, the security rules (each user can only touch their own data) and the "delete my account" function.
-3. **Project Settings → API**: copy the **Project URL** and the **anon / publishable key** into `index.html`:
-   ```js
-   window.BAZINGA_CONFIG = {
-     googleClientId: '',
-     supabaseUrl: 'https://YOUR-PROJECT.supabase.co',
-     supabaseAnonKey: 'YOUR-ANON-KEY'
-   };
-   ```
-   (The anon key is meant to be public; the security rules from step 2 protect the data. Never put the *service_role* key in the app.)
-4. **Authentication → URL Configuration**: Site URL `https://<your-username>.github.io/bazinga/`, and add `https://<your-username>.github.io/bazinga/**` to **Redirect URLs**.
-5. **Email & password**: Authentication → Sign In / Providers → Email: enabled, **Confirm email ON**.
-   ⚠️ Supabase's built-in email sender only sends about **2 emails per hour** and only to your own team, so real users won't get verification emails until you connect a free email service: **Authentication → Emails → SMTP Settings** (e.g. Resend, Brevo or SendGrid). You can also edit the "Confirm signup" and "Reset password" email templates there.
-6. **Google sign-in**: in Google Cloud Console create an OAuth client ID (Web application) — the same project as YouTube sync is fine. Authorized JavaScript origin: `https://<your-username>.github.io`; Authorized redirect URI: `https://YOUR-PROJECT.supabase.co/auth/v1/callback`. Paste its Client ID + Client Secret into Supabase → Authentication → Providers → **Google**.
-7. **Discord sign-in**: https://discord.com/developers/applications → New Application → **OAuth2** → add redirect `https://YOUR-PROJECT.supabase.co/auth/v1/callback` → copy Client ID + Client Secret into Supabase → Authentication → Providers → **Discord**.
-8. Push to GitHub. Done.
+Good to know:
+- Copies on ntfy.sh expire after about **3 hours**. Every open device re-posts its library at least once an hour, and the full library always stays on each device. A device that's been closed longer catches up the next time it's open around the same time as another linked device.
+- ntfy.sh is a free community service with fair-use limits (15 MB per file, ~100 MB per visitor). A big library is well under that.
+- Want your own relay instead? Run an ntfy server and put its address in `index.html` → `syncRelay`.
 
-Notes: the free Supabase plan includes plenty of room for synced libraries (each one is a small compressed file) but may pause projects that go unused for a while — check Supabase's current plan limits. Passwords are handled entirely by Supabase. Users can delete their account (cloud data included) any time in Settings.
+## Updates reach users automatically
 
-## Set up the tippers leaderboard (one time, by the app owner)
-
-The Support page shows the top 5 tippers live. Buy Me a Coffee sends each tip to a tiny Supabase function, which adds it to a private table; the app only ever reads the public top-5 summary (names + totals, never emails).
-
-1. Accounts must be set up (Supabase, above) and you must have re-run `supabase/setup.sql` (section 6 creates the leaderboard tables).
-2. Install the Supabase CLI, then from this folder: `supabase functions deploy bmc-webhook --no-verify-jwt --project-ref YOUR-PROJECT`.
-3. Buy Me a Coffee → **Integrations → Webhooks** → add `https://YOUR-PROJECT.supabase.co/functions/v1/bmc-webhook`, tick the donation/support events, and copy the webhook **secret**.
-4. `supabase secrets set BMC_WEBHOOK_SECRET=that-secret --project-ref YOUR-PROJECT`. Use "Send test" in Buy Me a Coffee to check it.
-5. To remove someone from the public board: Supabase → Table editor → `tippers` → set `hidden` to true. Past tips aren't imported automatically; add them by hand in the `tippers` table if you like.
-
-**Phase 2 goal bar ($1,500,000 for lock-screen listening):** the same tips feed it. Re-run `supabase/setup.sql` once more (section 7 adds `phase2_progress`, which exposes only the total raised and the number of supporters). The popup appears once a day a few seconds after the first song starts (once a week for people who just supported), and from the ☕ button. To change the goal, edit `P2_GOAL` in `src/app.js` and run `python3 build.py`.
-
-Until this is set up, the board shows five open "Your name here" spots. Names are shown exactly as supporters entered them on Buy Me a Coffee ("Someone" shows as Anonymous). You may want to mention the public leaderboard in your Privacy Policy.
+After editing `src/`, run `python3 build.py` and upload **everything** (including the new `version.json`). Every time someone opens BAZINGA! (or comes back to it), the app compares its version with `version.json` on your site and reloads into the new one straight away. If music is playing, it waits for the next pause.
 
 ## Set up YouTube account sync (one time, by the app owner)
 
@@ -140,7 +132,7 @@ Until this is set up, the board shows five open "Your name here" spots. Names ar
 
 ## Support & socials
 
-- Tips: https://buymeacoffee.com/bazinga.app (Support tab, sidebar, footer, an occasional gentle pop-up at most once every 3 weeks, and Settings). The QR code is `icons/bmc-qr.png`.
+- Tips: https://buymeacoffee.com/bazinga.app (Support tab, sidebar, footer, a pop-up every 10th visit until dismissed for good, and Settings). The QR code is `icons/bmc-qr.png`.
 - Footer links: Instagram `@bazinga.app`, X/Twitter `@bazinga_app`.
 
 ## Honest limits
@@ -153,10 +145,10 @@ Until this is set up, the board shows five open "Your name here" spots. Names ar
 
 ## Privacy & Terms
 
-Users must accept the Privacy Policy & Terms of Use (in `src/legal.js`) when creating a profile; if you change the text, bump `TERMS_VERSION` and everyone is asked to accept again. The text is a template, not legal advice.
+Users accept the Privacy Policy & Terms of Use (in `src/legal.js`) on the welcome screen; if you change the text, bump `TERMS_VERSION` and everyone is asked to accept again. The text is a template, not legal advice.
 
 
-There is no backend. Profile, library, tokens and backups live in the browser's IndexedDB on the user's device. The app only talks directly to Spotify (if connected), YouTube / Invidious / Piped (to find and play videos) and Apple's iTunes Search API (for music info).
+Profile, library, tokens and backups live in the browser's IndexedDB on the user's device. There's no server of our own; optional device sync passes encrypted copies through ntfy.sh. The app only talks directly to Spotify (if connected), YouTube / Invidious / Piped (to find and play videos) and Apple's iTunes Search API (for music info).
 
 ---
 © 2026 Abbel Dawit

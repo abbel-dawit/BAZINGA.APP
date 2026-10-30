@@ -57,7 +57,11 @@ const I = {
   spotify: '<circle cx="12" cy="12" r="10"/><path d="M7 9.5c3.5-1 7-.7 10 1M7.5 12.8c3-.8 5.6-.5 8 .9M8 16c2.3-.5 4.3-.3 6 .7"/>',
   grip: '<circle cx="9" cy="7" r="1.2" fill="currentColor"/><circle cx="15" cy="7" r="1.2" fill="currentColor"/><circle cx="9" cy="12" r="1.2" fill="currentColor"/><circle cx="15" cy="12" r="1.2" fill="currentColor"/><circle cx="9" cy="17" r="1.2" fill="currentColor"/><circle cx="15" cy="17" r="1.2" fill="currentColor"/>',
   expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
-  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>'
+  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
+  lock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
+  unlock: '<rect x="4.5" y="10.5" width="15" height="10.5" rx="2.2"/><path d="M8 10.5V7.5a4 4 0 0 1 7.6-1.7"/><circle cx="12" cy="15.6" r="1.3" fill="currentColor"/>',
+  qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM18 14h3M14 18v3"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'
 };
 export const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n] || ''}</svg>`;
 
@@ -227,12 +231,14 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
       <div class="fsearch"><label class="searchbox sm">${icon('search')}<input data-f="q" placeholder="Filter songs" value="${esc(f.q || '')}" enterkeyhint="search" aria-label="Filter songs"></label>
         <button class="round-search" data-act="filter-go" aria-label="Search these songs" title="Search">${icon('search')}</button></div>
       <div class="fctl"><button class="chip ${f.open ? 'on' : ''}" data-act="toggle-filters">${icon('filter')}Filters${active ? ` <b>${active}</b>` : ''}</button>
-      ${showSort ? `<select data-f="sort" class="select" aria-label="Sort">
-        ${keepOrder ? `<option value="" ${!f.sort ? 'selected' : ''}>Custom order</option>` : ''}
-        ${likedSort ? `<option value="liked" ${f.sort === 'liked' ? 'selected' : ''}>Recently liked</option>` : ''}
-        ${[['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']]
-          .map(([v, l]) => `<option value="${v}" ${f.sort === v ? 'selected' : ''}>${l}</option>`).join('')}
-      </select>` : ''}</div>
+      ${showSort ? (() => {
+        const opts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
+          ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
+        const cur = opts.find(([v]) => v === (f.sort || '')) || opts.find(([v]) => v === 'added');
+        // The label + arrow are drawn centred together; the real <select> sits invisibly on top to open the list
+        return `<label class="sort-pick"><span class="sort-face"><span class="sort-lbl">${esc(cur[1])}</span>${icon('down')}</span>
+          <select data-f="sort" aria-label="Sort">${opts.map(([v, l]) => `<option value="${v}" ${cur[0] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>`;
+      })() : ''}</div>
     </div>
     ${f.open ? `<div class="filter-panel">
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">

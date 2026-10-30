@@ -82,7 +82,7 @@ function loadYT() {
           onStateChange: e => {
             if (P.source !== 'yt') return;
             if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
-            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); changed(); }
+            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
             else if (e.data === YT.PlayerState.PAUSED) {
               if (isRerouting()) return;
               // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
@@ -257,7 +257,7 @@ function ended() {
   next(true);
 }
 audio.addEventListener('ended', () => P.source === 'local' && ended());
-audio.addEventListener('play', () => { P.playing = true; changed(); });
+audio.addEventListener('play', () => { P.playing = true; if (!tick) startTick(); changed(); });
 audio.addEventListener('pause', () => { if (isRerouting()) return; P.playing = false; changed(); });
 audio.addEventListener('error', () => { if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
 

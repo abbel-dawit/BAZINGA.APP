@@ -1,9 +1,9 @@
 // BAZINGA service worker — makes the app open and run with no internet.
-const VERSION = 'bazinga-v21';
+const VERSION = 'bazinga-v23';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'favicon.ico',
   'js/bazinga.js',
-  'icons/icon-192.png', 'icons/icon-512.png', 'icons/app-192.png', 'icons/app-512.png', 'icons/bmc-qr.png', 'icons/favicon-32.png', 'icons/apple-touch-icon.png'
+  'icons/icon-192.png', 'icons/icon-512.png', 'icons/app-192.png', 'icons/app-512.png', 'icons/bmc-qr.png', 'icons/favicon-32.png', 'icons/apple-touch-icon.png', 'version.json'
 ];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
@@ -14,12 +14,26 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET') return;
-  // App files: network first (so updates arrive), cache fallback when offline
+  // App files: network first (so updates arrive). If the network is slow or fails, use the saved copy
+  // after a few seconds instead of leaving the app hanging on a blank screen.
   if (url.origin === location.origin) {
-    e.respondWith(fetch(e.request, { cache: 'no-cache' }).then(r => {
-      if (r.ok) { const c = r.clone(); caches.open(VERSION).then(cache => cache.put(e.request, c)); }
-      return r;
-    }).catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match('index.html'))));
+    e.respondWith((async () => {
+      const net = fetch(e.request, { cache: 'no-cache' }).then(r => {
+        if (r.ok) { const c = r.clone(); caches.open(VERSION).then(cache => cache.put(e.request, c)); }
+        return r;
+      });
+      net.catch(() => { });
+      const cached = () => caches.match(e.request, { ignoreSearch: true }).then(r => r || (e.request.mode === 'navigate' ? caches.match('index.html') : null));
+      const slow = new Promise(res => setTimeout(res, 4000)).then(cached);
+      try {
+        const first = await Promise.race([net, slow]);
+        if (first) return first;
+        return await net;
+      } catch {
+        const c = await cached();
+        return c || Response.error();
+      }
+    })());
     return;
   }
   // Fonts + album artwork: cache first, so covers show offline

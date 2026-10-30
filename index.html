@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>BAZINGA! - Music Made For You</title>
   <meta name="description" content="BAZINGA — turn your Spotify Liked Songs and playlists into YouTube music video & audio playlists. A full music player that keeps everything on your device.">
   <meta name="theme-color" content="#0c0c0e">
@@ -10,7 +10,7 @@
   <link rel="icon" href="favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
-  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png?v=2" sizes="180x180">
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -31,7 +31,18 @@
   <link rel="preconnect" href="https://itunes.apple.com">
   <link rel="preconnect" href="https://www.youtube.com">
   <script>try{if(/Apple/.test(navigator.vendor||""))document.documentElement.classList.add("webkit")}catch(e){}</script>
-  <link rel="stylesheet" href="css/app.css?v=e0bf03beae">
+  <style>
+    /* Start-up problem screen — styled here so it works even if the stylesheet can't load */
+    #boot-fail{position:fixed;inset:0;z-index:999;display:grid;place-items:center;padding:24px;overflow:auto;background:#0c0c0e;color:#f5f2e8;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center}
+    #boot-fail[hidden]{display:none}
+    #boot-fail .bf-card{max-width:440px}#boot-fail h2{margin:12px 0 6px;font-size:24px}#boot-fail p{color:#b9b5aa;margin:6px 0}
+    #boot-fail .bf-status{color:#ffd60a;min-height:1.5em;font-weight:600}
+    #boot-fail .bf-btns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:14px 0}
+    #boot-fail button{font:inherit;font-weight:700;padding:11px 22px;border-radius:999px;border:2px solid #000;background:#ffd60a;color:#000;box-shadow:2px 2px 0 #000;cursor:pointer}
+    #boot-fail button.ghost{background:transparent;color:#f5f2e8;border-color:#3a3a40;box-shadow:none}
+    #boot-fail ol{text-align:left;padding-left:22px;color:#d6d2c7;font-size:15px}#boot-fail li{margin:6px 0}#boot-fail b{color:#f5f2e8}
+  </style>
+  <link rel="stylesheet" href="css/app.css?v=01099fb9dc">
 </head>
 <body>
   <div id="onboarding" hidden></div>
@@ -47,6 +58,7 @@
         <a href="#/settings" data-r="settings"><span class="ni ni-settings"></span>Settings</a>
         <a href="#/support" data-r="support"><span class="ni ni-coffee"></span>Support</a>
         <button class="ask-btn" data-act="voice"><span class="ni ni-mic"></span>Ask BAZINGA!</button>
+        <button class="lock-side" data-act="lock" aria-label="Lock screen" title="Lock screen (or tap an empty spot 3 times)"><span class="ni ni-lock"></span>Lock screen</button>
       </nav>
       <div class="side-h"><span>Playlists</span><button class="ib sm" data-act="new-playlist" aria-label="New playlist">+</button></div>
       <div id="side-pl" class="side-pl"></div>
@@ -57,6 +69,7 @@
       <div class="topbar">
         <a class="brand-m" href="#/home" aria-label="BAZINGA! home"><span class="brand-row"><span class="logo-mark"><img src="icons/icon-192.png" alt=""></span><span class="wordmark">BAZINGA!</span></span></a>
         <span class="offline-pill">Offline</span>
+        <button class="ib mic-top lock-top" data-act="lock" aria-label="Lock screen" title="Lock screen"><span class="ni ni-lock"></span></button>
         <a class="ib mic-top coffee-top" href="#/support" aria-label="Support BAZINGA!"><span class="ni ni-coffee"></span></a>
         <button class="ib mic-top" data-act="voice" aria-label="Ask BAZINGA!"><span class="ni ni-mic"></span></button>
         <a href="#/settings" class="profile-chip compact"></a>
@@ -102,20 +115,82 @@
   <div id="modal-root"></div>
   <div id="menu-root"></div>
   <noscript>BAZINGA needs JavaScript turned on.</noscript>
-  <div id="boot-fail" hidden style="position:fixed;inset:0;place-items:center;z-index:999;padding:24px;text-align:center;font-family:system-ui;color:#f5f2e8;background:#0c0c0e">
-    <div style="max-width:440px"><img src="icons/icon-192.png" alt="" width="72"><h2>BAZINGA! couldn't start</h2>
-    <p style="color:#9b988f">Make sure all the files (the <b>js</b>, <b>css</b> and <b>icons</b> folders) were uploaded next to index.html, then reload. Private/incognito mode can also block storage.</p>
-    <code style="color:#ff9500"></code></div></div>
+  <div id="boot-fail" hidden>
+    <div class="bf-card"><img src="icons/icon-192.png" alt="" width="72" height="72">
+      <h2>Sorry! BAZINGA! didn't start</h2>
+      <p class="bf-msg">Something got in the way while the app was loading. Your music and settings are safe on this device.</p>
+      <p class="bf-status" aria-live="polite"></p>
+      <div class="bf-btns"><button type="button" id="bf-retry">Try again</button><button type="button" id="bf-help" class="ghost">Help</button></div>
+      <div id="bf-steps" hidden>
+        <p><b>Things that usually fix it:</b></p>
+        <ol>
+          <li>Check your internet connection, then tap <b>Try again</b>.</li>
+          <li>Close the BAZINGA! tab or app completely and open it again.</li>
+          <li>Turn off ad or content blockers for this site (Brave Shields, Safari content blockers, private DNS).</li>
+          <li>Leave Private / Incognito mode — it can block the storage BAZINGA! needs.</li>
+          <li>Update your browser. iPhone and iPad need iOS 15 or newer; or try Chrome, Edge or Safari.</li>
+          <li>Still stuck? Tap <b>Repair app</b>. It reloads BAZINGA!'s files without touching your music.</li>
+        </ol>
+        <div class="bf-btns"><button type="button" id="bf-repair">Repair app</button></div>
+      </div>
+    </div>
+  </div>
   <script>
     /* App owner settings — see README "Set up YouTube account sync". */
     window.BAZINGA_CONFIG = {
-      googleClientId: '341283340322-bjohqhft506q3o8qpgfpgr811f3j3l5l.apps.googleusercontent.com',  /* YouTube sync, e.g. '1234567890-abc123.apps.googleusercontent.com' */
-      youtubeApiKey: 'AIzaSyCozAeNSjhAO4YhQme_1iBQwlMImUJTDJc',   /* Backup YouTube search for everyone when the free servers are down (YouTube Data API v3 key, restrict it to your site) */
-      supabaseUrl: 'https://udxmgahmetaejbyuncqx.supabase.co',     /* Accounts & sync, e.g. 'https://abcdefgh.supabase.co' */
-      supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVkeG1nYWhtZXRhZWpieXVuY3F4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMyMDM5MTgsImV4cCI6MjEwODc3OTkxOH0.34yvJL5xGFwxDEdx5vtnFapYxvaY04_WSThx4G-n3yc'  /* the project's "anon" / publishable key (safe to publish) */
+      googleClientId: '',  /* YouTube sync, e.g. '1234567890-abc123.apps.googleusercontent.com' */
+      youtubeApiKey: '',   /* Backup YouTube search for everyone when the free servers are down (YouTube Data API v3 key, restrict it to your site) */
+      syncRelay: ''        /* Optional: your own ntfy server for device sync. Empty = the free public https://ntfy.sh (no setup) */
     };
   </script>
-  <script src="js/bazinga.js?v=14c8c635fc" defer></script>
-  <script>setTimeout(function(){ if(!window.__bzStarted){ var f=document.getElementById('boot-fail'); f.hidden=false; f.style.display='grid'; f.querySelector('code').textContent='Script js/bazinga.js did not load.'; } }, 4000);</script>
+  <script>
+    /* Start-up guard: if the app script fails or is very slow, recover by itself first, then show a friendly message */
+    (function () {
+      var D = document, ss = window.sessionStorage, waited = 0, extra = false;
+      function started() { return !!window.__bzStarted; }
+      function get(k) { try { return ss.getItem(k); } catch (e) { return null; } }
+      function set(k, v) { try { ss.setItem(k, v); } catch (e) { } }
+      function show(status) {
+        if (started()) return;
+        var f = D.getElementById('boot-fail'); if (!f) return;
+        f.hidden = false; f.querySelector('.bf-status').textContent = status || '';
+      }
+      // Load the script once more, bypassing every cache
+      function reload() {
+        if (extra || started()) return; extra = true;
+        var s = D.createElement('script'); s.src = 'js/bazinga.js?fresh=' + Date.now();
+        s.onerror = function () { repairOnce(); };
+        D.body.appendChild(s);
+      }
+      // Clear the app's cached files (never the music library) and reload the page — once per visit
+      function repair(force) {
+        if (!force && get('bzRepaired')) { show(''); return; }
+        set('bzRepaired', '1'); show('Repairing…');
+        var jobs = [];
+        try { if (window.caches) jobs.push(caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k !== 'bazinga-img'; }).map(function (k) { return caches.delete(k); })); })); } catch (e) { }
+        try { if (navigator.serviceWorker) jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) { return Promise.all(rs.map(function (r) { return r.unregister(); })); })); } catch (e) { }
+        Promise.all(jobs).catch(function () { }).then(function () { location.reload(); });
+      }
+      function repairOnce() { if (!started()) repair(false); }
+      window.__bzLoadErr = function () { if (!navigator.onLine) { show('You seem to be offline. Connect to the internet and tap Try again.'); return; } reload(); };
+      // Watchdog: slow phone networks get time; only act if nothing is still downloading
+      (function watch() {
+        if (started()) return;
+        waited += 1;
+        var done = D.readyState === 'complete'; // the page finished loading but the app never started
+        if (waited >= 6 && done && !extra) reload();
+        if (waited >= 14 && done) { repairOnce(); }
+        if ((waited >= 22 && done) || waited >= 45) { show(navigator.onLine ? '' : 'You seem to be offline. Connect to the internet and tap Try again.'); return; }
+        setTimeout(watch, 1000);
+      })();
+      D.addEventListener('click', function (e) {
+        var id = e.target && e.target.id;
+        if (id === 'bf-retry') location.reload();
+        if (id === 'bf-help') { var st = D.getElementById('bf-steps'); st.hidden = !st.hidden; }
+        if (id === 'bf-repair') repair(true);
+      });
+    })();
+  </script>
+  <script src="js/bazinga.js?v=d08b8bf7c6" defer onerror="window.__bzLoadErr && window.__bzLoadErr()"></script>
 </body>
 </html>
