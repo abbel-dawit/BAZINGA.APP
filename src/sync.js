@@ -38,6 +38,41 @@ export const deviceName = () => {
 };
 // A random id for this browser, so it can tell its own messages and "now playing" from other devices'
 const DEV = (() => { try { let d = localStorage.getItem('bz_dev'); if (!d) { d = Math.random().toString(36).slice(2, 12); localStorage.setItem('bz_dev', d); } return d; } catch { return 'x' + Math.random().toString(36).slice(2, 10); } })();
+// ---------- Your synced devices (names, paused, removed) ----------
+// Every device keeps a small list of all linked devices; it travels with the library like everything else.
+// Name/paused/removed changes carry a time stamp (newest wins); "last active" is the latest time seen.
+let devices = {}, devicesDirty = false;
+const saveDevices = () => kv.set('syncDevices', devices);
+function ensureMe() {
+  const me = devices[DEV];
+  if (!me || (me.removed && (me.ts || 0) <= (link?.since || 0))) { devices[DEV] = { name: deviceName(), autoName: deviceName(), auto: true, ts: Date.now(), lastSeen: Date.now() }; devicesDirty = true; saveDevices(); }
+}
+export function mergeDevices(L = {}, R = {}) {
+  const out = { ...L };
+  for (const [id, r] of Object.entries(R || {})) {
+    const l = out[id];
+    if (!l) { out[id] = { ...r }; continue; }
+    const win = (r.ts || 0) > (l.ts || 0) ? r : l;
+    out[id] = { ...win, lastSeen: Math.max(l.lastSeen || 0, r.lastSeen || 0) };
+  }
+  return out;
+}
+export const thisDevice = () => DEV;
+export const isPaused = () => !!devices[DEV]?.paused;
+export function listDevices() {
+  return Object.entries(devices).filter(([, d]) => !d.removed).map(([id, d]) => ({ id, ...d, me: id === DEV })).sort((a, b) => (b.me - a.me) || ((b.lastSeen || 0) - (a.lastSeen || 0)));
+}
+function editDevice(id, patch) {
+  if (!devices[id]) return;
+  devices[id] = { ...devices[id], ...patch, ts: Date.now() };
+  devicesDirty = true; saveDevices(); emit('devices');
+  if (link) { clearTimeout(devT); devT = setTimeout(() => syncNow(), 600); }
+}
+let devT = null;
+export const renameDevice = (id, name) => editDevice(id, { name: String(name).trim().slice(0, 40) || deviceName(), auto: false });
+export const autoNameDevice = id => editDevice(id, { name: id === DEV ? deviceName() : (devices[id]?.autoName || devices[id]?.name), auto: true });
+export const pauseDevice = (id, on) => { editDevice(id, { paused: !!on }); if (id === DEV && !on && link) { link.lastTs = 0; link.seen = []; link.hash = ''; } };
+export const removeDevice = id => editDevice(id, { removed: true, paused: false });
 function setStatus(status, error = '') { S.status = status; S.error = error; if (status === 'synced') S.lastSync = Date.now(); emit('sync', S); }
 
 // ---------- keys & links ----------
@@ -239,6 +274,7 @@ async function localSnap() {
     else if (v !== null && v !== undefined) kvx[k] = { v, ts: st2?.ts || 1 };
   }
   snap.kvx = kvx;
+  snap.devices = devices;
   return snap;
 }
 // Settings: per setting, the newer change wins. A setting one side doesn't have is simply added.
@@ -319,7 +355,8 @@ export function merge(L, R) {
   return {
     app: 'BAZINGA', version: 1, tracks, playlists, albums, tombstones: tomb, profile,
     settings: mergeSettings(L.settings, R.settings), kvx: mergeKv(L.kvx, R.kvx),
-    ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1)
+    ytcache: [...yc.entries()].sort((p, q) => p[0] < q[0] ? -1 : 1),
+    devices: mergeDevices(L.devices, R.devices)
   };
 }
 
@@ -381,7 +418,7 @@ export async function syncNow({ interactive = false } = {}) {
     setStatus('syncing');
     try {
       do { again = false; await once(); } while (again && link);
-      if (link) { setStatus('synced'); step('Done', 100); }
+      if (link && !isPaused()) { setStatus('synced'); step('Done', 100); }
     } catch (e) {
       if (isAbort(e)) { setStatus(link?.lastId ? 'synced' : 'off'); S.cancelled = true; return; }
       console.warn('sync failed', e);
@@ -417,6 +454,8 @@ async function once() {
     } catch { }
   }
   const latest = [...msgs].reverse().find(m => liveFile(m) && m.attachment.name !== 'delta.bz');
+  ensureMe();
+  const paused = isPaused();
   const local = await localSnap();
   // what changed here since the last send (captured before anything from other devices is merged in)
   const pending = link.deltaFrom ? changesSince(local, link.deltaFrom) : null;
@@ -444,6 +483,18 @@ async function once() {
       remoteNow = newerNow(remoteNow, data.now);
     } catch (e) { if (isAbort(e)) throw e; }
   }
+  // the device list from the other devices (kept even while paused, so a pause/remove from elsewhere arrives)
+  const before = JSON.stringify(devices);
+  devices = mergeDevices(devices, base.devices);
+  if (JSON.stringify(devices) !== before) { await saveDevices(); emit('devices'); }
+  const me = devices[DEV];
+  if (me?.removed && (me.ts || 0) > (link.since || 0)) { await leave(); emit('sync-removed', { byDevice: true }); return; }
+  if (isPaused()) {
+    // paused: nothing is merged into this device and nothing is sent — except its own device-list changes
+    if (devicesDirty) { const res = await post(topic, await postNote(topic, toB64(await seal({ t: 'delta', dev: DEV, tracks: [], playlists: [], albums: [], tombstones: { t: {}, p: {}, a: {} }, ytcache: [], devices: { [DEV]: { ...devices[DEV], lastSeen: Date.now() } } })))); devicesDirty = false; if (res?.time) link.lastTs = Math.max(link.lastTs || 0, res.time); }
+    await saveLink(); setStatus('paused'); return; // (messages stay "unread", so everything is picked up on resume)
+  }
+  if (paused && !isPaused()) { link.lastTs = 0; link.seen = []; link.hash = ''; again = true; } // just resumed (from another device): catch up fully
   if (replaced || hash(base) !== hash(local)) { step('Saving to this device…', 85); await applyLocal(base); }
   // continue where you left off on another device (only if nothing is playing here)
   if (remoteNow && remoteNow.dev !== DEV && (remoteNow.at || 0) > player.lastActive() && player.adopt(remoteNow)) emit('player-adopted', remoteNow);
@@ -456,14 +507,19 @@ async function once() {
   const withNow = playerWanted && player.syncState().queue.length ? { ...player.syncState(), dev: DEV, device: deviceName() } : null;
   if (stale) {
     step('Sending your library to your other devices…', 92);
-    const full = { ...base, now: { ...player.syncState(), dev: DEV, device: deviceName() } };
+    devices[DEV] = { ...devices[DEV], lastSeen: Date.now() };
+    const full = { ...base, devices, now: { ...player.syncState(), dev: DEV, device: deviceName() } };
     const res = await post(topic, await postLibrary(topic, await seal(full)));
     link.hash = hash(base); link.lastId = res.id; link.lastTs = res.time; link.pubTs = res.time;
-    playerWanted = false; lastPlayerPost = Date.now();
-  } else if (pending || withNow) {
+    playerWanted = false; lastPlayerPost = Date.now(); devicesDirty = false;
+  } else if (pending || withNow || devicesDirty) {
     step('Sending your changes…', 94);
     const d = pending || { t: 'delta', dev: DEV, tracks: [], playlists: [], albums: [], tombstones: { t: {}, p: {}, a: {} }, ytcache: [] };
     if (withNow) d.now = withNow;
+    // device list: what changed, plus this device's "last active"
+    devices[DEV] = { ...devices[DEV], lastSeen: Date.now() };
+    d.devices = Object.fromEntries(Object.entries(devices).filter(([id, x]) => id === DEV || (x.ts || 0) > (link.deltaFrom || 0) - 60e3 || devicesDirty));
+    devicesDirty = false;
     const sealed = await seal(d), b64 = toB64(sealed);
     // small enough for a plain message (no file storage used on the relay), otherwise a small file
     const res = await post(topic, b64.length <= 3900 ? await postNote(topic, b64) : await relayPost(topic, new Blob([sealed]), { filename: 'delta.bz', title: deviceName() }));
@@ -560,7 +616,7 @@ export async function redeemCode(code) {
   throw new Error('That code didn\'t work — check it, or make a new one on your other device (codes last 15 minutes).');
 }
 // Stop syncing on this device (its music stays here)
-export async function leave() { link = null; keys = null; try { es?.close(); } catch { } es = null; await saveLink(); setStatus('off'); }
+export async function leave() { link = null; keys = null; try { es?.close(); } catch { } es = null; devices = {}; await kv.del('syncDevices'); await saveLink(); setStatus('off'); emit('devices'); }
 // Tell every linked device to stop syncing (each keeps its music)
 export async function removeEverywhere() {
   if (!link) return;
@@ -575,7 +631,7 @@ const schedule = debounce(() => {
   const wait = Math.max(0, lastPush + 8e3 - Date.now());
   setTimeout(() => { lastPush = Date.now(); syncNow(); }, wait);
 }, 2500);
-export async function restore() { link = await kv.get('syncLink'); if (link?.secret) start(); else setStatus('off'); }
+export async function restore() { link = await kv.get('syncLink'); devices = (await kv.get('syncDevices')) || {}; if (link?.secret) start(); else setStatus('off'); }
 export function start() {
   if (!link) { setStatus('off'); return; }
   syncNow();

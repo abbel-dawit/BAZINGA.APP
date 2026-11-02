@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>BAZINGA! - Music Made For You</title>
   <meta name="description" content="BAZINGA — turn your Spotify Liked Songs and playlists into YouTube music video & audio playlists. A full music player that keeps everything on your device.">
-  <meta name="theme-color" content="#0c0c0e">
+  <meta name="theme-color" content="#060607">
   <meta name="mobile-web-app-capable" content="yes">
   <link rel="icon" href="favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="icons/favicon-16.png">
-  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png?v=3" sizes="180x180">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png?v=5" sizes="180x180">
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -31,7 +31,7 @@
   <link rel="preconnect" href="https://itunes.apple.com">
   <link rel="preconnect" href="https://www.youtube.com">
   <script>try{if(/Apple/.test(navigator.vendor||""))document.documentElement.classList.add("webkit")}catch(e){}</script>
-  <script>/* Your theme colour, before anything paints (set in Settings → You) */try{var bzv=JSON.parse(localStorage.getItem("bz_theme_vars")||"null");if(bzv)for(var k in bzv)document.documentElement.style.setProperty(k,bzv[k])}catch(e){}</script>
+  <script>/* Your theme colour, before anything paints (set in Settings → You) — also the Home Screen icon iPhones use */try{var bzv=JSON.parse(localStorage.getItem("bz_theme_vars")||"null");if(bzv)for(var k in bzv)document.documentElement.style.setProperty(k,bzv[k]);var bzt0=localStorage.getItem("bz_theme");if(bzt0&&/^[a-z]+$/.test(bzt0)&&bzt0!=="volt"){var ati=document.querySelector('link[rel="apple-touch-icon"]');if(ati)ati.href="icons/theme/"+bzt0+"-apple-touch-icon.png"}}catch(e){}</script>
   <style>
     /* Start-up problem screen — styled here so it works even if the stylesheet can't load */
     #boot-fail{position:fixed;inset:0;z-index:999;display:grid;place-items:center;padding:24px;overflow:auto;background:#0c0c0e;color:#f5f2e8;font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center}
@@ -43,32 +43,34 @@
     #boot-fail button.ghost{background:transparent;color:#f5f2e8;border-color:#3a3a40;box-shadow:none}
     #boot-fail ol{text-align:left;padding-left:22px;color:#d6d2c7;font-size:15px}#boot-fail li{margin:6px 0}#boot-fail b{color:#f5f2e8}
     /* Splash screen while BAZINGA! starts */
-    #splash{position:fixed;inset:0;z-index:998;display:grid;place-items:center;background:#060607;overflow:hidden;transition:opacity .55s ease,transform .55s ease,visibility 0s .55s}
-    #splash.out{opacity:0;transform:scale(1.06);visibility:hidden}
-    #splash .sp-glow{position:absolute;width:150vmax;height:150vmax;border-radius:50%;background:radial-gradient(circle,rgb(var(--volt-rgb,255 214 10)/.32),rgb(var(--volt-2-rgb,255 149 0)/.12) 30%,transparent 58%);animation:spg 3.2s ease-in-out infinite}
+    html,body{background:#060607}
+    #splash{position:fixed;inset:0;z-index:998;display:grid;place-items:center;background:#060607;overflow:hidden;transition:opacity .6s ease,transform .6s ease,visibility 0s .6s;contain:strict}
+    #splash.out{opacity:0;transform:scale(1.05);visibility:hidden}
+    #splash .sp-glow{position:absolute;width:110vmax;height:110vmax;border-radius:50%;background:radial-gradient(circle,rgb(var(--volt-rgb,255 214 10)/.3),rgb(var(--volt-2-rgb,255 149 0)/.1) 32%,transparent 60%);animation:spg 3.2s ease-in-out infinite;will-change:transform,opacity}
     #splash .sp-rings{position:absolute;width:min(70vmin,420px);aspect-ratio:1}
-    #splash .sp-rings i{position:absolute;inset:0;border-radius:50%;border:2px solid rgb(var(--volt-rgb,255 214 10)/.55);opacity:0;animation:spr 2.4s cubic-bezier(.2,.7,.3,1) infinite}
+    #splash .sp-rings i{position:absolute;inset:0;border-radius:50%;border:2px solid rgb(var(--volt-rgb,255 214 10)/.55);opacity:0;animation:spr 2.4s cubic-bezier(.2,.7,.3,1) infinite;will-change:transform,opacity}
     #splash .sp-rings i:nth-child(2){animation-delay:.8s}#splash .sp-rings i:nth-child(3){animation-delay:1.6s}
     #splash .sp-core{position:relative;display:grid;justify-items:center;gap:18px}
-    #splash .sp-bolt{width:min(34vmin,170px);height:auto;filter:drop-shadow(0 0 28px rgb(var(--volt-rgb,255 214 10)/.75));animation:spb 1s cubic-bezier(.2,1.4,.4,1) both,spz 2.4s ease-in-out 1s infinite}
-    #splash .sp-word{font:italic 900 clamp(34px,9vmin,58px)/1 "Arial Black",system-ui,sans-serif;letter-spacing:.04em;color:#fff;text-shadow:3px 3px 0 #000,6px 6px 0 var(--volt,#ffd60a);animation:spw .8s .25s cubic-bezier(.2,1.2,.4,1) both}
+    #splash .sp-logo{display:grid;justify-items:center;gap:18px;animation:spb .75s cubic-bezier(.2,1.3,.4,1) both;will-change:transform,opacity}
+    #splash .sp-bolt{width:min(34vmin,170px);height:min(34vmin,170px);overflow:visible;filter:drop-shadow(0 0 22px rgb(var(--volt-rgb,255 214 10)/.7));animation:spz 2.4s ease-in-out .75s infinite;will-change:transform}
+    #splash .sp-word{font:italic 900 clamp(34px,9vmin,58px)/1 "Arial Black",system-ui,sans-serif;letter-spacing:.04em;color:#fff;text-shadow:3px 3px 0 #000,6px 6px 0 var(--volt,#ffd60a)}
     #splash .sp-bar{width:min(46vmin,200px);height:4px;border-radius:4px;background:rgb(255 255 255/.1);overflow:hidden;animation:spw .6s .45s both}
     #splash .sp-bar i{display:block;height:100%;width:40%;border-radius:4px;background:var(--volt,#ffd60a);box-shadow:0 0 12px var(--volt,#ffd60a);animation:spl 1.1s ease-in-out infinite}
     @keyframes spg{50%{transform:scale(1.12);opacity:.75}}@keyframes spr{0%{transform:scale(.3);opacity:.9}100%{transform:scale(1.5);opacity:0}}
-    @keyframes spb{0%{transform:scale(.2) rotate(-25deg);opacity:0}100%{transform:none;opacity:1}}@keyframes spz{50%{transform:scale(1.06) rotate(2deg)}}
+    @keyframes spb{0%{transform:scale(.35) rotate(-8deg);opacity:0}100%{transform:none;opacity:1}}@keyframes spz{50%{transform:scale(1.06) rotate(2deg)}}
     @keyframes spw{0%{transform:translateY(14px);opacity:0}100%{transform:none;opacity:1}}@keyframes spl{0%{transform:translateX(-110%)}100%{transform:translateX(260%)}}
     #splash .sp-sub{margin:-4px 0 2px;min-height:1.4em;color:#e9e5da;font:600 clamp(14px,3.6vmin,17px)/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.01em;text-align:center;padding:0 20px;opacity:.92}
     #splash .sp-sub.in{animation:sps .6s cubic-bezier(.2,1.2,.4,1) both}
     @keyframes sps{0%{transform:translateY(8px);opacity:0}100%{transform:none;opacity:.92}}
     @media (prefers-reduced-motion:reduce){#splash *{animation:none!important}}
   </style>
-  <link rel="stylesheet" href="css/app.css?v=da5527cef3">
+  <link rel="stylesheet" href="css/app.css?v=1a08b8b6ab" media="print" onload="this.media='all';window.__bzCss=1">
+  <noscript><link rel="stylesheet" href="css/app.css?v=1a08b8b6ab"></noscript>
 </head>
 <body>
   <div id="splash" aria-hidden="true"><div class="sp-glow"></div><div class="sp-rings"><i></i><i></i><i></i></div>
-    <div class="sp-core"><img class="sp-bolt" src="icons/icon-512.png" alt=""><div class="sp-word">BAZINGA!</div><p class="sp-sub" aria-live="polite"></p><div class="sp-bar"><i></i></div></div></div>
+    <div class="sp-core"><div class="sp-logo"><svg class="sp-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="var(--volt,#ffd60a)"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="var(--volt-2,#ff9500)"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.4" stroke-linejoin="round"/></svg><div class="sp-word">BAZINGA!</div></div><p class="sp-sub" aria-live="polite"></p><div class="sp-bar"><i></i></div></div></div>
   <script>/* Fun lines while BAZINGA! starts */(function(){var L=["Charging the lightning ⚡","Warming up the speakers 🔊","Turning the bass up 🎚️","Dusting off the vinyl 💿","Finding your vibe 🎧","Lining up the bangers 🔥","Waking up the drummer 🥁","Tuning the guitar 🎸","Loading pure good vibes ✨","Getting the dance floor ready 🕺","Polishing the headphones 🎧","Counting you in: 1, 2, 3, 4 🎶"],el=document.querySelector("#splash .sp-sub"),i=Math.floor(Math.random()*L.length);function n(){if(!el||!el.isConnected)return;el.classList.remove("in");void el.offsetWidth;el.textContent=L[i++%L.length];el.classList.add("in");setTimeout(n,2600)}n()})();</script>
-  <script>try{var bzt=localStorage.getItem("bz_theme");if(bzt&&/^[a-z]+$/.test(bzt)&&bzt!=="volt")document.querySelector("#splash .sp-bolt").src="icons/theme/"+bzt+"-icon-512.png"}catch(e){}</script>
   <div id="onboarding" hidden></div>
 
   <div id="app" hidden>
@@ -104,7 +106,7 @@
         <div class="foot-social">
           <a class="soc" href="https://www.instagram.com/bazinga.app" target="_blank" rel="noopener" aria-label="BAZINGA! on Instagram"><span class="ni ni-instagram"></span><span><b>Instagram</b><small>@bazinga.app</small></span></a>
           <a class="soc" href="https://x.com/bazinga_app" target="_blank" rel="noopener" aria-label="BAZINGA! on X (Twitter)"><span class="ni ni-xsocial"></span><span><b>X / Twitter</b><small>@bazinga_app</small></span></a>
-          <a class="soc coffee" href="#/support" aria-label="Support BAZINGA!"><span class="ni ni-coffee"></span><span><b>Buy me a coffee</b><small>Keep BAZINGA! free</small></span></a>
+          <a class="soc coffee" href="#/support" aria-label="Support BAZINGA!"><span class="ni ni-coffee"></span><span><b>Buy BAZINGA! a coffee</b><small>Keep BAZINGA! free</small></span></a>
         </div>
         <div>© 2026 Abbel Dawit · BAZINGA! · <a href="#/legal">Privacy &amp; Terms</a></div>
       </footer>
@@ -216,6 +218,6 @@
       });
     })();
   </script>
-  <script src="js/bazinga.js?v=093275cf5a" defer onerror="window.__bzLoadErr && window.__bzLoadErr()"></script>
+  <script src="js/bazinga.js?v=d729d85e52" defer onerror="window.__bzLoadErr && window.__bzLoadErr()"></script>
 </body>
 </html>

@@ -31,7 +31,7 @@ let routeToken = 0;
 // ================= BOOT =================
 async function boot() {
   window.__bzStarted = true;
-  setTimeout(hideSplash, 12000); // never leave the splash up if something below goes wrong
+  setTimeout(() => hideSplash(true), 12000); // never leave the splash up if something below goes wrong
   if (location.protocol === 'file:') setTimeout(() => toast('Opened from a file: library & offline files work, but YouTube playback, Spotify and sharing need the GitHub Pages link.', 'err'), 1500);
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').then(r => r.update().catch(() => { })).catch(() => { });
   checkForUpdate(true);
@@ -53,7 +53,7 @@ async function boot() {
   wireGlobal();
   wireLock();
   on('sync', () => { renderProfileChip(); const el = $('#sync-line'); if (el) el.innerHTML = syncLine(); });
-  on('sync-removed', () => { toast('Sync was turned off on another device — your music stays here'); if (location.hash.startsWith('#/settings')) rerender(); });
+  on('sync-removed', d => { toast(d?.byDevice ? 'This device was removed from sync on another device. Your music stays here.' : 'Sync was turned off on another device. Your music stays here.'); if (location.hash.startsWith('#/settings')) rerender(); });
   on('synced-in', () => { if (location.hash.startsWith('#/settings') && !$('.modal-wrap')) rerender(); });
   on('profile-changed', p => { profile = p; renderProfileChip(); });
   // Settings that arrived from another synced device
@@ -66,9 +66,21 @@ async function boot() {
 }
 
 // ---------- Splash screen: fades out once the first screen is ready (shown at least ~1 s) ----------
-function hideSplash() {
-  const sp = $('#splash'); if (!sp || sp.classList.contains('out')) return;
-  setTimeout(() => { sp.classList.add('out'); setTimeout(() => sp.remove(), 700); }, Math.max(0, 1100 - performance.now()));
+// Stays up long enough to be seen properly (at least ~1.8 s from launch), and until the app underneath
+// is completely ready — its stylesheet loaded and fonts in — so it never jumps into a half-drawn screen.
+function hideSplash(force = false) {
+  const sp = $('#splash'); if (!sp || sp.classList.contains('out') || sp._leaving) return;
+  sp._leaving = true;
+  const cssReady = () => window.__bzCss || [...document.styleSheets].some(x => /css\/app\.css/.test(x.href || '') && x.media.mediaText !== 'print');
+  const go = () => { sp.classList.add('out'); setTimeout(() => sp.remove(), 700); };
+  const wait = async () => {
+    const t0 = Date.now();
+    while (!force && !cssReady() && Date.now() - t0 < 8000) await sleep(50);
+    try { await Promise.race([document.fonts?.ready, sleep(700)]); } catch { }
+    await sleep(Math.max(0, 1800 - performance.now()));
+    requestAnimationFrame(() => requestAnimationFrame(go)); // after the app has painted underneath
+  };
+  wait();
 }
 
 // ---------- Always run the newest version ----------
@@ -108,6 +120,11 @@ async function applyUpdate(atLaunch) {
     try { sessionStorage.setItem('bz_upd', updateReady + ':done'); } catch { }
   } else { try { sessionStorage.setItem('bz_upd', updateReady); } catch { } }
   try { saveSpot(); } catch { }
+  // the app opens from its saved copy, so have the service worker save the new page first (max ~3 s)
+  try {
+    const ctl = navigator.serviceWorker?.controller;
+    if (ctl) await new Promise(res => { const ch = new MessageChannel(); ch.port1.onmessage = res; ctl.postMessage({ refreshShell: true }, [ch.port2]); setTimeout(res, 3000); });
+  } catch { }
   location.reload();
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { if (updateReady && !player.isOn()) applyUpdate(false); else checkForUpdate(); } });
@@ -125,7 +142,8 @@ function syncLine() {
   const S = sync.state();
   if (!sync.linked()) return '';
   const ago = S.lastSync ? Math.max(0, Math.round((Date.now() - S.lastSync) / 60e3)) : null;
-  return S.status === 'syncing' ? `<span class="sync-st busy">${icon('cloud')} Syncing…</span>`
+  return S.status === 'paused' ? `<span class="sync-st">${icon('pause')} Syncing is paused on this device</span>`
+    : S.status === 'syncing' ? `<span class="sync-st busy">${icon('cloud')} Syncing…</span>`
     : S.status === 'error' ? `<span class="sync-st err">${icon('cloudOff')} ${esc(S.error || 'Sync failed')} — will retry</span>`
     : S.status === 'offline' ? `<span class="sync-st">${icon('cloudOff')} Offline — will sync when you're back online</span>`
     : `<span class="sync-st ok">${icon('check')} Synced${ago === null ? '' : ago < 1 ? ' just now' : ` ${ago} min ago`}</span>`;
@@ -235,6 +253,44 @@ async function linkDeviceDialog() {
   });
   clearInterval(timer);
   if (location.hash.startsWith('#/settings')) rerender();
+}
+// ---------- Your synced devices: rename, pause, remove ----------
+const agoText = ts => { if (!ts) return 'not seen yet'; const m = Math.round((Date.now() - ts) / 60e3); return m < 2 ? 'active now' : m < 60 ? `active ${m} min ago` : m < 48 * 60 ? `active ${Math.round(m / 60)} h ago` : `active ${Math.round(m / 1440)} days ago`; };
+const devIcon = n => /iPhone|Android/.test(n) ? '📱' : /iPad/.test(n) ? '📱' : /Mac|Windows|Linux/.test(n) ? '💻' : '🖥️';
+function devicesHTML() {
+  if (!sync.linked()) return '';
+  const list = sync.listDevices();
+  if (!list.length) return '';
+  return `<div class="kicker">Your devices</div>` + list.map(d => `<div class="sdev ${d.paused ? 'paused' : ''}" data-dev="${esc(d.id)}">
+      <span class="sdev-ic" aria-hidden="true">${devIcon(d.autoName || d.name)}</span>
+      <span class="sdev-t"><b>${esc(d.name)}</b>${d.me ? '<em>This device</em>' : ''}<small>${d.paused ? 'Paused' : agoText(d.lastSeen)}${d.autoName && d.name !== d.autoName ? ' · ' + esc(d.autoName) : ''}</small></span>
+      <span class="sdev-b">
+        <button class="ib sm" data-act="dev-rename" data-id="${esc(d.id)}" aria-label="Rename ${esc(d.name)}" title="Rename">${icon('edit')}</button>
+        <button class="ib sm" data-act="dev-pause" data-id="${esc(d.id)}" aria-label="${d.paused ? 'Resume' : 'Pause'} syncing on ${esc(d.name)}" title="${d.paused ? 'Resume syncing' : 'Pause syncing'}">${icon(d.paused ? 'play' : 'pause')}</button>
+        <button class="ib sm danger-t" data-act="dev-remove" data-id="${esc(d.id)}" aria-label="Remove ${esc(d.name)}" title="${d.me ? 'Stop syncing this device' : 'Remove device'}">${icon('trash')}</button>
+      </span></div>`).join('');
+}
+const redrawDevices = () => { const el = $('#sync-devices'); if (el) el.innerHTML = devicesHTML(); const sl = $('#sync-line'); if (sl) sl.innerHTML = syncLine(); };
+on('devices', redrawDevices);
+async function deviceAction(kind, id) {
+  const d = sync.listDevices().find(x => x.id === id); if (!d) return;
+  if (kind === 'rename') {
+    const r = await modal(`<h3>${icon('edit')} Name this device</h3><form><label class="fld"><span>Device name</span><input name="n" value="${esc(d.name)}" maxlength="40" required></label>
+      <div class="modal-actions"><button type="button" class="btn ghost" data-resolve="auto">Use automatic name${d.autoName ? ` (${esc(d.autoName)})` : ''}</button><button class="btn primary">Save</button></div></form>`);
+    if (r === 'auto') { sync.autoNameDevice(id); toast('Automatic name restored'); }
+    else if (r?.n) { sync.renameDevice(id, r.n); toast('Renamed ✓', 'ok'); }
+  }
+  if (kind === 'pause') {
+    sync.pauseDevice(id, !d.paused);
+    toast(d.paused ? `Syncing resumed on ${d.name}` : `Syncing paused on ${d.name}${d.me ? '' : ' (takes effect next time it\'s open)'}`, 'ok');
+    if (d.me && d.paused) sync.syncNow();
+  }
+  if (kind === 'remove') {
+    if (d.me) return syncMenu('leave');
+    if (!await confirmBox(`Remove ${d.name}?`, `It stops syncing the next time it's open and keeps the music it has. To add it back later, link it again from here.`, 'Remove', true)) return;
+    sync.removeDevice(id); toast(`${d.name} removed`, 'ok');
+  }
+  redrawDevices();
 }
 async function syncMenu(kind) {
   if (kind === 'leave') {
@@ -447,7 +503,8 @@ async function showApp() {
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
     openNP: () => openNP(), closeNP: () => closeNP(), lyrics: on => setLyrics(on), toast
   });
-  route().finally(hideSplash);
+  route().finally(() => hideSplash());
+  (window.requestIdleCallback || (f => setTimeout(f, 2500)))(iosStartupImage);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
   setWake(false); // no background listening: the mic is only on while the assistant is open
@@ -467,6 +524,51 @@ function wireToTop() {
   }, { passive: true });
   btn.onclick = () => { main.scrollTo({ top: 0, behavior: 'smooth' }); hide(); };
 }
+
+// ---------- iPhone/iPad launch image ----------
+// Opening a Home Screen web app on iPhone shows a "startup image" while the app loads — without one it's
+// a plain black screen. iOS takes that image when you tap "Add to Home Screen", so BAZINGA! draws one
+// that looks exactly like its splash screen (your colour, the bolt, the wordmark) at this phone's size.
+function iosStartupImage() {
+  if (!isIOS() || isStandalone()) return;
+  try {
+    document.querySelectorAll('link[rel="apple-touch-startup-image"]').forEach(l => l.remove());
+    const css = getComputedStyle(document.documentElement);
+    const volt = css.getPropertyValue('--volt').trim() || '#ffd60a', volt2 = css.getPropertyValue('--volt-2').trim() || '#ff9500', rgb = css.getPropertyValue('--volt-rgb').trim() || '255 214 10';
+    const dpr = Math.min(3, devicePixelRatio || 2), sw = screen.width, sh = screen.height;
+    const draw = (w, h) => {
+      const c = document.createElement('canvas'); c.width = w * dpr; c.height = h * dpr;
+      const g = c.getContext('2d'); g.scale(dpr, dpr);
+      g.fillStyle = '#060607'; g.fillRect(0, 0, w, h);
+      const r = Math.max(w, h) * .55, gr = g.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, r);
+      gr.addColorStop(0, `rgb(${rgb.split(' ').join(',')},.3)`); gr.addColorStop(.32, `rgb(${rgb.split(' ').join(',')},.08)`); gr.addColorStop(.6, 'rgba(0,0,0,0)');
+      g.fillStyle = gr; g.fillRect(0, 0, w, h);
+      const size = Math.min(Math.min(w, h) * .34, 170), x = w / 2 - size / 2, y = h / 2 - size / 2 - 40;
+      g.save(); g.translate(x, y); g.scale(size / 24, size / 24);
+      const bolt = new Path2D('M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z');
+      g.fillStyle = volt; g.fill(bolt);
+      g.fillStyle = '#fff'; g.fill(new Path2D('M11.4 1.2h1.9L8.2 11.1H6.4z'));
+      g.fillStyle = volt2; g.fill(new Path2D('M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z'));
+      g.lineWidth = 1.4; g.lineJoin = 'round'; g.strokeStyle = '#000'; g.stroke(bolt);
+      g.restore();
+      const fs = Math.max(30, Math.min(58, Math.min(w, h) * .09));
+      g.font = `italic 900 ${fs}px "Arial Black", system-ui, sans-serif`; g.textAlign = 'center'; g.textBaseline = 'top';
+      const ty = y + size + 18;
+      g.fillStyle = volt; g.fillText('BAZINGA!', w / 2 + 6, ty + 6);
+      g.fillStyle = '#000'; g.fillText('BAZINGA!', w / 2 + 3, ty + 3);
+      g.fillStyle = '#fff'; g.fillText('BAZINGA!', w / 2, ty);
+      return c.toDataURL('image/jpeg', 0.9); // ~10× smaller than PNG for this soft-glow picture
+    };
+    const add = (w, h, orient) => {
+      const l = document.createElement('link'); l.rel = 'apple-touch-startup-image';
+      l.media = `(device-width: ${Math.min(sw, sh)}px) and (device-height: ${Math.max(sw, sh)}px) and (-webkit-device-pixel-ratio: ${dpr}) and (orientation: ${orient})`;
+      l.href = draw(w, h); document.head.appendChild(l);
+    };
+    add(Math.min(sw, sh), Math.max(sw, sh), 'portrait');
+    add(Math.max(sw, sh), Math.min(sw, sh), 'landscape');
+  } catch { }
+}
+on('theme', () => setTimeout(iosStartupImage, 300));
 
 // ---------- "Add to Home Screen" ----------
 // Chrome/Edge/Samsung/Brave on Android & desktop give us a real install button; iPhone/iPad
@@ -553,6 +655,7 @@ function welcome(joinReq = null) {
   </div>`;
   $('#ob-legal').onclick = e => { e.preventDefault(); showLegal(); };
   hideSplash();
+  setTimeout(iosStartupImage, 2500);
   const termsOk = () => {
     if ($('#ob-terms').checked) return true;
     $('.ob-terms').classList.add('shake'); setTimeout(() => $('.ob-terms')?.classList.remove('shake'), 600);
@@ -726,7 +829,7 @@ async function vHome(_, my) {
   const greet = hr < 5 ? 'Late night vibes' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
   if (!all.length) {
     view().innerHTML = `<div class="page home">
-      <section class="home-hero empty-hero"><div class="hh-bg"></div><div class="hh-txt"><div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div><h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
+      <section class="home-hero empty-hero"><div class="hh-bg"></div>${helpBtn()}<div class="hh-txt"><div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div><h1>${greet}${profile.username && profile.username !== 'Listener' ? ', ' + esc(profile.username) : ''}</h1>
         <p>Bring in your Spotify, Apple Music or YouTube favourites and play them as music videos or audio.</p>
         <div class="row-btns">${bzBtn('primary')}<a class="btn" href="#/search">${icon('search')}Search</a><a class="btn" href="#/import">${icon('import')}Import music</a></div>
         <p class="tiny muted hh-note">You can import any time from Settings → Import music.${sync.available() && !sync.linked() ? ' Already using BAZINGA! somewhere else? <button class="lnk" data-act="enter-code">Link this device</button>.' : ''}</p></div></section></div>`;
@@ -748,7 +851,7 @@ async function vHome(_, my) {
   lists.set('recent', recent.map(t => t.id));
   if (cur) lists.set('cont', [cur.id]);
   view().innerHTML = `<div class="page home">
-    <section class="home-hero">
+    <section class="home-hero">${helpBtn()}
       <div class="hh-bg" ${heroArt ? `style="background-image:url('${esc(sized(heroArt, 300))}')"` : ''}></div>
       <div class="hh-txt">
         <div class="kicker hh-when"><span data-date>${new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}</span><span class="hh-time">${icon('clock')}<time data-clock>${clockText()}</time></span></div>
@@ -788,7 +891,8 @@ async function vHome(_, my) {
 // The BAZINGA! button: one tap builds a fresh mix of new songs from your top artists and genres
 // The bolt is drawn right in the page (no picture file), so it's there instantly every time Home opens —
 // no loading, no flicker — and it follows the theme colour.
-const BOLT_SVG = `<svg class="bz-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="var(--volt)" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="var(--volt-2)"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+// Always the classic Volt yellow bolt, whatever the theme colour.
+const BOLT_SVG = `<svg class="bz-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="#ffd60a" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="#ff9500"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix">${BOLT_SVG}BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
 const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
@@ -1418,7 +1522,7 @@ async function doSearch(q, tab) {
       const el = $(target); if (!el) return;
       el.innerHTML = tracks.length ? `<div class="sec-h"><h2>${icon('yt')} From YouTube</h2>${tab === 'all' && tracks.length >= limit ? '<a class="lnk" href="#/search/youtube">See all</a>' : ''}</div>${rowsFor('s-yt-list', tracks)}` : (tab === 'youtube' ? '<p class="muted">No YouTube results.</p>' : '');
       markNow();
-    } catch (e) { const el = $(target); if (el && alive()) el.innerHTML = tab === 'youtube' ? `<p class="muted">${esc(e.message)}</p>` : ''; }
+    } catch (e) { const el = $(target); if (el && alive()) el.innerHTML = tab === 'youtube' ? `<div class="yt-err-box">${errHTML(e.message, false, 'search')}</div>` : ''; }
   };
   if (tab === 'youtube') return ytPart('#s-main', 20);
   if (tab === 'all') ytPart('#s-yt', 6);
@@ -1484,7 +1588,7 @@ async function importSection() {
     <div class="panel">
       <div class="panel-h">${icon('spotify', 'brand-sp')}<div><h2>From Spotify</h2><p class="muted tiny">Your Liked Songs and every playlist — no account setup, takes about a minute. Uses <b>Exportify</b>, a free, open-source tool that reads your Spotify library (read-only) right in your browser.</p></div></div>
       <ol class="steps">
-        <li><b>Open Exportify</b> below → tap <b>Get Started</b> → log in to Spotify and allow access.</li>
+        <li><b>Open Exportify</b> below (or go to <a class="lnk" href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a>) → tap <b>Get Started</b> → log in to Spotify and allow access.</li>
         <li>Tap <b>Export All</b> to download everything (a <code>.zip</code>), or <b>Export</b> next to just the playlists you want (<code>.csv</code>).</li>
         <li>Come back here and choose the downloaded file. Liked Songs go to your Liked Songs, every playlist comes in as a playlist.</li>
       </ol>
@@ -1772,6 +1876,7 @@ async function addLocalFiles(files, { albumHint } = {}) {
 // Scroll so the section's title sits just under the sticky top bar + section tabs (nothing hidden)
 function jumpToSection(id, smooth) {
   const el = document.getElementById(id), main = $('#main'); if (!el || !main) return;
+  if (el.classList.contains('set-acc')) toggleSetSection(el, true);
   // where the tabs end once they've stuck under the top bar (they sit lower before you scroll)
   const tb = $('.topbar'), topEdge = Math.max(tb && getComputedStyle(tb).display !== 'none' ? tb.getBoundingClientRect().bottom : 0, main.getBoundingClientRect().top);
   const covered = topEdge + ($('.set-jump')?.offsetHeight || 0) - 6;
@@ -1831,11 +1936,13 @@ async function vSettings([section] = []) {
       ${!sync.available() ? `<p class="muted">Device sync works on the online (GitHub Pages) version of BAZINGA!. Here, use <b>Download backup now</b> below and <b>Restore from file</b> on the other device.</p>`
       : sync.linked() ? `<p class="muted">This device is synced. Your library, likes, playlists, albums and name stay the same on every phone, computer and browser you link — no login. To add another, tap <b>Link a device</b> and scan the QR code (another browser on this phone counts as a device too).</p>
         <div id="sync-line">${syncLine()}</div>
+        <div class="sync-devices" id="sync-devices">${devicesHTML()}</div>
         <div class="row-btns"><button class="btn primary" data-act="link-device">${icon('qr')}Link a device</button><button class="btn" data-act="sync-now">${icon('restore')}Sync now</button><button class="btn ghost" data-act="enter-code">I have a code</button></div>
-        <details class="howto"><summary>Stop syncing</summary><div class="row-btns"><button class="btn ghost" data-act="sync-leave">Stop syncing this device</button><button class="btn ghost danger-t" data-act="sync-forget">Turn off sync everywhere</button></div><p class="tiny muted">Synced copies pass through the free ntfy.sh relay, encrypted on your device first. Keep BAZINGA! open on a device now and then (at least every few hours when you've made changes) so your other devices can pick them up.</p><div></div></details>`
+        <details class="howto"><summary>Stop syncing</summary><div class="row-btns"><button class="btn ghost" data-act="sync-leave">Stop syncing this device</button><button class="btn ghost danger-t" data-act="sync-forget">Turn off sync everywhere</button></div><p class="tiny muted">Synced copies pass through the free <a class="lnk" href="https://ntfy.sh" target="_blank" rel="noopener">ntfy.sh</a> relay, encrypted on your device first. Keep BAZINGA! open on a device now and then (at least every few hours when you've made changes) so your other devices can pick them up.</p><div></div></details>`
       : `<p class="muted">Use your music on your phone, computer and every browser — no account, no password. Scan a QR code or open a link on the other device and everything stays in sync automatically. Your library is encrypted on your device before it's sent.</p>
         <div class="row-btns"><button class="btn primary" data-act="link-device">${icon('qr')}Link a device</button><button class="btn" data-act="enter-code">${icon('link')}I have a code or link</button></div>`}
     </div>
+    <div class="panel support-panel" id="support-set">${supportPanelInner()}</div>
     ${imports}
     ${ytPanel}
     <div class="panel" id="playback"><h2>${icon('play')} Playback</h2>
@@ -1846,6 +1953,7 @@ async function vSettings([section] = []) {
       <label class="toggle"><input type="checkbox" id="set-prefoff" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label>
       <label class="toggle"><input type="checkbox" id="set-awake" ${settings.keepAwake !== false ? 'checked' : ''}><span></span><div>Keep the screen on while BAZINGA! is open<small class="tiny muted" style="display:block">Phones stop web music when they lock — this keeps your songs playing.</small></div></label>
       <label class="toggle"><input type="checkbox" id="set-lock" ${settings.lockFeature !== false ? 'checked' : ''}><span></span><div>Screen lock<small class="tiny muted" style="display:block">Shows a lock button (top bar on phones, sidebar on computers), and tapping an empty spot 3 times quickly locks the app so pocket touches and accidental taps do nothing. Tap 3 times again to unlock — the music keeps playing.</small></div></label>
+      <div class="fld out-row"><span>Audio output</span><button class="btn" type="button" data-act="output">${icon('speaker')}<span class="out-name">${esc(outputName())}</span></button></div>
       <button class="btn" data-act="a2hs">${icon('plus')}Add BAZINGA! to your Home Screen</button>
       <p class="tiny muted">Lock screen & background: for now, keep BAZINGA! open to keep the music going — phones pause web players when they lock or you switch apps. Songs with an offline file keep playing. Lock-screen listening is Phase 2: <a class="lnk" href="#/support" data-act="phase2">help us unlock it ☕</a></p>
     </div>
@@ -1874,15 +1982,14 @@ async function vSettings([section] = []) {
       <p class="tiny muted">Backups contain your library, playlists, albums, YouTube matches, profile and settings. Offline music files aren't copied (they're large) — keep the originals and re-add them after a restore.</p>
     </div>
 
-    <div class="panel support-panel">${supportPanelInner()}</div>
 
-    <div class="panel"><h2>${icon('mic')} Lyrics (Genius)</h2>
+    <div class="panel" id="lyrics"><h2>${icon('mic')} Lyrics (Genius)</h2>
       <p class="muted tiny">Lyrics come from Genius's official lyrics widget. If they don't load, add a free Genius access token: open <a class="lnk" href="https://genius.com/api-clients" target="_blank" rel="noopener">genius.com/api-clients</a> → New API Client (any name, any website) → Generate Access Token → paste it here. It's stored only on this device.</p>
       <form id="genius-form" class="stack"><label class="fld"><span>Genius access token (optional)</span><input name="geniusToken" value="${esc(settings.geniusToken || '')}" autocomplete="off"></label><button class="btn">Save</button></form>
     </div>
 
-    <div class="panel"><h2>${icon('yt')} YouTube matching</h2>
-      <p class="muted tiny">By default BAZINGA! finds videos through free public services — no key, no limits, but they're sometimes slow or down. For rock-solid matching add your own free YouTube Data API key (Google Cloud Console → YouTube Data API v3 → Credentials). It's stored only on this device.</p>
+    <div class="panel" id="yt-match"><h2>${icon('yt')} YouTube matching</h2>
+      <p class="muted tiny">By default BAZINGA! finds videos through free public services — no key, no limits, but they're sometimes slow or down. For rock-solid matching add your own free YouTube Data API key (<a class="lnk" href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank" rel="noopener">Google Cloud Console</a> → YouTube Data API v3 → Credentials). It's stored only on this device.</p>
       <form id="yt-form" class="stack">
         <label class="fld"><span>Your YouTube API key (optional)</span><input name="ytKey" value="${esc(settings.ytKey)}" placeholder="AIza…" autocomplete="off"></label>
         <label class="fld"><span>Custom Invidious server (optional)</span><input name="customInstance" value="${esc(settings.customInstance)}" placeholder="https://your-invidious.example"></label>
@@ -1890,17 +1997,18 @@ async function vSettings([section] = []) {
       <button class="btn ghost" data-act="clear-ytcache">Forget all YouTube matches</button>
     </div>
 
-    <div class="panel"><h2>${icon('sparkle')} Music info</h2>
+    <div class="panel" id="music-info"><h2>${icon('sparkle')} Music info</h2>
       <label class="toggle"><input type="checkbox" id="set-enrich" ${settings.enrich !== false ? 'checked' : ''}><span></span>Automatically fill in genres, release dates & artwork</label>
       <label class="fld"><span>Music store region (for search & albums)</span><select id="set-country" class="select">${['US', 'GB', 'CA', 'AU', 'DE', 'FR', 'ES', 'IT', 'NL', 'SE', 'BR', 'MX', 'JP', 'KR', 'IN', 'NG', 'ZA', 'KE', 'ET', 'EG', 'AE', 'TR', 'PL', 'IE', 'NZ'].map(c => `<option ${settings.country === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
       <p class="tiny muted" id="enrich-status"></p>
     </div>
 
-    <div class="panel danger-zone"><h2>${icon('trash')} Erase this device</h2>
+    <div class="panel danger-zone" id="erase"><h2>${icon('trash')} Erase this device</h2>
       <p class="muted">Erases your name, library, playlists, albums, offline files and on-device backups from this browser. ${sync.linked() ? 'Your other synced devices keep their music. ' : ''}A backup file you saved elsewhere is not touched.</p>
       <button class="btn danger" data-act="delete-account">Erase everything here</button></div>
     <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a></p>
   </div>`;
+  settingsAccordions(section);
   $('#pf-file').onchange = async e => { const f = e.target.files[0]; if (!f) return; profile.picture = await imageToDataURL(f, 256); await profileChanged(); rerender(); };
   $('#gcid-form')?.addEventListener('submit', async e => { e.preventDefault(); await saveSettings({ googleClientId: e.target.cid.value.trim() }); await ya.signOut(); toast('Saved — now sign in with YouTube', 'ok'); rerender(); });
   wireImport();
@@ -2242,8 +2350,8 @@ async function ytImportLink(link) {
 }
 
 // ---------- Support (Buy Me a Coffee) ----------
-const supportPanelInner = () => `<h2>${icon('coffee')} Support BAZINGA!</h2><p class="muted tiny">Free, no ads, made by one person. Tips keep it going.</p>${coffeeButton()}`;
-const coffeeButton = (label = 'Buy me a coffee', cls = '') => `<a class="coffee-btn ${cls}" href="${BMC_URL}" target="_blank" rel="noopener">
+const supportPanelInner = () => `<h2>${icon('coffee')} Support BAZINGA!</h2><p class="muted tiny">Free, no ads, no tracking. Every tip keeps BAZINGA! going.</p>${coffeeButton()}`;
+const coffeeButton = (label = 'Buy BAZINGA! a coffee', cls = '') => `<a class="coffee-btn ${cls}" href="${BMC_URL}" target="_blank" rel="noopener">
   <span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>${label}</b><small>buymeacoffee.com/bazinga.app</small></span><span class="cb-shine"></span></a>`;
 async function vSupport() {
   view().innerHTML = `<div class="page support">
@@ -2252,8 +2360,8 @@ async function vSupport() {
       <div class="sup-txt">
         <div class="kicker">Support BAZINGA!</div>
         <h1>Keep the music free ⚡</h1>
-        <p>BAZINGA! has no ads, no subscriptions and no tracking — it's built and kept alive by one person. If it makes your day a little louder, a coffee goes a long way.</p>
-        ${coffeeButton('Buy me a coffee', 'big')}
+        <p>BAZINGA! has no ads, no subscriptions and no tracking — it's kept alive by people like you. If BAZINGA! makes your day a little louder, a coffee goes a long way.</p>
+        ${coffeeButton('Buy BAZINGA! a coffee', 'big')}
         <p class="tiny muted">Payments are handled securely by Buy Me a Coffee. BAZINGA! never sees your card details.</p>
       </div>
       <div class="sup-qr"><div class="qr-card"><img src="icons/bmc-qr.png" alt="QR code for buymeacoffee.com/bazinga.app" width="240" height="240"><span>Scan to tip from your phone</span></div></div>
@@ -2275,7 +2383,23 @@ async function vSupport() {
 const p2GoalHTML = () => '';
 const animateP2 = () => { };
 
-async function phase2Popup({ love = false } = {}) {
+// Any "Buy me a coffee" link (Support page, Settings, footer, popups): when you come back to BAZINGA!
+// afterwards, it asks if you finished and says thank you. (Buy Me a Coffee doesn't tell the app, so it asks.)
+let coffeeAway = 0;
+document.addEventListener('click', e => {
+  const a = e.target.closest?.('a[href*="buymeacoffee.com"]');
+  if (!a || a.closest('.p2-modal')) return; // the coffee popup handles its own return
+  coffeeAway = Date.now();
+}, true);
+const coffeeBack = () => {
+  if (!coffeeAway || document.visibilityState !== 'visible') return;
+  const away = Date.now() - coffeeAway; coffeeAway = 0;
+  if (away < 3000) return; // didn't really leave
+  setTimeout(() => { $('.modal-wrap.out')?.remove(); phase2Popup({ step: 'wait' }); }, 350);
+};
+document.addEventListener('visibilitychange', coffeeBack);
+window.addEventListener('focus', coffeeBack);
+async function phase2Popup({ love = false, step = '' } = {}) {
   const st = (await kv.get('phase2')) || {};
   st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
   // Step 1: a quick "do you love it?" — only people who do are asked for a coffee
@@ -2287,9 +2411,9 @@ async function phase2Popup({ love = false } = {}) {
   const yay = () => `
       <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 24 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['var(--volt)', '#fff', 'var(--volt-2)', 'var(--volt)', '#7cf'][i % 5]}"></i>`).join('')}</div>
       <div class="p2-icon glow">${icon('heartFill')}</div>
-      <h3>You just made my day! 🥹⚡</h3>
-      <p>Hearing you love BAZINGA! honestly means the world. Want to help make it even better? Every coffee turns into new features, faster fixes and more music magic ⚡</p>
-      <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Buy me a coffee</b><small>Make BAZINGA! even better ☕</small></span><span class="cb-shine"></span></a>
+      <h3>You just made BAZINGA!'s day! 🥹⚡</h3>
+      <p>Hearing you love BAZINGA! means the world. Want to help make it even better? Every coffee turns into new features, faster fixes and more music magic ⚡</p>
+      <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Buy BAZINGA! a coffee</b><small>Make BAZINGA! even better ☕</small></span><span class="cb-shine"></span></a>
       <div class="p2-btns"><button class="btn p2-notnow" data-p2="close">Not now</button><button class="btn ghost p2-never" data-p2="never">Don't show this again</button></div>`;
   const sad = () => `<div class="sad-face" aria-label="Sad face">${icon('sad')}</div>`;
   const ask = () => `
@@ -2305,11 +2429,16 @@ async function phase2Popup({ love = false } = {}) {
       <p>Just so you know: until Phase 2, <b>keep BAZINGA! open</b> to keep your music playing. Locking your phone or switching apps will pause it.</p>
       <p class="tiny muted">We'll keep your screen awake while you're in the app${settings.keepAwake === false ? ' (turn it on in Settings → Playback)' : ''}. You can support Phase 2 any time from the ☕ button.</p>
       <button class="btn primary" data-resolve="later">Got it</button>`;
-  const waiting = () => `
+  const waiting = () => step === 'wait' ? `
+      <div class="p2-icon">${icon('coffee')}</div>
+      <h3>Welcome back! ☕</h3>
+      <p class="muted">Did you buy BAZINGA! a coffee?</p>
+      <button class="btn primary" data-p2="thanks">Yes, I did ☕</button>
+      <button class="btn ghost" data-p2="close">Not this time</button>` : `
       <div class="p2-icon spin">${icon('coffee')}</div>
       <h3>Finishing up on Buy Me a Coffee…</h3>
       <p class="muted">Come back here when you're done.</p>
-      <button class="btn primary" data-p2="thanks">I'm done ✓</button>
+      <button class="btn primary" data-p2="thanks">Done ✓</button>
       <button class="btn ghost" data-p2="back">I didn't support this time</button>`;
   const thanks = () => `
       <div class="p2-confetti" aria-hidden="true">${Array.from({ length: 28 }, (_, i) => `<i style="--x:${(i * 37) % 100}%;--d:${(i % 7) * 90}ms;--r:${(i * 53) % 360}deg;--c:${['var(--volt)', '#fff', 'var(--volt-2)', 'var(--volt)', '#7cf'][i % 5]}"></i>`).join('')}</div>
@@ -2327,7 +2456,7 @@ async function phase2Popup({ love = false } = {}) {
   const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
     onMount: (m, close) => {
       m.classList.add('p2-modal');
-      body = m.querySelector('.p2-body'); if (love) show('love', loveQ()); else show('yay', yay());
+      body = m.querySelector('.p2-body'); if (step === 'wait') show('wait', waiting()); else if (love) show('love', loveQ()); else show('yay', yay());
       m.addEventListener('click', e => {
         if (e.target.closest('.p2-support')) {
           st.supportClickedAt = Date.now(); kv.set('phase2', st);
@@ -2356,6 +2485,154 @@ async function phase2Popup({ love = false } = {}) {
   if (onBack) { document.removeEventListener('visibilitychange', onBack); window.removeEventListener('focus', onBack); }
   if (state === 'later') { st.declinedAt = Date.now(); kv.set('phase2', st); }
 }
+// ================= SHORT ERRORS WITH A FIX =================
+// Player/search errors stay one short line, with a button that fixes them right there.
+function errHTML(msg, compact = false, where = 'player') {
+  const retry = where === 'search' ? `<button type="button" class="err-btn" data-act="search-retry">Try Again!</button>` : `<button type="button" class="err-btn" data-p="retry">Try Again!</button>`;
+  const fix = `<a class="err-fix" href="#/settings/yt-match" ${where === 'search' ? '' : 'data-p="fix"'} title="Settings → YouTube matching">${icon('settings')}Fix issue</a>`;
+  if (msg === yt.YT_UNREACHABLE) return `<span class="err-line${compact ? ' compact' : ''}"><span class="err-text"><span class="e-long">${esc(msg)}</span><span class="e-short">Couldn't reach YouTube.</span></span>${retry}${fix}</span>`;
+  if (where === 'player' && (msg === player.NO_MATCH || /^YouTube won/.test(msg))) return `<span class="err-line${compact ? ' compact' : ''}"><span class="err-text">${esc(msg)}</span><button type="button" class="err-btn" data-p="setlink">Set link</button></span>`;
+  return `<span class="err-text">${esc(msg)}</span>`;
+}
+
+// ================= AUDIO OUTPUT (speakers, Bluetooth, AirPlay) =================
+let outLabels = new Map();
+const outputName = () => { const id = player.outputId(); return id ? (outLabels.get(id) || 'Chosen device') : 'This device (system sound)'; };
+const isBT = l => /airpods|beats|buds|bluetooth|headphone|headset|bose|sony|jbl|wh-|wf-|jabra|sennheiser|soundcore|marshall|powerbeats|earbuds|pixel buds|galaxy buds/i.test(l || '');
+function osTip(canAP) {
+  const ua = navigator.userAgent;
+  if (isIOS()) return (canAP ? 'Tap <b>AirPlay &amp; Bluetooth</b> above, or open' : 'Open') + ' Control Center and tap the AirPlay icon on the music card, then pick your headphones.';
+  if (/android/i.test(ua)) return 'Swipe down from the top, tap the <b>output button</b> on the music card (or Quick Settings → Media output), then pick your headphones.';
+  if (/Mac/.test(navigator.platform || ua)) return 'Click <b>Control Center</b> in the menu bar → <b>Sound</b>, then pick your headphones or speaker. It switches instantly, no need to open System Settings.';
+  if (/Win/.test(navigator.platform || ua)) return 'Press <b>Windows + Ctrl + V</b> (Windows 11) or click the speaker icon in the taskbar, then pick your headphones or speaker.';
+  return 'Pick your headphones or speaker in your system\'s sound menu.';
+}
+async function outputSheet() {
+  // Phones and tablets switch every app's sound in one place (the system picker), so they get that instead of a list
+  const mobileOS = isIOS() || /android/i.test(navigator.userAgent);
+  const canPick = player.canPickOutput() && !mobileOS, canSel = player.canSelectOutput() && !mobileOS, canAP = player.canAirPlay();
+  const devs = canPick ? await player.listOutputs() : [];
+  const named = devs.some(d => d.label);
+  outLabels = new Map(devs.filter(d => d.label).map(d => [d.deviceId, d.label.replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, '')]));
+  const cur = player.outputId();
+  const list = devs.filter(d => d.label && d.deviceId !== 'default').map(d => {
+    const name = outLabels.get(d.deviceId);
+    return `<button type="button" class="out-dev ${cur === d.deviceId ? 'on' : ''}" data-resolve="dev:${esc(d.deviceId)}">${icon(isBT(name) ? 'bluetooth' : 'speaker')}<span><b>${esc(name)}</b><small>${isBT(name) ? 'Bluetooth' : 'Speaker'}</small></span>${cur === d.deviceId ? icon('check') : ''}</button>`;
+  }).join('');
+  const ytNow = P.source !== 'local';
+  const r = await modal(`<div class="out-sheet"><h3>${icon('speaker')} Play on…</h3>
+    ${canAP ? `<button type="button" class="btn primary block" data-resolve="airplay">${icon('bluetooth')}AirPlay &amp; Bluetooth</button>` : ''}
+    ${canPick ? `<div class="out-list">
+      <button type="button" class="out-dev ${!cur ? 'on' : ''}" data-resolve="dev:default">${icon('volume')}<span><b>This device</b><small>Follows your system sound output</small></span>${!cur ? icon('check') : ''}</button>
+      ${list}</div>
+      ${!named ? `<button type="button" class="btn block" data-resolve="names">${icon('bluetooth')}Show my headphones &amp; speakers</button><p class="tiny muted">Your browser only shares device names after you allow the microphone once. BAZINGA! closes it straight away and never records.</p>` : ''}
+      ${canSel ? `<button type="button" class="btn block" data-resolve="select">${icon('plus')}Find another device…</button>` : ''}` : ''}
+    <div class="sub-panel out-tip"><b>${icon('yt')} ${ytNow ? 'Playing from YouTube' : 'YouTube songs'}</b><p class="tiny muted">${mobileOS ? 'Your phone sends all of BAZINGA!\'s sound (YouTube and offline songs) to the output you pick in its system menu.' : `YouTube always plays through your system's sound output${canPick ? ' (the list above moves offline songs)' : ''}.`} Quickest way to switch it: ${osTip(canAP)}</p></div>
+  </div>`);
+  if (!r) return;
+  try {
+    if (r === 'airplay') { if (!player.airplay()) toast('AirPlay isn\'t available here', 'err'); return; }
+    if (r === 'names') { await player.unlockOutputNames(); return outputSheet(); }
+    if (r === 'select') { const d = await player.chooseOutput(); toast(`Playing on ${d.label || 'your device'} ⚡`, 'ok'); return; }
+    if (r.startsWith('dev:')) {
+      const id = r.slice(4); await player.setOutput(id);
+      const nm = id === 'default' ? 'this device' : outLabels.get(id) || 'your device';
+      toast(P.source === 'local' || id === 'default' ? `Playing on ${nm} ⚡` : `Offline songs play on ${nm}. YouTube follows your system sound.`, 'ok');
+    }
+  } catch (e) { if (e?.name !== 'AbortError' && e?.name !== 'NotAllowedError') toast(e.message || 'Couldn\'t switch the output', 'err'); else if (e?.name === 'NotAllowedError') toast('Allow the microphone once so the browser can show device names', 'err'); }
+}
+on('output-added', d => { if (!profile) return; toastUndo(`🎧 ${d.label.replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, '')} connected`, () => outputSheet(), 'Play on…'); });
+on('output', () => { const el = $('.out-row .out-name'); if (el) el.textContent = outputName(); $$('[data-p="output"]').forEach(b => b.classList.toggle('on', !!player.outputId())); });
+
+// ================= SETTINGS SECTIONS (open / close) =================
+// Each section is one tidy button (icon, title, one-line description). Tap it and the whole section drops
+// open underneath; tap again and it folds back up, so Settings stays short and easy to scroll.
+const SET_DESC = {
+  sync: 'Same music on every phone, computer and browser. No account needed.',
+  'support-set': 'Free, no ads, no tracking. Help keep BAZINGA! going.',
+  import: 'Spotify, YouTube, Apple Music, CSV files, a pasted list or your own files.',
+  'yt-backup': 'Save your playlists to YouTube and bring them back in.',
+  playback: 'Autoplay, audio output, offline files, screen on and screen lock.',
+  'voice-set': 'Choose the voice BAZINGA! talks with.',
+  backup: 'Automatic backups, backup files and restoring.',
+  lyrics: 'Add a free Genius token if lyrics don\'t load.',
+  'yt-match': 'How BAZINGA! finds videos. Add your own key for rock-solid matching.',
+  'music-info': 'Genres, release dates, artwork and your music store region.',
+  erase: 'Remove your name, music and backups from this browser.'
+};
+const setOpen = new Set(); // which sections are open (kept while you move around the app)
+function settingsAccordions(openId) {
+  const page = $('.settings-page'); if (!page) return;
+  if (openId) setOpen.add(openId);
+  for (const sec of page.querySelectorAll(':scope > .panel, :scope > .set-group')) {
+    const h = sec.querySelector(':scope > h2, :scope > .group-h'); if (!h || !sec.id) continue;
+    const ic = h.querySelector('svg.ic')?.outerHTML || icon('settings');
+    const title = h.textContent.trim();
+    h.remove(); sec.querySelector(':scope > .group-sub')?.remove();
+    const body = document.createElement('div'); body.className = 'sa-body'; body.id = sec.id + '-body'; body.setAttribute('role', 'region');
+    const inner = document.createElement('div'); inner.className = 'sa-inner';
+    inner.append(...sec.childNodes); body.append(inner);
+    const head = document.createElement('button'); head.type = 'button'; head.className = 'sa-head';
+    head.setAttribute('aria-controls', body.id);
+    head.innerHTML = `<span class="sa-ic">${ic}</span><span class="sa-txt"><b>${esc(title)}</b><small>${esc(SET_DESC[sec.id] || '')}</small></span><span class="sa-chev" aria-hidden="true">${icon('down')}</span>`;
+    sec.append(head, body); sec.classList.add('set-acc');
+    const open = setOpen.has(sec.id);
+    sec.classList.toggle('open', open); sec.classList.toggle('settled', open); head.setAttribute('aria-expanded', String(open));
+    head.onclick = () => toggleSetSection(sec);
+  }
+}
+function toggleSetSection(sec, force) {
+  const open = force ?? !sec.classList.contains('open');
+  if (open === sec.classList.contains('open')) return;
+  clearTimeout(sec._settle);
+  sec.classList.remove('settled'); // (contents are clipped while it moves)
+  sec.classList.toggle('open', open);
+  sec.querySelector(':scope > .sa-head')?.setAttribute('aria-expanded', String(open));
+  if (open) { setOpen.add(sec.id); sec._settle = setTimeout(() => sec.classList.add('settled'), 480); }
+  else setOpen.delete(sec.id);
+}
+
+// ================= HELP (Home) =================
+const helpBtn = () => `<button type="button" class="hh-help" data-act="help" aria-label="Help: getting started and questions" title="Help">${icon('help')}</button>`;
+const FAQ = [
+  ['Where does the music come from?', 'BAZINGA! plays each song from YouTube, as the official music video or an audio version. Your library itself is a list of songs saved on your device. Music files you own can play straight from your device, even offline.'],
+  ['How do I bring in my Spotify or Apple Music songs?', 'Go to Settings → Import music. For Spotify, tap <b>Open Exportify</b> (<a class="lnk" href="https://exportify.net" target="_blank" rel="noopener">exportify.net</a>), export everything and choose the downloaded file. For Apple Music, export your library from the Music app on a Mac or PC and drop the file in.'],
+  ['Do I need an account?', 'No. There\'s no login, email or password. Your name, music and settings live on this device. Use <b>Sync your devices</b> in Settings to have them on your phone and computer too.'],
+  ['Why does the music stop when I lock my phone?', 'Phones pause web players when the screen locks or you switch apps. Keep BAZINGA! open (it keeps your screen awake). Songs with an offline file keep playing. Lock-screen listening is coming in Phase 2.'],
+  ['How do I switch between video and audio?', 'In the player, tap <b>Video</b> or <b>Audio</b>. BAZINGA! remembers your choice.'],
+  ['A song plays the wrong video. How do I fix it?', 'Tap ⋯ on the song → <b>Set music video link</b> or <b>Set audio link</b>, then paste a YouTube link or tap <b>Search again automatically</b>.'],
+  ['It says it couldn\'t reach YouTube. What now?', 'Tap <b>Try Again!</b>. The free search services are sometimes busy. For rock-solid matching add your own free YouTube key in Settings → YouTube matching.'],
+  ['How do I play on my Bluetooth headphones?', 'Tap the speaker icon in the player (<b>Play on…</b>). It shows your devices and the quickest way to switch your system sound to them.'],
+  ['How do I install BAZINGA! like an app?', 'Settings → Playback → <b>Add BAZINGA! to your Home Screen</b>. On iPhone: Share → Add to Home Screen.'],
+  ['Is my music backed up?', 'Yes. BAZINGA! saves a backup on this device after every change. In Settings → Backup you can also keep a backup file or download one any time.'],
+  ['Is BAZINGA! free?', 'Yes, with no ads or tracking. If you love it, you can buy BAZINGA! a coffee from the ☕ button.']
+];
+async function helpSheet() {
+  const steps = [
+    ['import', 'Bring in your music', 'Import from Spotify, Apple Music, YouTube, a CSV file, a pasted list or your own music files.', '#/import', 'Import music'],
+    ['play', 'Press play', 'Tap any song, or the BAZINGA! button for a fresh mix of new songs from your favorite artists.', '', ''],
+    ['video', 'Video or audio', 'Watch the music video or switch to Audio in the player. Like songs with ♡ to build your Liked Songs.', '', ''],
+    ['link', 'Take it everywhere', 'Sync your devices with a QR code. No account needed.', '#/settings/sync', 'Sync devices']
+  ];
+  await modal(`<div class="help-sheet">
+    <div class="help-top"><span class="help-ic">${icon('help')}</span><div><h3>Getting started</h3><p class="muted tiny">Four steps and you're listening.</p></div></div>
+    <ol class="help-steps">${steps.map(([ic, h, d, href, lbl], i) => `<li style="--i:${i}"><span class="hs-n">${icon(ic)}</span><div><b>${h}</b><p>${d}</p>${href ? `<a class="btn sm" href="${href}" data-close>${lbl}</a>` : ''}</div></li>`).join('')}</ol>
+    <h4 class="help-faq-h">Frequently asked questions</h4>
+    <div class="faq">${FAQ.map(([q, a], i) => `<div class="faq-i" data-i="${i}"><button type="button" class="faq-q" aria-expanded="false"><span>${q}</span>${icon('down')}</button><div class="faq-a"><div><p>${a}</p></div></div></div>`).join('')}</div>
+    <p class="tiny muted center help-more">Still stuck? Message <a class="lnk" href="https://www.instagram.com/bazinga.app" target="_blank" rel="noopener">@bazinga.app</a> on Instagram.</p>
+  </div>`, {
+    wide: true,
+    onMount: m => {
+      m.classList.add('help-modal');
+      m.addEventListener('click', e => {
+        const q = e.target.closest('.faq-q'); if (!q) return;
+        const it = q.parentElement, open = !it.classList.contains('open');
+        it.classList.toggle('open', open); q.setAttribute('aria-expanded', String(open));
+      });
+    }
+  });
+}
+
 // ================= SHARING =================
 async function shareTracks(kind, name, tracks, artwork) {
   const t = [];
@@ -2387,9 +2664,9 @@ async function trackMenu(btn, id, plId) {
   const k = await menu(btn, [
     { header: `<b>${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
     { k: 'next', label: 'Play next', icon: 'play' },
-    { k: 'queue', label: 'Add to queue', icon: 'queue' },
+    { k: 'like', label: t.liked ? 'Remove from Liked' : 'Add to Liked Songs', icon: t.liked ? 'heartFill' : 'heart' },
     { k: 'addpl', label: 'Add to playlist…', icon: 'plus' },
-    { k: 'like', label: t.liked ? 'Remove from Liked' : 'Add to Liked Songs', icon: 'heart' },
+    { k: 'queue', label: 'Add to queue', icon: 'queue' },
     '-',
     t.album || t.itunesAlbumId ? { k: 'album', label: 'Go to album', icon: 'disc' } : null,
     t.album || t.itunesAlbumId ? { k: 'savealbum', label: 'Save full album', icon: 'plus' } : null,
@@ -2397,7 +2674,7 @@ async function trackMenu(btn, id, plId) {
     { k: 'share', label: 'Share song', icon: 'share' },
     '-',
     { k: 'ytv', label: c.video ? 'Change music video link' : 'Set music video link', icon: 'video' },
-    { k: 'yta', label: c.audio ? 'Change audio link' : 'Set audio link', icon: 'audio' },
+    { k: 'yta', label: c.audio ? 'Change audio link' : 'Set audio link', icon: 'wave' },
     c.video || c.audio ? { k: 'ytopen', label: 'Open on YouTube', icon: 'yt' } : null,
     { k: 'file', label: t.localFileId ? 'Replace offline file' : 'Attach offline file', icon: 'offline' },
     t.localFileId ? { k: 'unfile', label: 'Remove offline file', icon: 'cloudOff' } : null,
@@ -2648,6 +2925,9 @@ function wireGlobal() {
       case 'yt-drop': await ya.dropJob(a.dataset.job); rerender(); break;
       case 'support': e.preventDefault(); phase2Popup(); break;
       case 'phase2': e.preventDefault(); phase2Popup(); break;
+      case 'output': e.preventDefault(); outputSheet(); break;
+      case 'help': e.preventDefault(); helpSheet(); break;
+      case 'search-retry': e.preventDefault(); rerender(); break;
       case 'exportify': openExportify(); break;
       case 'sp-liked': spImportLiked(); break;
       case 'sp-playlists': spChoosePlaylists(); break;
@@ -2702,6 +2982,9 @@ function wireGlobal() {
       case 'link-device': linkDeviceDialog(); break;
       case 'enter-code': { const req = await enterCodeDialog(); if (req) joinFlow(req); break; }
       case 'sync-leave': syncMenu('leave'); break;
+      case 'dev-rename': deviceAction('rename', id); break;
+      case 'dev-pause': deviceAction('pause', id); break;
+      case 'dev-remove': deviceAction('remove', id); break;
       case 'sync-forget': syncMenu('forget'); break;
       case 'sync-now': withSyncProgress('Syncing your music', () => sync.syncNow({ interactive: true })).then(() => { const S = sync.state(); toast(S.cancelled ? 'Sync cancelled' : S.status === 'synced' ? 'Synced ✓' : S.error || 'Sync failed', S.cancelled ? 'info' : S.status === 'synced' ? 'ok' : 'err'); }); break;
       case 'bk-link': try { await backup.linkFile(); rerender(); } catch (err) { if (err.name !== 'AbortError') toast(err.message, 'err'); } break;
@@ -2860,6 +3143,10 @@ function wirePlayerUI() {
     if (k === 'close') closeNP();
     if (k === 'more') { const t = player.current(); if (t) trackMenu(b, t.id); }
     if (k === 'sleep') sleepMenu(b);
+    if (k === 'output') outputSheet();
+    if (k === 'retry') { e.stopPropagation(); P.error = ''; player.reloadCurrent(); }
+    if (k === 'fix') { e.stopPropagation(); closeNP('nav'); location.hash = '#/settings/yt-match'; }
+    if (k === 'setlink') { e.stopPropagation(); const t = player.current(); if (t) db.get('ytcache', t.id).then(c => setYTLink(t, P.mode, c || {})); }
     if (k === 'mute') player.setVolume(P.volume > 0 ? 0 : 0.8);
     if (k === 'artist') { const t = player.current(); if (t) { closeNP('nav'); location.hash = '#/artist/' + encodeURIComponent(mainArtist(t.artist)); } }
     if (k === 'album') { const t = player.current(); if (t) { closeNP('nav'); gotoAlbum(t); } }
@@ -3076,7 +3363,7 @@ function renderPlayer() {
   bar.innerHTML = `<div class="pb-progress"><i></i></div>
     <div class="pb-left" data-p="open">
       ${cover(t.artwork, t.title, 'pb-art')}
-      <div class="pb-meta"><div class="pb-title">${esc(displayTitle(t))}</div><div class="pb-artist">${P.error ? `<span class="err-text">${esc(P.error)}</span>` : esc(t.artist)}</div></div>
+      <div class="pb-meta"><div class="pb-title">${esc(displayTitle(t))}</div><div class="pb-artist">${P.error ? errHTML(P.error, true) : esc(t.artist)}</div></div>
       <button class="ib like ${t.liked && !t.transient ? 'on' : ''}" data-p="like" aria-label="Like">${icon(t.liked && !t.transient ? 'heartFill' : 'heart')}</button>
     </div>
     <div class="pb-center">
@@ -3091,6 +3378,7 @@ function renderPlayer() {
     </div>
     <div class="pb-right hide-sm">
       ${P.source === 'local' ? `<span class="badge">${icon('offline')}Offline file</span>` : modeBtns}
+      <button class="ib out-btn" data-p="output" aria-label="Play on… (speakers, Bluetooth)" title="Play on… (speakers, Bluetooth)">${icon('speaker')}</button>
       <button class="ib ${document.body.classList.contains('queue-open') ? 'on' : ''}" data-p="queue" aria-label="Queue">${icon('queue')}</button>
       <button class="ib" data-p="mute" aria-label="Mute">${icon(P.volume > 0 ? 'volume' : 'mute')}</button>
       <input type="range" class="vol" min="0" max="1" step="0.01" value="${P.volume}" aria-label="Volume">
@@ -3203,14 +3491,14 @@ function renderNP(full = false) {
     setIf(np.querySelector('.np-extra'), npExtra());
     const lk = np.querySelector('.np-info .like'), liked = t.liked && !t.transient;
     if (lk && lk.classList.contains('on') !== !!liked) lk.outerHTML = npLike(t);
-    const err = np.querySelector('.np-err'); err.textContent = P.error || ''; err.hidden = !P.error;
+    const err = np.querySelector('.np-err'); if (err.dataset.e !== (P.error || '')) { err.dataset.e = P.error || ''; err.innerHTML = P.error ? errHTML(P.error) : ''; } err.hidden = !P.error;
     if (qOn) renderQueue(np.querySelector('.np-q-body'));
     renderTime(); placeDock();
     return;
   }
   np.dataset.key = key;
   const keep = { sc: scrollY || 0, q: $('.np-q-body')?.scrollTop || 0 };
-  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><span class="np-head-r"><button class="ib sleep-np" data-p="sleep" aria-label="Sleep timer" title="Sleep timer">${icon('timer')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button></span>`;
+  $('#np-head').innerHTML = `<button class="ib" data-p="close" aria-label="Close">${icon('down')}</button><div class="np-ctx">Now playing</div><button class="ib lock-np" data-act="lock" aria-label="Lock screen" title="Lock screen">${icon('lock')}</button><span class="np-head-r"><button class="ib out-np" data-p="output" aria-label="Play on… (speakers, Bluetooth)" title="Play on… (speakers, Bluetooth)">${icon('speaker')}</button><button class="ib sleep-np" data-p="sleep" aria-label="Sleep timer" title="Sleep timer">${icon('timer')}</button><button class="ib" data-p="more" aria-label="More">${icon('more')}</button></span>`;
   sleepBtn();
   // Layout: the top bar and the video/cover stay put; everything below scrolls on its own.
   // On wide screens the queue is a panel on the right with its own scroll.
@@ -3221,7 +3509,7 @@ function renderNP(full = false) {
         <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
         <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
           <div class="np-side">${npLike(t)}<div class="np-tags np-tags-side">${npTags(t)}</div></div></div>
-        <p class="err-text np-err" ${P.error ? '' : 'hidden'}>${esc(P.error || '')}</p>
+        <p class="np-err" data-e="${esc(P.error || '')}" ${P.error ? '' : 'hidden'}>${P.error ? errHTML(P.error) : ''}</p>
         <div class="np-seek"><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><div class="np-times"><span class="t-now">0:00</span><span class="t-dur">0:00</span></div></div>
         <div class="np-ctrls" data-sig="${P.shuffle}|${P.repeat}">${npCtrls()}</div>
         <div class="np-extra">${npExtra()}</div>

@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v41`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v44`) so phones fetch the new version.
 
 ## Features
 
@@ -35,9 +35,17 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
 
+### New in v1.7
+- **Settings sections fold away**: every section is one button (icon, title, one-line description). Tap it and the whole section drops open underneath; tap again and it folds back up. Section tabs, "Fix issue" links and `#/settings/<section>` open the right one automatically.
+- **Play on… (audio output)**: speaker button in the player (top bar on full screen, next to the queue on computers) and Settings → Playback → Audio output. Lists headphones and speakers (Bluetooth marked) where the browser allows it (Chrome/Edge/Firefox on computers) and moves offline songs there; AirPlay & Bluetooth picker on Safari; a one-line "quickest way to switch" for YouTube, which always plays through the system output. Connecting headphones restarts the sound in place so it moves over straight away.
+- **Next song already loading**: on computers a second, hidden YouTube player buffers the next song in the last 30 s and BAZINGA! swaps to it instantly. Offline files are loaded one song ahead everywhere. Changing the queue (Play next, reorder, shuffle) looks up the new next songs right away.
+- **Short errors with a fix**: "Couldn't reach YouTube search right now." with a **Try Again!** button and a subtle **Fix issue** link to Settings → YouTube matching ("No match" errors get a **Set link** button).
+- **Help on Home**: a grey ? button on the hero card (bottom right on phones and tablets, top left on computers) opens Getting started + Frequently asked questions.
+- Splash: the bolt and the wordmark appear together. Bigger "Support Phase 2" button on computers. Song menu order: Play next, Add to Liked Songs, Add to playlist, Add to queue; "Set audio link" uses a sound-wave icon. Links in text (exportify.net, genius.com/api-clients, Google Cloud Console, ntfy.sh) are styled as links. Sleep-timer icon lights up instantly on phones (no sticky grey tap circle).
+
 ### New in v1.6
-- **Theme colors**: Volt (the original yellow), Mint, Violet, Indigo, Ocean, Cyan, Gold, Sunset, Rose and Crimson. Pick one on the welcome card or in Settings → You. Buttons, glows, the logo bolt, the wordmark shadow, the tab icon and the Home Screen icon all follow it, and it's remembered on the device. (Recolored icons live in `icons/theme/`; `build.py` writes one install manifest per color.)
-- **Splash screen** in your theme color while the app starts, with fun lines under the logo that change every few seconds ("Charging the lightning ⚡", "Warming up the speakers 🔊"…).
+- **Theme colors**: Volt (the original yellow), Mint, Violet, Indigo, Ocean, Cyan, Gold, Sunset, Rose and Crimson. Pick one on the welcome card or in Settings → You. Buttons, glows, the logo bolt, the wordmark shadow, the tab icon and the Home Screen icon all follow it, and it's remembered on the device. (Recolored icons live in `icons/theme/`. The install manifest and app icons keep the same addresses and the service worker answers them in your color, so an installed Android app updates its icon by itself; iPhone sets the icon when you tap Add to Home Screen.)
+- **Splash screen** in your theme color while the app starts. It paints first (background and bolt are part of the page itself; the stylesheet no longer holds up the first paint), stays up at least ~1.8 s and until the app is fully ready, then fades out. The app opens from its saved copy (no waiting on the network), so there's no black screen; updates still arrive through `version.json`. Android's own launch screen uses the transparent bolt on the same dark background, and iPhones get a launch image drawn to match the splash (taken when you tap Add to Home Screen), with fun lines under the logo that change every few seconds ("Charging the lightning ⚡", "Warming up the speakers 🔊"…).
 - **"When the queue finishes"** options evenly spaced.
 - **Sleep timer**: timer icon in the full-screen player's top bar (left of ⋯). 5 min to 1.5 hours, or the end of this song. The music fades out gently and pauses; the icon lights up while it's set and the menu shows the time left.
 - **BAZINGA! button** on Home (replaces "Ask BAZINGA!" there): builds a fresh mix (it plays from the queue; it's only saved as a playlist if you tap + in the queue) of songs you don't have yet from your top 50 artists (taking turns, #1 first), then today's top songs in your top genres. The music starts as soon as the first few artists are in; the rest fills in behind it. New listeners pick favorite genres, then favorite artists (top 10 per genre) first.
@@ -64,7 +72,10 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Live sync between devices**: a like/unlike, playlist change, new song or setting goes to your other devices within seconds, as a small change (usually a few hundred bytes) instead of the whole library; open devices hear about it straight away over a live connection to the relay. The full library is re-sent every couple of hours so devices that were closed catch up.
 - **Continue on another device**: the song, the spot in it and the queue go to your other devices when you pause, switch songs (at most every 3 minutes) or leave the app. A device that isn't playing anything picks it up and offers "Continue … ▶".
 - **Covers**: the song's letter on its own colour shows until the picture arrives, then it fades in; pictures that loaded once show instantly afterwards (remembered, and kept in the offline picture cache).
-- **BAZINGA! button**: the bolt is drawn in the page (no picture to load), so it never flickers when you come back to Home.
+- **BAZINGA! button**: the bolt is drawn in the page (no picture to load), always in the classic Volt yellow, so it never flickers when you come back to Home.
+- **Manage your synced devices** (Settings → Sync your devices): every linked phone, computer and browser with its name and when it was last active. Rename any of them (or go back to the automatic name), pause syncing on one (from any device; it catches up when resumed), or remove one (it stops syncing and keeps its music).
+- **Coffee thank-you everywhere**: after any Buy Me a Coffee link (Support page, Settings, footer), coming back to BAZINGA! asks "Did you buy BAZINGA! a coffee?" and says thank you.
+- **Settings**: the Support card sits right under Sync your devices.
 - **Sync now includes settings and connections**: API keys, tokens, servers, theme, playback options, Spotify/YouTube connections, YouTube playlist links and your taste picks. Each setting remembers when you changed it and the newest change wins. A device that never set something can't wipe it, and removals only spread when you disconnect on purpose.
 - **Voice assistant**: loud chime when it starts listening; music stays silent until the assistant closes; closes after ~3.5 s if it hears nothing; mic buttons show a theme-colored ring while it's open and go back to normal after. iPhone now speaks with the phone's own (Siri-quality) voice instead of Apple's robotic "compact" voices, in one smooth sentence, after switching audio back from "phone call" mode.
 

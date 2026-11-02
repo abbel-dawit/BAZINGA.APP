@@ -66,6 +66,10 @@ const I = {
   moon: '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
   thumbUp: '<path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1z"/><path d="M7 10l4-7a2.5 2.5 0 0 1 3 2.6L13.4 9H19a2 2 0 0 1 2 2.3l-1.3 8A2 2 0 0 1 17.7 21H7"/>',
   thumbDown: '<path d="M17 14V3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1z"/><path d="M17 14l-4 7a2.5 2.5 0 0 1-3-2.6l.6-3.4H5a2 2 0 0 1-2-2.3l1.3-8A2 2 0 0 1 6.3 3H17"/>',
+  wave: '<path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 6v12M23 11v2" stroke-width="2.2"/>',
+  help: '<circle cx="12" cy="12" r="9.5"/><path d="M9.3 9.2a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.5-2.7 4.2"/><circle cx="12" cy="17.6" r="1.1" fill="currentColor" stroke="none"/>',
+  speaker: '<rect x="5" y="2.5" width="14" height="19" rx="2.5"/><circle cx="12" cy="14.5" r="3.6"/><circle cx="12" cy="7" r="1.2" fill="currentColor" stroke="none"/>',
+  bluetooth: '<path d="M7 7l10 10-5 4.5V2.5L17 7 7 17"/>',
   sad: '<circle cx="12" cy="12" r="10"/><path d="M8 16.5c1-1.4 2.4-2.1 4-2.1s3 .7 4 2.1"/><circle cx="8.8" cy="9.6" r="1.1" fill="currentColor"/><circle cx="15.2" cy="9.6" r="1.1" fill="currentColor"/>'
 };
 export const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${I[n] || ''}</svg>`;
@@ -119,12 +123,16 @@ export function applyTheme(name) {
     const m = (img.getAttribute('src') || '').match(/^icons\/(?:theme\/[a-z]+-)?(icon-192|icon-512|app-192|app-512)\.png/);
     if (m) img.setAttribute('src', logoSrc(m[1]));
   });
-  // Tab icon, Home Screen icon (iPhone reads it when you tap "Add to Home Screen") and the install manifest
+  // Tab icon follows the colour right away
   const set = (sel, href) => { const l = document.querySelector(sel); if (l) l.setAttribute('href', href); };
-  set('link[rel="apple-touch-icon"]', logoSrc('apple-touch-icon') + '?v=4');
   set('link[rel="icon"][sizes="32x32"]', logoSrc('favicon-32'));
   set('link[rel="icon"][sizes="16x16"]', logoSrc('favicon-16'));
-  set('link[rel="manifest"]', name === 'volt' ? 'manifest.webmanifest' : `icons/theme/manifest-${name}.webmanifest`);
+  set('link[rel="apple-touch-icon"]', logoSrc('apple-touch-icon')); // iPhone/iPad read this when you tap "Add to Home Screen"
+  // Home Screen / installed-app icon: the icon addresses never change (an installed app only re-checks
+  // the same addresses); the service worker answers them with this colour's icons instead.
+  // Telling the service worker = saving the colour where it can read it.
+  try { caches.open('bz-meta').then(c => c.put('theme', new Response(name))).catch(() => { }); } catch { }
+  try { navigator.serviceWorker?.controller?.postMessage({ theme: name }); } catch { }
   emit('theme', name);
 }
 

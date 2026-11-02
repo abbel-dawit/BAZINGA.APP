@@ -201,6 +201,8 @@ function raceSearch(q, order) {
   });
 }
 
+// Short on purpose: the app shows it with a "Try Again!" button and a "Fix issue" link to Settings → YouTube matching
+export const YT_UNREACHABLE = 'Couldn\'t reach YouTube search right now.';
 const qCache = new Map();
 // preferFree: try free servers before spending API-key quota (used by the Search page while typing)
 export async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
@@ -224,7 +226,7 @@ export async function rawSearch(q, { preferFree = false, prefer = null } = {}) {
     // Free servers all failed: fall back to your key if we skipped it, then the app's backup key
     if (settings.ytKey && preferFree) { try { return await searchViaKey(q); } catch { } }
     if (settings.ownerKey && settings.ownerKey !== settings.ytKey) { try { return await searchViaKey(q, settings.ownerKey); } catch (e) { console.warn('backup key search failed', e); } }
-    throw new Error('Couldn\'t reach YouTube search right now — try again in a moment, or add a free YouTube API key in Settings → YouTube matching.');
+    throw new Error(YT_UNREACHABLE);
   })();
   qCache.set(key, p);
   p.catch(() => qCache.delete(key));
@@ -321,7 +323,7 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
     return save();
   })();
   inflight.set(t.id, p);
-  p.finally(() => inflight.delete(t.id));
+  p.finally(() => inflight.delete(t.id)).catch(() => { }); // (the caller handles the error; this copy mustn't show up as unhandled)
   return p;
 }
 

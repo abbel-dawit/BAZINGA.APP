@@ -6,6 +6,7 @@ import * as yt from './youtube.js';
 import { emit, toast, debounce } from './util.js';
 import { logoSrc } from './ui.js';
 
+export const NO_MATCH = 'No YouTube match for this song.';
 export const P = {
   queue: [],          // [{id, user}]
   origin: '',         // where the queue came from: 'mix' (BAZINGA! button) or '' (a list played as-is)
@@ -23,8 +24,11 @@ export const P = {
   error: ''
 };
 
-const audio = new Audio();
-audio.preload = 'auto';
+// Two audio elements: the one playing, and the next offline song already loaded behind it (no gap between songs)
+let audio = new Audio(), audioNext = new Audio();
+audio.preload = audioNext.preload = 'auto';
+let preLocal = null;       // { tid, url } — the next offline song, loaded and waiting in audioNext
+let ytPre = null, preYT = null; // computers: a second, hidden YouTube player that buffers the next song ({ tid, vid, mode })
 let ytPlayer = null, ytReady = null, tick = null, objUrl = null, loadToken = 0;
 let wantPlay = false;      // the listener wants music playing (used to undo pauses the phone does on its own)
 let resumeAt = 0, resumeFor = null; // where to pick up the restored song after a refresh
@@ -105,13 +109,31 @@ function loadYT() {
   if (ytReady) return ytReady;
   ytReady = new Promise((resolve, reject) => {
     window.onYouTubeIframeAPIReady = () => {
-      ytPlayer = new YT.Player('yt-player', {
+      ytPlayer = makeYT('yt-player', () => { ytPlayer.setVolume(outVol() * 100); markActiveYT(); resolve(ytPlayer); });
+      // Computers: a second player waits behind the first and buffers the next song while this one plays
+      if (dualYT()) {
+        const slot = document.createElement('div'); slot.id = 'yt-player-b';
+        document.getElementById('yt-player')?.parentElement?.appendChild(slot);
+        ytPre = makeYT('yt-player-b', pl => { try { pl.mute(); } catch { } markActiveYT(); });
+      }
+    };
+    const s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    s.onerror = () => { ytReady = null; reject(new Error('Could not load YouTube player (offline?)')); };
+    document.head.appendChild(s);
+  });
+  return ytReady;
+}
+// Both YouTube players are built the same way; only the one that's playing (ytPlayer) drives the app
+function makeYT(elId, onReady) {
+  const pl = new YT.Player(elId, {
         width: '100%', height: '100%',
         // cc_load_policy 0 + unloading the captions module = no subtitles by default
         playerVars: { playsinline: 1, rel: 0, modestbranding: 1, cc_load_policy: 0, iv_load_policy: 3, ...(location.protocol.startsWith('http') ? { origin: location.origin } : {}) },
         events: {
-          onReady: () => { ytPlayer.setVolume(outVol() * 100); resolve(ytPlayer); },
+          onReady: () => onReady(pl),
           onStateChange: e => {
+            if (pl !== ytPlayer) { preState(pl, e.data); return; }
             if (P.source !== 'yt') return;
             if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
             if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
@@ -127,16 +149,66 @@ function loadYT() {
             else if (e.data === YT.PlayerState.BUFFERING) { if (!P.loading) { P.loading = true; changed(); } }
             else if (e.data === YT.PlayerState.CUED && wantPlay) ytPlayer.playVideo();
           },
-          onError: e => ytError(e.data)
+          onError: e => { if (pl === ytPlayer) ytError(e.data); else preYT = null; }
         }
       });
-    };
-    const s = document.createElement('script');
-    s.src = 'https://www.youtube.com/iframe_api';
-    s.onerror = () => { ytReady = null; reject(new Error('Could not load YouTube player (offline?)')); };
-    document.head.appendChild(s);
-  });
-  return ytReady;
+  return pl;
+}
+// ---------- Next song, already loading ----------
+// Computers (not phones/tablets, which only let the player that was tapped make sound) keep a second
+// YouTube player that loads the next song muted in the last 30 s of this one, then swap to it instantly.
+const dualYT = () => {
+  try { return !/iphone|ipad|ipod|android/i.test(navigator.userAgent) && !(navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) && matchMedia('(hover: hover) and (pointer: fine)').matches; } catch { return false; }
+};
+function markActiveYT() {
+  try { ytPlayer?.getIframe?.()?.classList.remove('yt-idle'); ytPre?.getIframe?.()?.classList.add('yt-idle'); } catch { }
+}
+// The waiting player: once the next song starts buffering, hold it paused at the start
+function preState(pl, st) {
+  if (pl !== ytPre || !preYT) return;
+  if (st === 1) { try { pl.pauseVideo(); pl.seekTo(0, true); } catch { } preYT.ready = true; }
+}
+function nextIndex() {
+  if (P.repeat === 'one' || stopAfterSong) return -1;
+  if (P.cursor < P.queue.length - 1) return P.cursor + 1;
+  return P.repeat === 'all' && P.queue.length > 1 ? 0 : -1;
+}
+let preBusy = false;
+async function preloadNext() {
+  if (preBusy) return;
+  const i = nextIndex(); if (i < 0) return;
+  const t = lib.tracks.get(P.queue[i]?.id); if (!t) return;
+  preBusy = true;
+  try {
+    // An offline song: read the file and have it ready to play
+    if (t.localFileId && (P.preferOffline || !navigator.onLine)) {
+      if (preLocal?.tid === t.id) return;
+      const f = await db.get('files', t.localFileId);
+      if (!f?.blob) return;
+      if (preLocal?.url) URL.revokeObjectURL(preLocal.url);
+      const url = URL.createObjectURL(f.blob);
+      preLocal = { tid: t.id, url };
+      audioNext.src = url; audioNext.volume = outVol(); applySink(audioNext);
+      try { audioNext.load(); } catch { }
+      return;
+    }
+    if (!navigator.onLine || !ytPre?.loadVideoById || preYT?.tid === t.id) return;
+    const c = await yt.findForTrack(t, { need: P.mode });
+    const vid = c[P.mode] || c[P.mode === 'video' ? 'audio' : 'video'];
+    if (!vid || !ytPre?.loadVideoById || (preYT?.tid === t.id && preYT.vid === vid)) return;
+    preYT = { tid: t.id, vid, mode: P.mode, ready: false };
+    try { ytPre.mute(); ytPre.loadVideoById(vid); } catch { preYT = null; }
+  } catch { } finally { preBusy = false; }
+}
+// Swap to the player that already holds this song
+function swapYT(id, at) {
+  const old = ytPlayer; ytPlayer = ytPre; ytPre = old; preYT = null;
+  try { old.pauseVideo(); old.mute(); } catch { }
+  markActiveYT();
+  P.source = 'yt'; P.ytId = id; P.loading = true; P.needsTap = false; changed();
+  startedAt = Date.now(); captionsOffFor = null;
+  try { ytPlayer.seekTo(at > 1 ? at : 0, true); ytPlayer.unMute(); ytPlayer.setVolume(outVol() * 100); ytPlayer.playVideo(); } catch { }
+  emit('video-visible', true);
 }
 
 let ytRetried = false, resumeTries = 0, hiddenAt = 0, startedAt = 0, captionsOffFor = null;
@@ -171,7 +243,7 @@ async function ytError(code) {
     ytRetried = true;
     try { const n = await yt.findForTrack(t, { force: true }); const id = n[P.mode] || n[other]; if (id && id !== P.ytId) return startYT(id); } catch { }
   }
-  P.error = 'YouTube won\'t play this one here (code ' + code + '). Set a different link from the ⋯ menu.';
+  P.error = 'YouTube won\'t play this one here.'; console.warn('YouTube error code', code);
   P.loading = false; changed();
   setTimeout(() => { if (P.error) next(); }, 2500);
 }
@@ -189,6 +261,8 @@ function startTick() {
     emit('time', P);
     updatePositionState();
     if (P.playing && ++tickN % 10 === 0) persist(); // remember the spot every ~5 s
+    // Get the next song ready: offline files a few seconds in, YouTube in the last 30 s
+    if (P.playing && P.time > 3 && (P.duration && P.duration - P.time < 30 || nextIsLocal())) preloadNext();
   }, 500);
 }
 
@@ -197,8 +271,12 @@ async function startYT(id, start = 0) {
   P.source = 'yt'; P.ytId = id; P.loading = true; P.needsTap = false; changed();
   startedAt = Date.now(); if (document.hidden) resumeTries = 0;
   const pl = await loadYT();
+  if (preYT?.vid === id) preYT = null; // (it's playing here now)
   pl.loadVideoById(start > 1 ? { videoId: id, startSeconds: start } : id);
+  try { pl.unMute(); } catch { } // the waiting player mutes itself; YouTube remembers that, so always unmute the one playing
   pl.setVolume(outVol() * 100);
+  // Ask YouTube for its best stream (it still adapts to your connection)
+  try { pl.setPlaybackQuality(P.mode === 'video' ? 'hd1080' : 'highres'); } catch { }
   emit('video-visible', true);
   // Some phones (iPhone especially) only let YouTube start after you tap the video itself once.
   // If nothing has started after a few seconds, show the video so one tap starts it.
@@ -229,6 +307,21 @@ async function load(autoplay = true) {
 
   // Offline file first (if user prefers it or we're offline)
   if (t.localFileId && (P.preferOffline || !navigator.onLine)) {
+    if (preLocal?.tid === t.id) {
+      // Already loaded behind the current song: swap and play straight away
+      const old = audio; audio = audioNext; audioNext = old;
+      old.pause(); old.removeAttribute('src'); try { old.load(); } catch { }
+      if (objUrl) URL.revokeObjectURL(objUrl);
+      objUrl = preLocal.url; preLocal = null;
+      P.source = 'local'; P.ytId = null;
+      emit('video-visible', false);
+      try { ytPlayer?.pauseVideo?.(); } catch { }
+      audio.volume = outVol();
+      try { audio.currentTime = at || 0; } catch { }
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      P.loading = false; changed(); startTick();
+      return;
+    }
     const f = await db.get('files', t.localFileId);
     if (my !== loadToken) return;
     if (f?.blob) {
@@ -236,7 +329,8 @@ async function load(autoplay = true) {
       objUrl = URL.createObjectURL(f.blob);
       P.source = 'local'; P.ytId = null;
       emit('video-visible', false);
-      audio.src = objUrl;
+      try { ytPlayer?.pauseVideo?.(); } catch { }
+      audio.src = objUrl; applySink(audio);
       audio.volume = outVol();
       if (at) audio.addEventListener('loadedmetadata', () => { try { audio.currentTime = at; } catch { } }, { once: true });
       if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
@@ -253,9 +347,10 @@ async function load(autoplay = true) {
     if (my !== loadToken) return;
     const id = c[P.mode] || c[P.mode === 'video' ? 'audio' : 'video'];
     if (!t.artwork) store.coverFromVideo(t.id, c.audio || c.video);
-    if (!id) throw new Error('No YouTube match found for this song. Use ⋯ → "Set YouTube link".');
+    if (!id) throw new Error(NO_MATCH);
     if (!c[P.mode]) toast(`No ${P.mode === 'video' ? 'music video' : 'audio upload'} found — playing the other version`);
-    await startYT(id, at);
+    if (preYT && preYT.tid === t.id && preYT.vid === id && ytPre) swapYT(id, at);
+    else await startYT(id, at);
     if (!autoplay) ytPlayer.pauseVideo();
     startTick();
     prefetchNext(my);
@@ -278,6 +373,9 @@ function prefetchNext(my) {
     } })();
   }, 300);
 }
+const nextIsLocal = () => { const i = nextIndex(); const t = i >= 0 && lib.tracks.get(P.queue[i]?.id); return !!(t && t.localFileId && (P.preferOffline || !navigator.onLine)); };
+// The queue changed (Play next, reorder, shuffle): look up the new next songs right away
+const queueChanged = () => { if (current()) prefetchNext(loadToken); };
 // Start looking up a song the moment the pointer rests on it, so tapping it plays right away
 export function prefetch(id) {
   const t = lib.tracks.get(id);
@@ -305,10 +403,12 @@ function ended() {
   if (P.repeat === 'one') { seek(0); play(); return; }
   next(true);
 }
-audio.addEventListener('ended', () => P.source === 'local' && ended());
-audio.addEventListener('play', () => { P.playing = true; if (!tick) startTick(); changed(); });
-audio.addEventListener('pause', () => { if (isRerouting()) return; P.playing = false; changed(); });
-audio.addEventListener('error', () => { if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
+for (const el of [audio, audioNext]) {
+  el.addEventListener('ended', () => el === audio && P.source === 'local' && ended());
+  el.addEventListener('play', () => { if (el !== audio) return; P.playing = true; if (!tick) startTick(); changed(); });
+  el.addEventListener('pause', () => { if (el !== audio || isRerouting()) return; P.playing = false; changed(); });
+  el.addEventListener('error', () => { if (el !== audio) { if (preLocal) { URL.revokeObjectURL(preLocal.url); preLocal = null; } return; } if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
+}
 
 // Play/pause update every button instantly (optimistic); the player then catches up.
 export function play() {
@@ -388,7 +488,7 @@ export function addToQueue(ids, playNext = false) {
   let at = P.cursor + 1;
   if (!playNext) while (at < P.queue.length && P.queue[at].user) at++;
   P.queue.splice(at, 0, ...items);
-  persist(); changed();
+  persist(); changed(); queueChanged();
   toast(ids.length === 1 ? (playNext ? 'Playing next' : 'Added to queue') : `${ids.length} songs added to queue`);
 }
 // Quietly add songs to the end of the queue (used while the BAZINGA! mix is still being built)
@@ -411,7 +511,7 @@ export function moveInQueue(from, to) {
   if (P.cursor === from) P.cursor = to;
   else if (from < P.cursor && to >= P.cursor) P.cursor--;
   else if (from > P.cursor && to <= P.cursor) P.cursor++;
-  persist(); changed();
+  persist(); changed(); queueChanged();
 }
 export function jumpTo(i) { P.cursor = i; load(true); }
 export function clearQueue() { P.queue = P.queue.slice(0, P.cursor + 1); persist(); changed(); }
@@ -423,7 +523,7 @@ export function setShuffle(v) {
     const rest = P.queue.slice(P.cursor + 1).sort(() => Math.random() - 0.5);
     P.queue = [...P.queue.slice(0, P.cursor + 1), ...rest];
   }
-  persist(); changed();
+  persist(); changed(); queueChanged();
 }
 export function cycleRepeat() { P.repeat = { off: 'all', all: 'one', one: 'off' }[P.repeat]; persist(); changed(); }
 export function setVolume(v) { P.volume = v; duckLevel = 1; applyVol(); persist(); changed(); }
@@ -434,7 +534,7 @@ export function duck(on) { duckLevel = on ? 0 : 1; applyVol(); }
 // Switch between music video and audio-only version, keeping position
 export async function setMode(mode) {
   if (mode === P.mode) return;
-  P.mode = mode; persist(); changed();
+  P.mode = mode; preYT = null; persist(); changed(); queueChanged();
   const t = current();
   if (t && P.source === 'yt') {
     const at = P.time, wasPlaying = P.playing;
@@ -486,6 +586,60 @@ function updatePositionState() {
 // Stop everything (used when deleting the account)
 export function stopAll() {
   loadToken++; wantPlay = false; audio.pause(); audio.removeAttribute('src');
-  try { ytPlayer?.stopVideo?.(); } catch { }
+  try { ytPlayer?.stopVideo?.(); ytPre?.stopVideo?.(); } catch { }
+  preYT = null; if (preLocal) { URL.revokeObjectURL(preLocal.url); preLocal = null; } audioNext.removeAttribute('src');
   P.queue = []; P.cursor = -1; P.playing = false; changed();
 }
+
+// ---------- Audio output: speakers, Bluetooth headphones, AirPlay ----------
+// Songs BAZINGA! plays itself (offline files) can be sent to any output the browser lists (setSinkId).
+// YouTube plays inside its own frame, which always uses the system's output, so for YouTube we show the
+// quickest way to switch it on this device (and AirPlay's picker on Apple devices).
+const OUT_KEY = 'bz_out';
+let outId = ''; try { outId = localStorage.getItem(OUT_KEY) || ''; } catch { }
+export const canPickOutput = () => typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype && !!navigator.mediaDevices?.enumerateDevices;
+export const canSelectOutput = () => !!navigator.mediaDevices?.selectAudioOutput;
+export const canAirPlay = () => !!window.WebKitPlaybackTargetAvailabilityEvent && 'webkitShowPlaybackTargetPicker' in HTMLMediaElement.prototype;
+export const outputId = () => outId;
+async function applySink(el) {
+  if (!canPickOutput() || !el) return;
+  try { if ((el.sinkId || '') !== outId) await el.setSinkId(outId); }
+  catch (e) { if (outId && (e.name === 'NotFoundError' || e.name === 'AbortError')) { outId = ''; try { localStorage.removeItem(OUT_KEY); } catch { } } }
+}
+// Every audio output the browser shows (names appear once the browser has allowed the microphone or an output once)
+export async function listOutputs() {
+  try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audiooutput' && d.deviceId !== 'communications'); } catch { return []; }
+}
+export const outputsNamed = async () => (await listOutputs()).some(d => d.label);
+export async function setOutput(id) {
+  outId = !id || id === 'default' ? '' : id;
+  try { if (outId) localStorage.setItem(OUT_KEY, outId); else localStorage.removeItem(OUT_KEY); } catch { }
+  await Promise.all([applySink(audio), applySink(audioNext)]);
+  refreshOutput(); emit('output', outId);
+}
+// Firefox: the browser's own device chooser
+export async function chooseOutput() { const d = await navigator.mediaDevices.selectAudioOutput(); await setOutput(d.deviceId); return d; }
+// Chrome/Edge only share speaker names after the microphone has been allowed once. Opened and closed straight away.
+export async function unlockOutputNames() {
+  const st = await navigator.mediaDevices.getUserMedia({ audio: true });
+  st.getTracks().forEach(t => t.stop());
+  setTimeout(refreshOutput, 300); // headphones go back to full-quality music sound
+}
+// Safari (iPhone, iPad, Mac): Apple's AirPlay / Bluetooth picker
+export function airplay() {
+  const el = audio.src ? audio : (() => { if (!audioNext.src) audioNext.src = 'media/awake.mp4'; return audioNext; })();
+  try { el.webkitShowPlaybackTargetPicker(); return true; } catch { return false; }
+}
+// Headphones connected or disconnected: restart the sound in place so it moves to the new output straight away
+let lastOuts = null;
+async function outputsChanged() {
+  const now = await listOutputs(), ids = new Set(now.map(d => d.deviceId));
+  if (outId && !ids.has(outId)) { outId = ''; try { localStorage.removeItem(OUT_KEY); } catch { } await Promise.all([applySink(audio), applySink(audioNext)]); toast('Audio output disconnected. Playing on this device'); }
+  const added = lastOuts ? now.filter(d => d.label && d.deviceId !== 'default' && !lastOuts.has(d.deviceId)) : [];
+  lastOuts = ids;
+  setTimeout(refreshOutput, 400);
+  if (added.length) emit('output-added', added[0]);
+  emit('output', outId);
+}
+try { navigator.mediaDevices?.addEventListener?.('devicechange', outputsChanged); listOutputs().then(l => { lastOuts = new Set(l.map(d => d.deviceId)); }); } catch { }
+applySink(audio); applySink(audioNext);
