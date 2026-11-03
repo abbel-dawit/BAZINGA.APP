@@ -299,6 +299,17 @@ export function menu(anchor, items) {
 export function closeMenu() { const r = $('#menu-root'); if (r) r.innerHTML = ''; }
 
 // ---------- Filters (genre + release date + sort + text) ----------
+// Popularity score per song (app.js plugs in YouTube views & likes); -1 = not known yet
+let popOf = () => -1;
+export const setPopularity = fn => { popOf = fn; };
+const yrOf = t => t.year || yearOf(t.releaseDate);
+// Year range: "From" and "To" (either can be left on Any); older saved multi-year picks become a range
+export function yearRange(f) {
+  let a = +f.from || 0, b = +f.to || 0;
+  if (!a && !b && f.years?.length) { a = Math.min(...f.years); b = Math.max(...f.years); }
+  if (a && b && a > b) [a, b] = [b, a];
+  return [a, b];
+}
 export function applyFilters(list, f) {
   let out = list;
   if (f.q) {
@@ -307,7 +318,8 @@ export function applyFilters(list, f) {
   }
   if (f.genres?.length) out = out.filter(t => f.genres.includes(genreOf(t)));
   const y = t => t.year || yearOf(t.releaseDate);
-  if (f.years?.length) out = out.filter(t => f.years.includes(y(t)));
+  const [ya, yb] = yearRange(f);
+  if (ya || yb) out = out.filter(t => { const v = yrOf(t); return v && (!ya || v >= ya) && (!yb || v <= yb); });
   if (f.liked) out = out.filter(t => t.liked);
   if (f.offline) out = out.filter(t => t.localFileId);
   const by = {
@@ -317,8 +329,13 @@ export function applyFilters(list, f) {
     artist: (a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
     newest: (a, b) => (b.releaseDate || String(y(b) || '')).localeCompare(a.releaseDate || String(y(a) || '')),
     oldest: (a, b) => (y(a) || 9999) - (y(b) || 9999) || (a.releaseDate || '').localeCompare(b.releaseDate || ''),
-    album: (a, b) => (a.album || '').localeCompare(b.album || '') || (a.trackNumber || 0) - (b.trackNumber || 0)
+    album: (a, b) => (a.album || '').localeCompare(b.album || '') || (a.trackNumber || 0) - (b.trackNumber || 0),
+    popular: null
   }[f.sort];
+  if (f.sort === 'popular') { // most → least; songs without numbers yet keep their order at the bottom
+    const sc = new Map(out.map(t => [t.id, popOf(t.id)]));
+    return [...out].sort((a, b) => sc.get(b.id) - sc.get(a.id));
+  }
   if (by) out = [...out].sort(by);
   return out;
 }
@@ -333,10 +350,12 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
   const ym = new Map();
   for (const t of tracks) { const y = t.year || yearOf(t.releaseDate); if (y) ym.set(y, (ym.get(y) || 0) + 1); }
   const years = [...ym.entries()].sort((a, b) => b[0] - a[0]);
-  const active = (f.genres?.length || 0) + (f.years?.length || 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  const [ya, yb] = yearRange(f);
+  const active = (f.genres?.length || 0) + (ya || yb ? 1 : 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  const yAsc = years.map(([y]) => y).sort((a, b) => a - b);
   // Sort options open as an on-screen panel, just like Filters (no system picker)
   const sortOpts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
-    ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
+    ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['popular', 'Most popular'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
   const curSort = sortOpts.find(([v]) => v === (f.sort || '')) || sortOpts.find(([v]) => v === 'added');
   return `<div class="filters">
     <div class="filter-top">
@@ -352,8 +371,12 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
         ${genres.length ? genres.map(([g, n]) => `<button class="chip ${f.genres?.includes(g) ? 'on' : ''}" data-act="f-genre" data-g="${esc(g)}">${esc(g)} <small>${n}</small></button>`).join('') : '<span class="muted">Genres appear as songs get matched.</span>'}
       </div></div>
-      ${years.length ? `<div class="fp-sec"><div class="fp-h">Year <span class="fp-note">pick one or more</span></div>
-        <div class="chips years-chips">${years.map(([y, n]) => `<button class="chip ${f.years?.includes(y) ? 'on' : ''}" data-act="f-year" data-y="${y}" aria-pressed="${!!f.years?.includes(y)}">${y} <small>${n}</small></button>`).join('')}</div>
+      ${years.length ? `<div class="fp-sec"><div class="fp-h">Year</div>
+        <div class="year-range">
+          <label class="yr"><span>From</span><select class="select" data-f="from" aria-label="From year"><option value="">Any</option>${yAsc.map(y => `<option value="${y}" ${ya === y ? 'selected' : ''}>${y}</option>`).join('')}</select></label>
+          <span class="yr-dash" aria-hidden="true">–</span>
+          <label class="yr"><span>To</span><select class="select" data-f="to" aria-label="To year"><option value="">Any</option>${yAsc.map(y => `<option value="${y}" ${yb === y ? 'selected' : ''} ${ya && y < ya ? 'disabled' : ''}>${y}</option>`).join('')}</select></label>
+        </div>
       </div>` : ''}
       <div class="fp-sec"><div class="chips">
         <button class="chip ${f.liked ? 'on' : ''}" data-act="f-flag" data-k="liked">${icon('heart')}Liked only</button>

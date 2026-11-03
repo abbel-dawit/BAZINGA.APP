@@ -1,7 +1,7 @@
 // BAZINGA — app shell, router and views
 import { db, kv } from './db.js';
 import { $, $$, esc, on, emit, toast, debounce, fmtTime, fmtDur, imageToDataURL, mainArtist, norm, trackKey, albumKey, yearOf, packToString, unpackString, sleep, downloadBlob, uid, displayTitle, genreOf } from './util.js';
-import { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, filterBar, empty, likedCover, loader, sized, toastUndo, THEMES, applyTheme, currentTheme, logoSrc } from './ui.js';
+import { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, setPopularity, filterBar, empty, likedCover, loader, sized, toastUndo, THEMES, applyTheme, currentTheme, logoSrc } from './ui.js';
 import { initVoice, openVoice, canListen, voiceOptions, setVoicePrefs, previewVoice, setWake, wakeSupported } from './voice.js';
 import * as store from './store.js';
 import { lib } from './store.js';
@@ -22,7 +22,7 @@ const lists = new Map();      // listKey -> [trackIds] for "play from here"
 const sections = new Map();   // sectionKey -> {tracks, opts}
 const fstate = {};            // sectionKey -> filter state
 let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
-export const APP_VERSION = 'v1.1';
+export const APP_VERSION = 'v1.7.3'; // shown at the bottom of Settings — bump with each release
 const APP_TAGLINE = 'Music Made For You';
 const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
 let profile = null;
@@ -318,6 +318,7 @@ function applySettings() {
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
   store.setEnrich(settings.enrich !== false);
+  player.setAutoResume(settings.autoResume !== false);
   keepAwake();
 }
 
@@ -503,7 +504,7 @@ async function showApp() {
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
     openNP: () => openNP(), closeNP: () => closeNP(), lyrics: on => setLyrics(on), toast
   });
-  route().finally(() => hideSplash());
+  route().finally(() => { hideSplash(); setTimeout(() => player.resumeLast(), 2000); }); // carry on with the music if it was playing when you left
   (window.requestIdleCallback || (f => setTimeout(f, 2500)))(iosStartupImage);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
@@ -591,15 +592,22 @@ const isInstalled = async () => isStandalone() || !!((await kv.get('a2hs')) || {
 // (if it lands on an Add to Home Screen visit, it follows right after that popup).
 async function launchPopups() {
   const { n, fresh } = await countLaunch();
-  if (!fresh || !profile || $('.modal-wrap') || document.body.classList.contains('np-open')) return;
+  // "Help BAZINGA! get to Phase 2": every 7th time the app is loaded (reloads count), until "Don't show this again"
+  const loads = ((await kv.get('loads')) || 0) + 1; await kv.set('loads', loads);
+  const cof0 = (await kv.get('phase2')) || {};
+  const wantP2 = !cof0.never && (loads % 7 === 0 || cof0.p2pending);
+  const busy = () => !profile || $('.modal-wrap') || $('#mix-ov') || document.body.classList.contains('np-open');
+  if (!fresh || busy()) { if (wantP2) { if (busy()) { cof0.p2pending = true; await kv.set('phase2', cof0); } else showP2(cof0); } return; }
   const a2 = (await kv.get('a2hs')) || {}, cof = (await kv.get('phase2')) || {};
   const wantA2 = !a2.never && !(await isInstalled()) && (n === 1 || n % 5 === 0);
   const wantCoffee = !cof.never && (n % 10 === 0 || (cof.pending && n > 1));
   if (wantA2) await maybeInstallPrompt();
-  if (!wantCoffee) return;
+  if (!wantCoffee) { if (wantP2) { if (wantA2 || busy()) { cof.p2pending = true; await kv.set('phase2', cof); } else showP2(cof); } return; }
+  if (wantP2) { cof.p2pending = true; } // (the love popup comes first; Phase 2 waits for the next load)
   cof.pending = false; await kv.set('phase2', cof);
   setTimeout(() => { if (!$('.modal-wrap') && !$('#mix-ov')) phase2Popup({ love: true }); else { cof.pending = true; kv.set('phase2', cof); } }, wantA2 ? 700 : 0);
 }
+async function showP2(st) { st.p2pending = false; await kv.set('phase2', st); phase2Popup({ ask: true }); }
 async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
   const st = (await kv.get('a2hs')) || {};
@@ -697,7 +705,7 @@ const showLegal = () => modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3>
 // Browser tab title: "BAZINGA! - <page>"
 const setTitle = x => { document.title = 'BAZINGA! - ' + (x || APP_TAGLINE); };
 const TITLES = { new: 'New from your top artists', home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
-const LIB_TABS = { songs: 'Songs', liked: 'Liked Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
+const LIB_TABS = { liked: 'Liked Songs', songs: 'Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
 // Where "Back" goes when there's no in-app history (e.g. a shared link opened directly)
 const BACK_TO = { new: ['#/home', 'Home'], artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
 const navStack = [];
@@ -715,7 +723,7 @@ async function route() {
   if (navStack.length > 50) navStack.shift();
   const h = location.hash.replace(/^#\/?/, '') || 'home';
   const [name, ...rest] = h.split('/');
-  setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'songs'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
+  setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'liked'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
   const arg = rest.map(decodeURIComponent);
   lists.clear(); sections.clear(); pagers.clear();
   $('#main')?.removeEventListener('scroll', settingsSpy);
@@ -754,7 +762,7 @@ async function route() {
 }
 function backLabel(hash) {
   const [n, a] = hash.replace(/^#\/?/, '').split('/');
-  if (n === 'library') return LIB_TABS[a || 'songs'] || 'Library';
+  if (n === 'library') return LIB_TABS[a || 'liked'] || 'Library';
   if (n === 'artist') return decodeURIComponent(a || 'Artist');
   if (n === 'playlist') return lib.playlists.get(a)?.name || 'Playlist';
   if (n === 'album') return 'Album';
@@ -770,14 +778,30 @@ const rerender = debounce(() => {
 
 // ================= TRACK LIST SECTIONS =================
 const PAGE = 150;
+// Filters & sort are remembered on this device, per list, so they're still set when you come back
+const FKEEP = ['sort', 'genres', 'years', 'liked', 'offline', 'q', 'from', 'to', 'open'];
+// (only lists that are always the same list: Liked Songs, Songs, Offline and each playlist — not album/artist/genre pages)
+const FREMEMBER = new Set(['liked', 'songs', 'offline', 'pl']);
+const fmemKey = (key, f) => key === 'pl' ? 'pl:' + (f?._id || '') : key;
+let fmem = {}; try { fmem = JSON.parse(localStorage.getItem('bz_filters') || '{}') || {}; } catch { }
+function saveFilters(key) {
+  const f = fstate[key]; if (!f || !FREMEMBER.has(key)) return;
+  const keep = {}; for (const k of FKEEP) if (f[k] !== undefined && f[k] !== '' && !(Array.isArray(f[k]) && !f[k].length) && f[k] !== false) keep[k] = f[k];
+  const mk = fmemKey(key, f);
+  if (Object.keys(keep).length) fmem[mk] = keep; else delete fmem[mk];
+  const ks = Object.keys(fmem); if (ks.length > 60) delete fmem[ks[0]];
+  try { localStorage.setItem('bz_filters', JSON.stringify(fmem)); } catch { }
+}
+const savedFilters = mk => { const m = fmem[mk]; return m ? JSON.parse(JSON.stringify(m)) : null; };
 function tracksSection(key, tracks, opts = {}) {
   sections.set(key, { tracks, opts });
-  fstate[key] = fstate[key] || { sort: opts.defaultSort ?? 'added', open: false };
+  fstate[key] = fstate[key] || { sort: opts.defaultSort ?? 'added', open: false, ...(key !== 'pl' && FREMEMBER.has(key) ? savedFilters(key) || {} : {}) };
   return `<div class="tsec" data-tsec="${key}">${tracksSectionInner(key)}</div>`;
 }
 function tracksSectionInner(key) {
   const { tracks, opts } = sections.get(key);
   const f = fstate[key];
+  if (!opts.noFilter && f.sort === 'popular') popKick(key, tracks);
   const shown = opts.noFilter ? tracks : applyFilters(tracks, f);
   lists.set(key, shown.map(t => t.id));
   const cur = player.current()?.id;
@@ -787,7 +811,25 @@ function tracksSectionInner(key) {
   const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
   return head + count + `<div class="rows">${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
 }
+// "Most popular": numbers load once from the device (fast), then missing views/likes fill in quietly in the
+// background; the list re-sorts itself at most every few seconds while they arrive.
+setPopularity(yt.popularity);
+let popLoaded = false, popRefreshT = 0, popLastRefresh = 0;
+const popRefresh = () => {
+  clearTimeout(popRefreshT);
+  popRefreshT = setTimeout(() => {
+    if (isTyping() || ($('#main')?.scrollTop || 0) > 1500 || $('.menu, .modal-wrap')) return popRefresh(); // (never re-sort under someone reading far down or using a menu)
+    popLastRefresh = Date.now();
+    for (const [k, f] of Object.entries(fstate)) if (f.sort === 'popular' && sections.has(k) && document.querySelector(`[data-tsec="${k}"]`)) refreshSection(k, true);
+  }, Math.max(400, 4000 - (Date.now() - popLastRefresh)));
+};
+function popKick(key, tracks) {
+  if (!popLoaded) { yt.loadPopularity().then(() => { popLoaded = true; popRefresh(); }); }
+  const ids = tracks.map(t => t.id);
+  (window.requestIdleCallback || (f => setTimeout(f, 300)))(() => yt.wantStats(ids, popRefresh));
+}
 function refreshSection(key, keepFocus) {
+  saveFilters(key);
   const el = $(`[data-tsec="${key}"]`); if (!el) return;
   const active = document.activeElement?.dataset?.f;
   const pos = document.activeElement?.selectionStart;
@@ -860,7 +902,7 @@ async function vHome(_, my) {
         <div class="row-btns">
           ${bzBtn('primary')}
           ${liked.length ? `<button class="btn" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
-          <button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>
+          ${liked.length ? `<button class="btn" data-act="play-list" data-id="home-liked" data-shuffle="1">${icon('shuffle')}Shuffle Liked Songs</button>` : `<button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>`}
         </div>
       </div>
       ${collage.length >= 2 ? `<div class="hh-collage">${collage.map((src, i) => `<img src="${esc(sized(src, 300))}" alt="" style="--i:${i}" loading="lazy">`).join('')}</div>` : ''}
@@ -1222,9 +1264,9 @@ async function vGenre([g]) {
 }
 
 // ---------- LIBRARY ----------
-async function vLibrary([tab = 'songs']) {
+async function vLibrary([tab = 'liked']) {
   const all = store.saved();
-  const tabs = [['songs', 'Songs', all.length], ['liked', 'Liked', all.filter(t => t.liked).length], ['playlists', 'Playlists', lib.playlists.size], ['albums', 'Albums', lib.albums.size + store.implicitAlbums().length], ['artists', 'Artists', store.artists().length]];
+  const tabs = [['liked', 'Liked', all.filter(t => t.liked).length], ['songs', 'Songs', all.length], ['playlists', 'Playlists', lib.playlists.size], ['albums', 'Albums', lib.albums.size + store.implicitAlbums().length], ['artists', 'Artists', store.artists().length]];
   let body = '';
   if (tab === 'songs' || tab === 'liked') {
     const tracks = tab === 'liked' ? all.filter(t => t.liked) : all;
@@ -1311,7 +1353,7 @@ async function vPlaylist([id]) {
   const tracks = p.trackIds.map(i => lib.tracks.get(i)).filter(Boolean);
   setTitle(p.name);
   const dur = tracks.reduce((s, t) => s + (t.durationMs || 0), 0);
-  fstate['pl'] = fstate['pl'] && fstate['pl']._id === id ? fstate['pl'] : { sort: '', open: false, _id: id };
+  fstate['pl'] = fstate['pl'] && fstate['pl']._id === id ? fstate['pl'] : { sort: '', open: false, ...(savedFilters('pl:' + id) || {}), _id: id };
   view().innerHTML = `<div class="page">
     ${header(esc(p.name), `${esc(profile.username)} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${p.source ? ' · from ' + esc(p.source) : ''}`, cover(plCover(p), p.name), '', 'Playlist')}
     <div class="actions">${playBtns('play-list', 'pl')}
@@ -1950,6 +1992,7 @@ async function vSettings([section] = []) {
         ${[['liked', 'Play Liked Songs'], ['replay', 'Replay the queue'], ['off', 'Stop']].map(([v, l]) => `<label><input type="radio" name="autoplay" value="${v}" ${(settings.autoplay || 'liked') === v ? 'checked' : ''}><span>${l}</span></label>`).join('')}
       </div></div>
       <p class="tiny muted">Autoplay keeps the music going: after the last song it starts your Liked Songs (shuffled), or plays the same queue again from the top. If the queue already was your Liked Songs, it replays them.</p>
+      <label class="toggle"><input type="checkbox" id="set-autoresume" ${settings.autoResume !== false ? 'checked' : ''}><span></span><div>Keep playing when you come back<small class="tiny muted" style="display:block">Leave BAZINGA! (or close it) while music plays, and it carries on where it was when you return.</small></div></label>
       <label class="toggle"><input type="checkbox" id="set-prefoff" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label>
       <label class="toggle"><input type="checkbox" id="set-awake" ${settings.keepAwake !== false ? 'checked' : ''}><span></span><div>Keep the screen on while BAZINGA! is open<small class="tiny muted" style="display:block">Phones stop web music when they lock — this keeps your songs playing.</small></div></label>
       <label class="toggle"><input type="checkbox" id="set-lock" ${settings.lockFeature !== false ? 'checked' : ''}><span></span><div>Screen lock<small class="tiny muted" style="display:block">Shows a lock button (top bar on phones, sidebar on computers), and tapping an empty spot 3 times quickly locks the app so pocket touches and accidental taps do nothing. Tap 3 times again to unlock — the music keeps playing.</small></div></label>
@@ -2006,7 +2049,7 @@ async function vSettings([section] = []) {
     <div class="panel danger-zone" id="erase"><h2>${icon('trash')} Erase this device</h2>
       <p class="muted">Erases your name, library, playlists, albums, offline files and on-device backups from this browser. ${sync.linked() ? 'Your other synced devices keep their music. ' : ''}A backup file you saved elsewhere is not touched.</p>
       <button class="btn danger" data-act="delete-account">Erase everything here</button></div>
-    <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a></p>
+    <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a><br><span class="app-ver">BAZINGA! ${APP_VERSION}</span></p>
   </div>`;
   settingsAccordions(section);
   $('#pf-file').onchange = async e => { const f = e.target.files[0]; if (!f) return; profile.picture = await imageToDataURL(f, 256); await profileChanged(); rerender(); };
@@ -2015,9 +2058,11 @@ async function vSettings([section] = []) {
   $$('#set-autoplay input').forEach(i => i.onchange = () => saveSettings({ autoplay: i.value }));
   $$('.ah-theme [data-theme]').forEach(b => b.onclick = async () => {
     const k = b.dataset.theme; markThemePicks(k); await saveSettings({ theme: k });
-    toast(`${THEMES.find(t => t[0] === k)[1]} it is ⚡`, 'ok');
+    const nm = THEMES.find(t => t[0] === k)[1];
+    toast(isStandalone() ? (isIOS() ? `${nm} it is ⚡ iPhone keeps the Home Screen icon from when BAZINGA! was added.` : `${nm} it is ⚡ Your Home Screen icon switches too the next time your phone checks for app updates.`) : `${nm} it is ⚡`, 'ok');
   });
   $('#set-prefoff').onchange = e => player.setPreferOffline(e.target.checked);
+  $('#set-autoresume').onchange = e => { saveSettings({ autoResume: e.target.checked }); player.setAutoResume(e.target.checked); };
   $('#set-lock').onchange = e => { saveSettings({ lockFeature: e.target.checked }); applyLockSetting(); toast(e.target.checked ? 'Screen lock is on — tap 3 times or use the lock button' : 'Screen lock is off', e.target.checked ? 'ok' : 'info'); };
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
@@ -2399,7 +2444,7 @@ const coffeeBack = () => {
 };
 document.addEventListener('visibilitychange', coffeeBack);
 window.addEventListener('focus', coffeeBack);
-async function phase2Popup({ love = false, step = '' } = {}) {
+async function phase2Popup({ love = false, step = '', ask: askFirst = false } = {}) {
   const st = (await kv.get('phase2')) || {};
   st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
   // Step 1: a quick "do you love it?" — only people who do are asked for a coffee
@@ -2418,7 +2463,7 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   const sad = () => `<div class="sad-face" aria-label="Sad face">${icon('sad')}</div>`;
   const ask = () => `
       <div class="kicker">Phase 2 ⚡ Lock-screen listening</div>
-      <h3>Help unlock music on your lock screen</h3>
+      <h3>Help BAZINGA! get to Phase 2</h3>
       <p>Right now your phone pauses BAZINGA! when the screen locks or you leave the app. To let everyone enjoy music and streams on the lock screen, BAZINGA! needs a music license — and that's what Phase 2 is for.</p>
       ${p2GoalHTML()}
       <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Support Phase 2</b><small>Every coffee counts ☕</small></span><span class="cb-shine"></span></a>
@@ -2456,7 +2501,7 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
     onMount: (m, close) => {
       m.classList.add('p2-modal');
-      body = m.querySelector('.p2-body'); if (step === 'wait') show('wait', waiting()); else if (love) show('love', loveQ()); else show('yay', yay());
+      body = m.querySelector('.p2-body'); if (step === 'wait') show('wait', waiting()); else if (love) show('love', loveQ()); else if (askFirst) show('ask', ask()); else show('yay', yay());
       m.addEventListener('click', e => {
         if (e.target.closest('.p2-support')) {
           st.supportClickedAt = Date.now(); kv.set('phase2', st);
@@ -2485,6 +2530,9 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   if (onBack) { document.removeEventListener('visibilitychange', onBack); window.removeEventListener('focus', onBack); }
   if (state === 'later') { st.declinedAt = Date.now(); kv.set('phase2', st); }
 }
+// Coming back to BAZINGA!: the browser wants a tap before the music can carry on
+on('resume-blocked', () => { if (!$('#toasts .resume-t')) { toastUndo('Tap anywhere to keep listening', () => player.play(), '▶ Play'); setTimeout(() => $('#toasts .toast:last-child')?.classList.add('resume-t'), 0); } });
+
 // ================= SHORT ERRORS WITH A FIX =================
 // Player/search errors stay one short line, with a button that fixes them right there.
 function errHTML(msg, compact = false, where = 'player') {
@@ -2901,7 +2949,7 @@ function wireGlobal() {
       case 'f-genre': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const g = a.dataset.g; f.genres = f.genres?.includes(g) ? f.genres.filter(x => x !== g) : [...(f.genres || []), g]; refreshSection(key); break; }
       case 'f-year': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const y = +a.dataset.y; f.years = f.years?.includes(y) ? f.years.filter(x => x !== y) : [...(f.years || []), y]; refreshSection(key); break; }
       case 'f-flag': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key][a.dataset.k] = !fstate[key][a.dataset.k]; refreshSection(key); break; }
-      case 'f-clear': { const key = a.closest('[data-tsec]').dataset.tsec; Object.assign(fstate[key], { genres: [], years: [], liked: false, offline: false, q: '' }); refreshSection(key); break; }
+      case 'f-clear': { const key = a.closest('[data-tsec]').dataset.tsec; Object.assign(fstate[key], { genres: [], years: [], from: '', to: '', liked: false, offline: false, q: '' }); refreshSection(key); break; }
       case 'new-playlist': { const n = await promptText('New playlist', '', 'Name', 'Create'); if (n) { const p = await store.createPlaylist(n); renderSidebarPlaylists(); location.hash = '#/playlist/' + p.id; } break; }
       case 'playlist-menu': playlistMenu(a, id); break;
       case 'share-playlist': { const p = lib.playlists.get(id); shareTracks('playlist', p.name, p.trackIds.map(x => lib.tracks.get(x)).filter(Boolean), plCover(p)); break; }
@@ -3022,7 +3070,8 @@ function wireGlobal() {
     const f = e.target.dataset.f; if (!f) return;
     const key = e.target.closest('[data-tsec]')?.dataset.tsec; if (!key) return;
     fstate[key][f] = e.target.value;
-    if (f === 'q' || f === 'from' || f === 'to') debouncedRefresh(key);
+    if (f === 'from' || f === 'to') { delete fstate[key].years; refreshSection(key); return; }
+    if (f === 'q') debouncedRefresh(key);
     else refreshSection(key);
   });
   document.addEventListener('change', e => {
@@ -3072,6 +3121,11 @@ function wireGlobal() {
   // Re-place the video on any size change (window, phone rotation, browser bars)
   const schedulePlace = () => requestAnimationFrame(() => requestAnimationFrame(placeDock));
   window.addEventListener('resize', schedulePlace);
+  // Turning the phone: the browser reports the new size before the new layout has settled, so place it again a few times
+  const afterTurn = () => { schedulePlace(); [120, 300, 600, 1000].forEach(ms => setTimeout(placeDock, ms)); };
+  window.addEventListener('orientationchange', afterTurn);
+  screen.orientation?.addEventListener?.('change', afterTurn);
+  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); new MutationObserver(() => { const sl = $('#np-slot'); if (sl && !sl._ro) { sl._ro = 1; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
   window.visualViewport?.addEventListener('resize', schedulePlace);
   if ('ResizeObserver' in window) new ResizeObserver(schedulePlace).observe($('#np'));
   // Yellow fill on every slider as it moves
@@ -3596,7 +3650,7 @@ function placeDock() {
   const slot = document.body.classList.contains('np-open') ? $('#np-slot') : null;
   if (slot) {
     const r = slot.getBoundingClientRect();
-    const st = dock.style, L = Math.round(r.left + scrollX) + 'px', T = Math.round(r.top + scrollY) + 'px', W = r.width + 'px', H = r.height + 'px';
+    const st = dock.style, L = (r.left + scrollX) + 'px', T = (r.top + scrollY) + 'px', W = r.width + 'px', H = r.height + 'px'; // exact, so the video sits flush in its frame
     if (st.left !== L || st.top !== T || st.width !== W || st.height !== H) Object.assign(st, { left: L, top: T, width: W, height: H, right: 'auto', bottom: 'auto' });
     dock.classList.add('in-np');
   } else if (dock.classList.contains('in-np') || dock.hasAttribute('style')) {

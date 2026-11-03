@@ -519,7 +519,7 @@ async function answer(q) {
   return decide(p.action, [q], { shuffle: p.opts.shuffle });
 }
 
-const PAGES = { home: '#/home', library: '#/library/songs', songs: '#/library/songs', 'liked songs': '#/library/liked', likes: '#/library/liked', liked: '#/library/liked', playlists: '#/library/playlists', albums: '#/library/albums', artists: '#/library/artists', search: '#/search', settings: '#/settings', import: '#/import', offline: '#/offline', queue: '#/queue', 'privacy policy': '#/legal', terms: '#/legal' };
+const PAGES = { home: '#/home', library: '#/library/liked', songs: '#/library/songs', 'liked songs': '#/library/liked', likes: '#/library/liked', liked: '#/library/liked', playlists: '#/library/playlists', albums: '#/library/albums', artists: '#/library/artists', search: '#/search', settings: '#/settings', import: '#/import', offline: '#/offline', queue: '#/queue', 'privacy policy': '#/legal', terms: '#/legal' };
 
 async function handle(raw, alts = []) {
   const q = clean(raw);

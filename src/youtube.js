@@ -301,11 +301,12 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
     let list = await rawSearch(base, { prefer });
     let v = pick(list, t, 'video'), a = pick(list, t, 'audio', v?.id);
     const save = async () => {
-      if (v) { out.video = v.id; out.videoTitle = v.title; }
-      if (a) { out.audio = a.id; out.audioTitle = a.title; }
+      if (v) { out.video = v.id; out.videoTitle = v.title; if (v.views) out.videoViews = v.views; }
+      if (a) { out.audio = a.id; out.audioTitle = a.title; if (a.views) out.audioViews = a.views; }
       const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
-      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; }
+      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; if (guess.views) out.audioViews = guess.views; }
       await db.put('ytcache', { ...out }, t.id);
+      notePop(t.id, out);
       if (out.video || out.audio) hot.set(t.id, { ...out });
       return { ...out };
     };
@@ -443,4 +444,79 @@ export async function publicPlaylist(listId) {
     } catch (e) { record(base, false, 0, e.rate); }
   }
   throw new Error('Couldn\'t read that playlist. Make sure it\'s public or unlisted, or sign in with YouTube to import your private playlists.');
+}
+
+// ---------- Popularity (views & likes of each song's music video) ----------
+// Views come free with every search. Likes (and fresher views) are looked up in the background, only
+// for songs in a list sorted by "Most popular", a few at a time: 50 per request with a YouTube key,
+// otherwise one by one from free services, gently paced. Everything is saved with the song's match.
+const pop = new Map();   // track id -> score (missing = not known yet)
+let popReady = null;
+export const popularity = id => pop.has(id) ? pop.get(id) : -1;
+const scoreOf = c => {
+  const st = c?.stats, views = st?.v ?? (c?.video ? c.videoViews : null) ?? c?.audioViews ?? null;
+  if (views == null) return null;
+  return views + (st?.l || 0) * 20; // a like says more than a view
+};
+const popMeta = new Map(); // track id -> [video id, when its numbers were fetched]
+function notePop(id, c) { const sc = scoreOf(c); if (sc != null) pop.set(id, sc); const vid = c?.video || c?.audio; if (vid) popMeta.set(id, [vid, c.stats?.at || 0]); }
+export function loadPopularity() {
+  return popReady || (popReady = (async () => {
+    try { const [ks, vs] = await Promise.all([db.keys('ytcache'), db.all('ytcache')]); ks.forEach((k, i) => notePop(k, vs[i])); } catch { }
+  })());
+}
+const statsWanted = new Map(); // track id -> video id, waiting to be looked up
+const statsTried = new Set();
+let statsRunning = false, statsBudget = 400, statsFails = 0; // per visit, for the keyless route
+const STATS_AGE = 30 * 864e5;
+// Ask for views & likes of these songs (only ones with a match and no recent numbers)
+export async function wantStats(trackIds, onUpdate) {
+  await loadPopularity();
+  for (const id of trackIds) {
+    if (statsTried.has(id) || statsWanted.has(id)) continue;
+    const m = popMeta.get(id);
+    if (!m || Date.now() - m[1] < STATS_AGE) continue;
+    statsWanted.set(id, m[0]);
+  }
+  if (!statsRunning && statsWanted.size) runStats(onUpdate);
+}
+async function runStats(onUpdate) {
+  statsRunning = true;
+  const key = settings.ytKey || settings.ownerKey;
+  let changed = 0;
+  const save = async (id, v, l) => {
+    const c = await db.get('ytcache', id); if (!c) return;
+    c.stats = { v: +v || 0, l: +l || 0, at: Date.now() };
+    await db.put('ytcache', c, id); notePop(id, c);
+    if (++changed % 15 === 0) onUpdate?.();
+  };
+  try {
+    while (statsWanted.size) {
+      const batch = [...statsWanted].slice(0, key ? 50 : 1);
+      batch.forEach(([id]) => { statsWanted.delete(id); statsTried.add(id); });
+      if (key) {
+        try {
+          const d = await fetchJSON(`https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${batch.map(b => b[1]).join(',')}&key=${encodeURIComponent(key)}`, 8000);
+          const by = new Map((d.items || []).map(i => [i.id, i.statistics]));
+          for (const [id, vid] of batch) { const st = by.get(vid); if (st) await save(id, st.viewCount, st.likeCount); }
+          continue;
+        } catch { } // key out of quota / blocked: fall through to the free route for this batch
+      }
+      for (const [id, vid] of batch) {
+        if (statsBudget-- <= 0) { statsWanted.clear(); break; }
+        const st = await freeStats(vid);
+        if (st) { statsFails = 0; await save(id, st.v, st.l); }
+        else if (++statsFails >= 5) { statsWanted.clear(); statsBudget = 0; break; } // the free services are down: try again next visit
+        await sleep(document.hidden ? 1500 : 350); // gentle on the free services, and quieter in the background
+      }
+    }
+  } finally { statsRunning = false; if (changed % 15) onUpdate?.(); }
+}
+// Keyless: Return YouTube Dislike's public API (views + likes), then an Invidious server
+async function freeStats(vid) {
+  try { const d = await fetchJSON(`https://returnyoutubedislikeapi.com/votes?videoId=${encodeURIComponent(vid)}`, 5000); if (d && d.viewCount != null) return { v: d.viewCount, l: d.likes }; } catch { }
+  for (const base of rankServers().filter(b => pool.get(b).kind === 'inv').slice(0, 2)) {
+    try { const d = await fetchJSON(`${base}/api/v1/videos/${encodeURIComponent(vid)}?fields=viewCount,likeCount`, 5000); if (d && d.viewCount != null) { record(base, true, 800); return { v: d.viewCount, l: d.likeCount }; } } catch (e) { record(base, false, 0, e.rate); }
+  }
+  return null;
 }

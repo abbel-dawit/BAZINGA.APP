@@ -3,7 +3,7 @@ import { db, kv } from './db.js';
 import { lib } from './store.js';
 import * as store from './store.js';
 import * as yt from './youtube.js';
-import { emit, toast, debounce } from './util.js';
+import { emit, toast, debounce, genreOf } from './util.js';
 import { logoSrc } from './ui.js';
 
 export const NO_MATCH = 'No YouTube match for this song.';
@@ -46,10 +46,12 @@ const changed = () => {
   if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
 };
 // P.at = when this device last did anything with the player (used to decide which device "wins" on sync)
-const persist = debounce(() => { P.at = Date.now(); return kv.set('player', {
+// wasOn = music was playing when the app was last seen (so it can carry on when you come back)
+const saveNow = () => { P.at = Date.now(); return kv.set('player', {
   queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
-  time: Math.floor(P.time || 0), at: P.at
-}); }, 500);
+  time: Math.floor(P.time || 0), at: P.at, wasOn: !!(wantPlay && current())
+}); };
+const persist = debounce(saveNow, 500);
 export const setEndHook = fn => { endHook = fn; };
 const outVol = () => Math.max(0, Math.min(1, P.volume * duckLevel));
 
@@ -88,7 +90,9 @@ export function adopt(s) {
 }
 export async function restore() {
   const s = await kv.get('player');
-  if (s) { Object.assign(P, s, { playing: false }); resumeAt = +s.time || 0; P.time = resumeAt; }
+  if (s) { Object.assign(P, s, { playing: false }); delete P.wasOn; resumeAt = +s.time || 0; P.time = resumeAt; }
+  // The app was closed (or the phone cleared it) while music played less than 30 min ago: carry on
+  resumeOnLaunch = !!(s?.wasOn && Date.now() - (s.at || 0) < 30 * 60e3);
   // v1.6: music video is the default for everyone (once); switching to Audio afterwards is remembered
   if (!(await kv.get('videoDefault'))) { P.mode = 'video'; await kv.set('videoDefault', 1); persist(); }
   P.queue = P.queue.filter(q => lib.tracks.has(q.id));
@@ -136,14 +140,14 @@ function makeYT(elId, onReady) {
             if (pl !== ytPlayer) { preState(pl, e.data); return; }
             if (P.source !== 'yt') return;
             if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
-            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
+            if (e.data === YT.PlayerState.PLAYING) { quietStart = false; P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
             else if (e.data === YT.PlayerState.PAUSED) {
               if (isRerouting()) return;
               // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
               // ask for that, start it again straight away.
               // (Only right after leaving / a new song starting — a pause you make later from the lock screen is respected.)
               if (wantPlay && document.hidden && (Date.now() - hiddenAt < 8000 || Date.now() - startedAt < 8000) && resumeTries < 10) { resumeTries++; setTimeout(() => { try { if (wantPlay) ytPlayer.playVideo(); } catch { } }, Math.min(150 * resumeTries, 1500)); return; }
-              P.playing = false; P.loading = false; if (!document.hidden) wantPlay = false; changed();
+              P.playing = false; P.loading = false; if (!document.hidden && !leavingNow()) wantPlay = false; changed();
             }
             else if (e.data === YT.PlayerState.ENDED) ended();
             else if (e.data === YT.PlayerState.BUFFERING) { if (!P.loading) { P.loading = true; changed(); } }
@@ -218,21 +222,72 @@ function noCaptions() {
   try { ytPlayer.setOption('captions', 'track', {}); } catch { }
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) {
-    // Back in the app: if the phone stopped the music while you were away, carry on right where it was
-    resumeTries = 0;
-    if (!wantPlay) return;
-    if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); if (st === 2 || st === 5 || st === -1) ytPlayer.playVideo(); } catch { } }
-    else if (P.source === 'local' && audio.paused) audio.play().catch(() => { });
-    return;
-  }
-  hiddenAt = Date.now(); resumeTries = 0;
+  if (!document.hidden) { comeBack(); return; }
+  hiddenAt = Date.now(); leftAt = Date.now(); resumeTries = 0;
+  saveNow(); // (the phone may close the app any moment now)
   audioMode('playback');
   // Leaving the browser / locking the phone: keep going
   if (wantPlay && P.source === 'yt') setTimeout(() => { try { if (wantPlay && ytPlayer?.getPlayerState?.() !== 1) ytPlayer.playVideo(); } catch { } }, 500);
   if (wantPlay && P.source === 'local' && audio.paused) audio.play().catch(() => { });
   persist();
 });
+// ---------- Keep playing when you come back ----------
+// Leaving the app (switching apps, locking the phone, closing the tab) and coming back carries on with
+// the music if it was playing when you left. If the browser needs a tap first, one tap anywhere does it.
+let leftAt = 0, resumeOnLaunch = false, quietStart = false, autoResumeOn = true, tapArmed = false;
+try { autoResumeOn = localStorage.getItem('bz_autoresume') !== '0'; } catch { }
+export const setAutoResume = on => { autoResumeOn = !!on; try { localStorage.setItem('bz_autoresume', on ? '1' : '0'); } catch { } };
+const leavingNow = () => Date.now() - leftAt < 1500;
+// (focus moving into the YouTube video itself isn't leaving)
+window.addEventListener('blur', () => setTimeout(() => { if (document.activeElement?.tagName !== 'IFRAME') leftAt = Date.now(); }, 0));
+window.addEventListener('pagehide', () => { leftAt = Date.now(); saveNow(); });
+document.addEventListener('freeze', () => { leftAt = Date.now(); saveNow(); });
+window.addEventListener('pageshow', e => { if (e.persisted) comeBack(); });
+window.addEventListener('focus', () => { if (!document.hidden) comeBack(); });
+let backT = null;
+function comeBack() {
+  resumeTries = 0;
+  if (!wantPlay || !autoResumeOn || !current()) return;
+  clearTimeout(backT);
+  backT = setTimeout(() => {
+    if (!wantPlay || document.hidden) return;
+    if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); if (st === 2 || st === 5 || st === -1) ytPlayer.playVideo(); } catch { } }
+    else if (P.source === 'local' && audio.paused) audio.play().catch(() => blocked());
+    else if (!P.source) load(true);
+    // still silent a moment later: the browser wants a tap
+    setTimeout(() => {
+      if (!wantPlay || document.hidden || !current() || reallyPlaying()) return;
+      P.playing = false; P.loading = false; changed(); // show the true state (it may still say "playing" from before you left)
+      blocked();
+    }, 1800);
+  }, 150);
+}
+const reallyPlaying = () => {
+  if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); return st === 1 || st === 3; } catch { return P.playing; } }
+  if (P.source === 'local') return !audio.paused;
+  return false;
+};
+// The browser blocked starting on its own: the next tap anywhere carries on (and the app shows a Play button)
+function blocked() {
+  emit('resume-blocked');
+  if (tapArmed) return; tapArmed = true;
+  const go = e => {
+    off();
+    if (e.target?.closest?.('[data-p="toggle"],[data-p="next"],[data-p="prev"],.row,[data-act^="play"]')) return; // that tap already starts something
+    if (!P.playing && current()) play();
+  };
+  const off = () => { tapArmed = false; document.removeEventListener('pointerdown', go, true); document.removeEventListener('keydown', go, true); };
+  document.addEventListener('pointerdown', go, true); document.addEventListener('keydown', go, true);
+  setTimeout(off, 120e3);
+}
+// Called once the app is on screen after starting up
+export function resumeLast() {
+  if (!resumeOnLaunch || !autoResumeOn || !current() || isOn()) return false;
+  resumeOnLaunch = false; quietStart = true;
+  play();
+  setTimeout(() => { if (quietStart && wantPlay && !P.playing && !P.needsTap) blocked(); }, 4500);
+  return true;
+}
 async function ytError(code) {
   const t = current(); if (!t) return;
   // 101/150 = embedding disabled by owner; try the other version, then re-search once
@@ -285,7 +340,7 @@ async function startYT(id, start = 0) {
   startWatch = setTimeout(() => {
     if (my !== loadToken || !wantPlay || P.source !== 'yt' || document.hidden) return;
     let st = -9; try { st = ytPlayer.getPlayerState(); } catch { }
-    if (st === -1 || st === 5 || st === 2 && !P.playing) { P.needsTap = true; P.loading = false; changed(); emit('needs-tap'); }
+    if (st === -1 || st === 5 || st === 2 && !P.playing) { P.needsTap = true; P.loading = false; changed(); if (quietStart) { quietStart = false; blocked(); } else emit('needs-tap'); }
   }, 3500);
 }
 // Load the YouTube player in the background right after start-up, so the first song starts instantly
@@ -318,7 +373,7 @@ async function load(autoplay = true) {
       try { ytPlayer?.pauseVideo?.(); } catch { }
       audio.volume = outVol();
       try { audio.currentTime = at || 0; } catch { }
-      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); if (quietStart) { quietStart = false; blocked(); } });
       P.loading = false; changed(); startTick();
       return;
     }
@@ -333,7 +388,7 @@ async function load(autoplay = true) {
       audio.src = objUrl; applySink(audio);
       audio.volume = outVol();
       if (at) audio.addEventListener('loadedmetadata', () => { try { audio.currentTime = at; } catch { } }, { once: true });
-      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); if (quietStart) { quietStart = false; blocked(); } });
       P.loading = false; changed(); startTick();
       return;
     }
@@ -406,7 +461,7 @@ function ended() {
 for (const el of [audio, audioNext]) {
   el.addEventListener('ended', () => el === audio && P.source === 'local' && ended());
   el.addEventListener('play', () => { if (el !== audio) return; P.playing = true; if (!tick) startTick(); changed(); });
-  el.addEventListener('pause', () => { if (el !== audio || isRerouting()) return; P.playing = false; changed(); });
+  el.addEventListener('pause', () => { if (el !== audio || isRerouting()) return; P.playing = false; if (!document.hidden && !leavingNow() && !el.ended && !fadeT) wantPlay = false; changed(); });
   el.addEventListener('error', () => { if (el !== audio) { if (preLocal) { URL.revokeObjectURL(preLocal.url); preLocal = null; } return; } if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
 }
 
@@ -425,7 +480,7 @@ export function play() {
   else load(true);
 }
 export function pause() {
-  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify);
+  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify); quietStart = false;
   P.playing = false; P.loading = false; changed();
   if (P.source === 'local') audio.pause();
   else if (ytPlayer?.pauseVideo) try { ytPlayer.pauseVideo(); } catch { }
@@ -444,6 +499,7 @@ export function seek(sec) {
 export const queueIsNew = () => P.queue.length > 1 && (P.origin === 'mix' || !!P.shuffle);
 export function next(auto = false) {
   if (!P.queue.length) return;
+  if (!auto) noteSkip();
   if (P.cursor < P.queue.length - 1) P.cursor++;
   else if (P.repeat === 'all') P.cursor = 0;
   else {
@@ -451,7 +507,7 @@ export function next(auto = false) {
     const plan = endHook?.(P.queue.map(q => q.id));
     if (plan?.ids?.length) {
       let list = plan.ids.filter(id => lib.tracks.has(id)).map(id => ({ id, user: false }));
-      if (plan.shuffle) list.sort(() => Math.random() - 0.5);
+      if (plan.shuffle) { resetSkips(); list = genreShuffle(list.map(q => q.id)).map(id => ({ id, user: false })); }
       if (list.length) { P.queue = list; P.cursor = 0; P.origin = ''; if (plan.msg) toast(plan.msg); load(true); return; }
     }
     if (auto) { P.playing = false; wantPlay = false; changed(); }
@@ -471,9 +527,8 @@ export function playList(ids, start = 0, { shuffle = P.shuffle, origin = '' } = 
   if (!ids.length) return toast('Nothing to play');
   let list = ids.map(id => ({ id, user: false }));
   if (shuffle) {
-    const first = list.splice(start, 1)[0];
-    list.sort(() => Math.random() - 0.5);
-    list.unshift(first); start = 0;
+    resetSkips();
+    list = genreShuffle(ids, { first: ids[start] }).map(id => ({ id, user: false })); start = 0;
   }
   P.queue = list; P.cursor = start; P.shuffle = shuffle; P.origin = origin;
   load(true);
@@ -519,10 +574,7 @@ export function clearUserQueue() { P.queue = P.queue.filter((q, i) => i <= P.cur
 
 export function setShuffle(v) {
   P.shuffle = v;
-  if (v && P.cursor >= 0) {
-    const rest = P.queue.slice(P.cursor + 1).sort(() => Math.random() - 0.5);
-    P.queue = [...P.queue.slice(0, P.cursor + 1), ...rest];
-  }
+  if (v && P.cursor >= 0) { resetSkips(); reshuffleRest(); }
   persist(); changed(); queueChanged();
 }
 export function cycleRepeat() { P.repeat = { off: 'all', all: 'one', one: 'off' }[P.repeat]; persist(); changed(); }
@@ -643,3 +695,70 @@ async function outputsChanged() {
 }
 try { navigator.mediaDevices?.addEventListener?.('devicechange', outputsChanged); listOutputs().then(l => { lastOuts = new Set(l.map(d => d.deviceId)); }); } catch { }
 applySink(audio); applySink(audioNext);
+
+// ---------- Shuffle by genre ----------
+// Shuffle plays songs in little runs of 3 from the same genre, and moves on to a similar genre next
+// (Hip-Hop → R&B → Soul…), so it flows like a DJ set instead of jumping around. Skip one genre more
+// than 5 times and the rest of the shuffle plays less of it (one song at a time, mostly later on).
+const NEAR = {
+  'Hip-Hop/Rap': ['R&B', 'Afrobeats', 'Reggae', 'Pop', 'Electronic'], 'R&B': ['Hip-Hop/Rap', 'Soul', 'Pop', 'Afrobeats', 'Gospel'],
+  'Soul': ['R&B', 'Jazz', 'Blues', 'Gospel'], 'Pop': ['R&B', 'K-Pop', 'Electronic', 'Rock', 'Latin'], 'K-Pop': ['Pop', 'Electronic', 'R&B'],
+  'Electronic': ['Pop', 'Hip-Hop/Rap', 'Latin', 'Afrobeats', 'K-Pop'], 'Afrobeats': ['Reggae', 'Hip-Hop/Rap', 'R&B', 'Latin', 'World'],
+  'Reggae': ['Afrobeats', 'Latin', 'Hip-Hop/Rap'], 'Latin': ['Reggae', 'Pop', 'Afrobeats', 'Electronic'], 'Rock': ['Metal', 'Pop', 'Folk', 'Blues'],
+  'Metal': ['Rock'], 'Folk': ['Country', 'Rock', 'Soundtrack'], 'Country': ['Folk', 'Rock', 'Blues'], 'Jazz': ['Blues', 'Soul', 'Classical'],
+  'Blues': ['Jazz', 'Soul', 'Rock', 'Country'], 'Classical': ['Soundtrack', 'Jazz'], 'Soundtrack': ['Classical', 'Pop'], 'Gospel': ['Soul', 'R&B'],
+  'World': ['Afrobeats', 'Latin', 'Folk'], 'Kids': ['Holiday', 'Soundtrack'], 'Holiday': ['Kids', 'Pop'], 'Comedy': []
+};
+const near = (a, b) => (NEAR[a] || []).includes(b) || (NEAR[b] || []).includes(a);
+const RUN = 3;
+let skips = new Map(), lessOf = new Set();
+function resetSkips() { skips = new Map(); lessOf = new Set(); }
+const gOf = id => genreOf(lib.tracks.get(id)) || '';
+function mix(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; }
+// ids → shuffled ids in genre runs. first: song that must play first; prev: genre playing right now.
+export function genreShuffle(ids, { first = null, prev = null, prevRun = 1 } = {}) {
+  const buckets = new Map();
+  for (const id of ids) { if (id === first) continue; const g = gOf(id); (buckets.get(g) || buckets.set(g, []).get(g)).push(id); }
+  for (const b of buckets.values()) mix(b);
+  const size = new Map([...buckets].map(([g, v]) => [g, v.length]));
+  const out = []; let cur = prev, run = prev == null ? 0 : prevRun; // (the song playing now counts toward its run)
+  if (first && lib.tracks.has(first)) { out.push(first); cur = gOf(first); run = 1; }
+  const runFor = g => lessOf.has(g) ? 1 : RUN;
+  while (out.length < ids.length) {
+    const b = buckets.get(cur);
+    if (b?.length && run < runFor(cur)) { out.push(b.pop()); run++; continue; }
+    // next genre: similar ones are much more likely, never the same genre twice in a row if there's a choice,
+    // genres you keep skipping only once the others are mostly done
+    const left = [...buckets].filter(([, v]) => v.length);
+    if (!left.length) break;
+    const pool = left.length > 1 ? left.filter(([g]) => g !== cur) : left;
+    let tot = 0;
+    // (a genre that's falling behind gets a boost, so no genre piles up at the end — except ones you skip)
+    const w = pool.map(([g, v]) => { const f = v.length / size.get(g); const x = (cur == null ? 1 : g && cur && near(cur, g) ? 4 : 1) * v.length * f * f * f * (lessOf.has(g) ? 0.04 : 1); tot += x; return x; });
+    let r = Math.random() * tot, k = 0;
+    while (k < w.length - 1 && (r -= w[k]) > 0) k++;
+    cur = pool[k][0]; run = 0;
+  }
+  return out;
+}
+// Re-shuffle everything after the current song (songs you queued yourself stay first, in order)
+function reshuffleRest() {
+  const head = P.queue.slice(0, P.cursor + 1), rest = P.queue.slice(P.cursor + 1);
+  const mine = rest.filter(q => q.user), others = rest.filter(q => !q.user).map(q => q.id);
+  const cur = current();
+  const g = cur ? gOf(cur.id) : null;
+  P.queue = [...head, ...mine, ...genreShuffle(others, { prev: g, prevRun: lessOf.has(g) ? 99 : 1 }).map(id => ({ id, user: false }))];
+}
+// Skipping: tapping Next before most of the song has played (shuffle only)
+function noteSkip() {
+  const t = current(); if (!P.shuffle || !t) return;
+  const played = P.time || 0, dur = P.duration || (t.durationMs || 0) / 1000;
+  if (dur ? played > dur * 0.6 : played > 90) return; // (listened to most of it: not a skip)
+  const g = genreOf(t); if (!g || lessOf.has(g)) return;
+  const n = (skips.get(g) || 0) + 1; skips.set(g, n);
+  if (n > 5) {
+    lessOf.add(g);
+    reshuffleRest(); persist(); queueChanged();
+    toast(`Playing less ${g} for the rest of this shuffle`);
+  }
+}

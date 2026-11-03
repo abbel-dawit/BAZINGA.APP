@@ -2207,3 +2207,23 @@ body.np-pulling #np-head::before { opacity: 1; }
 @media (max-width: 420px) { .pb-artist .err-line.compact .err-text { display: none; } .pb-artist .err-line.compact::before { content: '!'; display: inline-grid; place-items: center; width: 17px; height: 17px; border-radius: 50%; background: #ff453a; color: #fff; font-weight: 800; font-size: 11.5px; flex: none; } }
 @media (max-width: 380px) { #np-head .np-ctx { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-size: 11px; } }
 @media (max-width: 420px) { .pb-artist .err-btn { padding: 1px 8px; font-size: 11px; } }
+
+/* --- Year filter: From – To --- */
+.year-range { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+.year-range .yr { display: grid; gap: 4px; flex: 1 1 120px; max-width: 200px; }
+.year-range .yr > span { font-size: 12px; font-weight: 650; color: var(--muted); }
+.year-range .select { width: 100%; padding: 9px 12px; border-radius: 12px; font-weight: 650; }
+.year-range .yr-dash { padding-bottom: 10px; color: var(--muted); font-weight: 700; }
+
+/* ===== v1.7.3 ===== */
+/* --- corner video (computers & tablets): always exactly 16:9, so the video fills its box at every width --- */
+@media (min-width: 701px) {
+  body:not(.dock-min) #yt-dock:not(.in-np) .dock-frame { height: auto !important; aspect-ratio: 16 / 9; }
+}
+/* --- pop-ups clear the iPhone status bar, camera and home bar --- */
+.modal-wrap { padding: max(16px, calc(env(safe-area-inset-top) + 10px)) max(16px, env(safe-area-inset-right)) max(16px, calc(env(safe-area-inset-bottom) + 10px)) max(16px, env(safe-area-inset-left)) !important; }
+.modal { max-height: calc(100vh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); max-height: calc(100dvh - max(16px, env(safe-area-inset-top) + 10px) - max(16px, env(safe-area-inset-bottom) + 10px)); }
+@media (max-width: 700px) and (orientation: portrait) {
+  .help-modal { padding-top: 26px; }
+  .help-modal .help-top { margin-top: 4px; }
+}

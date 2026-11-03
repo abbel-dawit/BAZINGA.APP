@@ -561,6 +561,17 @@ function menu(anchor, items) {
 function closeMenu() { const r = $('#menu-root'); if (r) r.innerHTML = ''; }
 
 // ---------- Filters (genre + release date + sort + text) ----------
+// Popularity score per song (app.js plugs in YouTube views & likes); -1 = not known yet
+let popOf = () => -1;
+const setPopularity = fn => { popOf = fn; };
+const yrOf = t => t.year || yearOf(t.releaseDate);
+// Year range: "From" and "To" (either can be left on Any); older saved multi-year picks become a range
+function yearRange(f) {
+  let a = +f.from || 0, b = +f.to || 0;
+  if (!a && !b && f.years?.length) { a = Math.min(...f.years); b = Math.max(...f.years); }
+  if (a && b && a > b) [a, b] = [b, a];
+  return [a, b];
+}
 function applyFilters(list, f) {
   let out = list;
   if (f.q) {
@@ -569,7 +580,8 @@ function applyFilters(list, f) {
   }
   if (f.genres?.length) out = out.filter(t => f.genres.includes(genreOf(t)));
   const y = t => t.year || yearOf(t.releaseDate);
-  if (f.years?.length) out = out.filter(t => f.years.includes(y(t)));
+  const [ya, yb] = yearRange(f);
+  if (ya || yb) out = out.filter(t => { const v = yrOf(t); return v && (!ya || v >= ya) && (!yb || v <= yb); });
   if (f.liked) out = out.filter(t => t.liked);
   if (f.offline) out = out.filter(t => t.localFileId);
   const by = {
@@ -579,8 +591,13 @@ function applyFilters(list, f) {
     artist: (a, b) => a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title),
     newest: (a, b) => (b.releaseDate || String(y(b) || '')).localeCompare(a.releaseDate || String(y(a) || '')),
     oldest: (a, b) => (y(a) || 9999) - (y(b) || 9999) || (a.releaseDate || '').localeCompare(b.releaseDate || ''),
-    album: (a, b) => (a.album || '').localeCompare(b.album || '') || (a.trackNumber || 0) - (b.trackNumber || 0)
+    album: (a, b) => (a.album || '').localeCompare(b.album || '') || (a.trackNumber || 0) - (b.trackNumber || 0),
+    popular: null
   }[f.sort];
+  if (f.sort === 'popular') { // most → least; songs without numbers yet keep their order at the bottom
+    const sc = new Map(out.map(t => [t.id, popOf(t.id)]));
+    return [...out].sort((a, b) => sc.get(b.id) - sc.get(a.id));
+  }
   if (by) out = [...out].sort(by);
   return out;
 }
@@ -595,10 +612,12 @@ function filterBar(f, tracks, { showSort = true, keepOrder = false, likedSort = 
   const ym = new Map();
   for (const t of tracks) { const y = t.year || yearOf(t.releaseDate); if (y) ym.set(y, (ym.get(y) || 0) + 1); }
   const years = [...ym.entries()].sort((a, b) => b[0] - a[0]);
-  const active = (f.genres?.length || 0) + (f.years?.length || 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  const [ya, yb] = yearRange(f);
+  const active = (f.genres?.length || 0) + (ya || yb ? 1 : 0) + (f.liked ? 1 : 0) + (f.offline ? 1 : 0);
+  const yAsc = years.map(([y]) => y).sort((a, b) => a - b);
   // Sort options open as an on-screen panel, just like Filters (no system picker)
   const sortOpts = [...(keepOrder ? [['', 'Custom order']] : []), ...(likedSort ? [['liked', 'Recently liked']] : []),
-    ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
+    ['added', 'Recently added'], ['title', 'Title'], ['artist', 'Artist'], ['album', 'Album'], ['popular', 'Most popular'], ['newest', 'Year: newest'], ['oldest', 'Year: oldest']];
   const curSort = sortOpts.find(([v]) => v === (f.sort || '')) || sortOpts.find(([v]) => v === 'added');
   return `<div class="filters">
     <div class="filter-top">
@@ -614,8 +633,12 @@ function filterBar(f, tracks, { showSort = true, keepOrder = false, likedSort = 
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
         ${genres.length ? genres.map(([g, n]) => `<button class="chip ${f.genres?.includes(g) ? 'on' : ''}" data-act="f-genre" data-g="${esc(g)}">${esc(g)} <small>${n}</small></button>`).join('') : '<span class="muted">Genres appear as songs get matched.</span>'}
       </div></div>
-      ${years.length ? `<div class="fp-sec"><div class="fp-h">Year <span class="fp-note">pick one or more</span></div>
-        <div class="chips years-chips">${years.map(([y, n]) => `<button class="chip ${f.years?.includes(y) ? 'on' : ''}" data-act="f-year" data-y="${y}" aria-pressed="${!!f.years?.includes(y)}">${y} <small>${n}</small></button>`).join('')}</div>
+      ${years.length ? `<div class="fp-sec"><div class="fp-h">Year</div>
+        <div class="year-range">
+          <label class="yr"><span>From</span><select class="select" data-f="from" aria-label="From year"><option value="">Any</option>${yAsc.map(y => `<option value="${y}" ${ya === y ? 'selected' : ''}>${y}</option>`).join('')}</select></label>
+          <span class="yr-dash" aria-hidden="true">–</span>
+          <label class="yr"><span>To</span><select class="select" data-f="to" aria-label="To year"><option value="">Any</option>${yAsc.map(y => `<option value="${y}" ${yb === y ? 'selected' : ''} ${ya && y < ya ? 'disabled' : ''}>${y}</option>`).join('')}</select></label>
+        </div>
       </div>` : ''}
       <div class="fp-sec"><div class="chips">
         <button class="chip ${f.liked ? 'on' : ''}" data-act="f-flag" data-k="liked">${icon('heart')}Liked only</button>
@@ -638,7 +661,7 @@ function loader(text = '', cls = '') {
   return `<div class="bz-loader ${cls}" role="status" aria-live="polite"><div class="bz-orb"><span></span><span></span><span></span><img src="${logoSrc()}" alt=""></div>${text ? `<p>${esc(text)}</p>` : ''}</div>`;
 }
 
-return { icon, THEMES, currentTheme, logoSrc, themeVars, applyTheme, sized, cover, trackRow, card, toastUndo, modal, promptText, confirmBox, menu, closeMenu, applyFilters, filterBar, empty, likedCover, loader };
+return { icon, THEMES, currentTheme, logoSrc, themeVars, applyTheme, sized, cover, trackRow, card, toastUndo, modal, promptText, confirmBox, menu, closeMenu, setPopularity, yearRange, applyFilters, filterBar, empty, likedCover, loader };
 })();
 // ---------- meta.js ----------
 const __m_meta = (() => {
@@ -1568,11 +1591,12 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
     let list = await rawSearch(base, { prefer });
     let v = pick(list, t, 'video'), a = pick(list, t, 'audio', v?.id);
     const save = async () => {
-      if (v) { out.video = v.id; out.videoTitle = v.title; }
-      if (a) { out.audio = a.id; out.audioTitle = a.title; }
+      if (v) { out.video = v.id; out.videoTitle = v.title; if (v.views) out.videoViews = v.views; }
+      if (a) { out.audio = a.id; out.audioTitle = a.title; if (a.views) out.audioViews = a.views; }
       const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
-      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; }
+      if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; if (guess.views) out.audioViews = guess.views; }
       await db.put('ytcache', { ...out }, t.id);
+      notePop(t.id, out);
       if (out.video || out.audio) hot.set(t.id, { ...out });
       return { ...out };
     };
@@ -1712,7 +1736,82 @@ async function publicPlaylist(listId) {
   throw new Error('Couldn\'t read that playlist. Make sure it\'s public or unlisted, or sign in with YouTube to import your private playlists.');
 }
 
-return { setYTSettings, startInstances, proxySearch, YT_UNREACHABLE, rawSearch, isPreview, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist };
+// ---------- Popularity (views & likes of each song's music video) ----------
+// Views come free with every search. Likes (and fresher views) are looked up in the background, only
+// for songs in a list sorted by "Most popular", a few at a time: 50 per request with a YouTube key,
+// otherwise one by one from free services, gently paced. Everything is saved with the song's match.
+const pop = new Map();   // track id -> score (missing = not known yet)
+let popReady = null;
+const popularity = id => pop.has(id) ? pop.get(id) : -1;
+const scoreOf = c => {
+  const st = c?.stats, views = st?.v ?? (c?.video ? c.videoViews : null) ?? c?.audioViews ?? null;
+  if (views == null) return null;
+  return views + (st?.l || 0) * 20; // a like says more than a view
+};
+const popMeta = new Map(); // track id -> [video id, when its numbers were fetched]
+function notePop(id, c) { const sc = scoreOf(c); if (sc != null) pop.set(id, sc); const vid = c?.video || c?.audio; if (vid) popMeta.set(id, [vid, c.stats?.at || 0]); }
+function loadPopularity() {
+  return popReady || (popReady = (async () => {
+    try { const [ks, vs] = await Promise.all([db.keys('ytcache'), db.all('ytcache')]); ks.forEach((k, i) => notePop(k, vs[i])); } catch { }
+  })());
+}
+const statsWanted = new Map(); // track id -> video id, waiting to be looked up
+const statsTried = new Set();
+let statsRunning = false, statsBudget = 400, statsFails = 0; // per visit, for the keyless route
+const STATS_AGE = 30 * 864e5;
+// Ask for views & likes of these songs (only ones with a match and no recent numbers)
+async function wantStats(trackIds, onUpdate) {
+  await loadPopularity();
+  for (const id of trackIds) {
+    if (statsTried.has(id) || statsWanted.has(id)) continue;
+    const m = popMeta.get(id);
+    if (!m || Date.now() - m[1] < STATS_AGE) continue;
+    statsWanted.set(id, m[0]);
+  }
+  if (!statsRunning && statsWanted.size) runStats(onUpdate);
+}
+async function runStats(onUpdate) {
+  statsRunning = true;
+  const key = settings.ytKey || settings.ownerKey;
+  let changed = 0;
+  const save = async (id, v, l) => {
+    const c = await db.get('ytcache', id); if (!c) return;
+    c.stats = { v: +v || 0, l: +l || 0, at: Date.now() };
+    await db.put('ytcache', c, id); notePop(id, c);
+    if (++changed % 15 === 0) onUpdate?.();
+  };
+  try {
+    while (statsWanted.size) {
+      const batch = [...statsWanted].slice(0, key ? 50 : 1);
+      batch.forEach(([id]) => { statsWanted.delete(id); statsTried.add(id); });
+      if (key) {
+        try {
+          const d = await fetchJSON(`https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${batch.map(b => b[1]).join(',')}&key=${encodeURIComponent(key)}`, 8000);
+          const by = new Map((d.items || []).map(i => [i.id, i.statistics]));
+          for (const [id, vid] of batch) { const st = by.get(vid); if (st) await save(id, st.viewCount, st.likeCount); }
+          continue;
+        } catch { } // key out of quota / blocked: fall through to the free route for this batch
+      }
+      for (const [id, vid] of batch) {
+        if (statsBudget-- <= 0) { statsWanted.clear(); break; }
+        const st = await freeStats(vid);
+        if (st) { statsFails = 0; await save(id, st.v, st.l); }
+        else if (++statsFails >= 5) { statsWanted.clear(); statsBudget = 0; break; } // the free services are down: try again next visit
+        await sleep(document.hidden ? 1500 : 350); // gentle on the free services, and quieter in the background
+      }
+    }
+  } finally { statsRunning = false; if (changed % 15) onUpdate?.(); }
+}
+// Keyless: Return YouTube Dislike's public API (views + likes), then an Invidious server
+async function freeStats(vid) {
+  try { const d = await fetchJSON(`https://returnyoutubedislikeapi.com/votes?videoId=${encodeURIComponent(vid)}`, 5000); if (d && d.viewCount != null) return { v: d.viewCount, l: d.likes }; } catch { }
+  for (const base of rankServers().filter(b => pool.get(b).kind === 'inv').slice(0, 2)) {
+    try { const d = await fetchJSON(`${base}/api/v1/videos/${encodeURIComponent(vid)}?fields=viewCount,likeCount`, 5000); if (d && d.viewCount != null) { record(base, true, 800); return { v: d.viewCount, l: d.likeCount }; } } catch (e) { record(base, false, 0, e.rate); }
+  }
+  return null;
+}
+
+return { setYTSettings, startInstances, proxySearch, YT_UNREACHABLE, rawSearch, isPreview, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist, popularity, loadPopularity, wantStats };
 })();
 // ---------- ytaccount.js ----------
 const __m_ytaccount = (() => {
@@ -2300,7 +2399,7 @@ const { db, kv } = __m_db;
 const { lib } = __m_store;
 const store = __m_store;
 const yt = __m_youtube;
-const { emit, toast, debounce } = __m_util;
+const { emit, toast, debounce, genreOf } = __m_util;
 const { logoSrc } = __m_ui;
 
 const NO_MATCH = 'No YouTube match for this song.';
@@ -2343,10 +2442,12 @@ const changed = () => {
   if ('mediaSession' in navigator) try { navigator.mediaSession.playbackState = current() ? (P.playing || (wantPlay && P.loading) ? 'playing' : 'paused') : 'none'; } catch { }
 };
 // P.at = when this device last did anything with the player (used to decide which device "wins" on sync)
-const persist = debounce(() => { P.at = Date.now(); return kv.set('player', {
+// wasOn = music was playing when the app was last seen (so it can carry on when you come back)
+const saveNow = () => { P.at = Date.now(); return kv.set('player', {
   queue: P.queue, cursor: P.cursor, origin: P.origin, mode: P.mode, shuffle: P.shuffle, repeat: P.repeat, volume: P.volume, preferOffline: P.preferOffline,
-  time: Math.floor(P.time || 0), at: P.at
-}); }, 500);
+  time: Math.floor(P.time || 0), at: P.at, wasOn: !!(wantPlay && current())
+}); };
+const persist = debounce(saveNow, 500);
 const setEndHook = fn => { endHook = fn; };
 const outVol = () => Math.max(0, Math.min(1, P.volume * duckLevel));
 
@@ -2385,7 +2486,9 @@ function adopt(s) {
 }
 async function restore() {
   const s = await kv.get('player');
-  if (s) { Object.assign(P, s, { playing: false }); resumeAt = +s.time || 0; P.time = resumeAt; }
+  if (s) { Object.assign(P, s, { playing: false }); delete P.wasOn; resumeAt = +s.time || 0; P.time = resumeAt; }
+  // The app was closed (or the phone cleared it) while music played less than 30 min ago: carry on
+  resumeOnLaunch = !!(s?.wasOn && Date.now() - (s.at || 0) < 30 * 60e3);
   // v1.6: music video is the default for everyone (once); switching to Audio afterwards is remembered
   if (!(await kv.get('videoDefault'))) { P.mode = 'video'; await kv.set('videoDefault', 1); persist(); }
   P.queue = P.queue.filter(q => lib.tracks.has(q.id));
@@ -2433,14 +2536,14 @@ function makeYT(elId, onReady) {
             if (pl !== ytPlayer) { preState(pl, e.data); return; }
             if (P.source !== 'yt') return;
             if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
-            if (e.data === YT.PlayerState.PLAYING) { P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
+            if (e.data === YT.PlayerState.PLAYING) { quietStart = false; P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
             else if (e.data === YT.PlayerState.PAUSED) {
               if (isRerouting()) return;
               // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
               // ask for that, start it again straight away.
               // (Only right after leaving / a new song starting — a pause you make later from the lock screen is respected.)
               if (wantPlay && document.hidden && (Date.now() - hiddenAt < 8000 || Date.now() - startedAt < 8000) && resumeTries < 10) { resumeTries++; setTimeout(() => { try { if (wantPlay) ytPlayer.playVideo(); } catch { } }, Math.min(150 * resumeTries, 1500)); return; }
-              P.playing = false; P.loading = false; if (!document.hidden) wantPlay = false; changed();
+              P.playing = false; P.loading = false; if (!document.hidden && !leavingNow()) wantPlay = false; changed();
             }
             else if (e.data === YT.PlayerState.ENDED) ended();
             else if (e.data === YT.PlayerState.BUFFERING) { if (!P.loading) { P.loading = true; changed(); } }
@@ -2515,21 +2618,72 @@ function noCaptions() {
   try { ytPlayer.setOption('captions', 'track', {}); } catch { }
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) {
-    // Back in the app: if the phone stopped the music while you were away, carry on right where it was
-    resumeTries = 0;
-    if (!wantPlay) return;
-    if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); if (st === 2 || st === 5 || st === -1) ytPlayer.playVideo(); } catch { } }
-    else if (P.source === 'local' && audio.paused) audio.play().catch(() => { });
-    return;
-  }
-  hiddenAt = Date.now(); resumeTries = 0;
+  if (!document.hidden) { comeBack(); return; }
+  hiddenAt = Date.now(); leftAt = Date.now(); resumeTries = 0;
+  saveNow(); // (the phone may close the app any moment now)
   audioMode('playback');
   // Leaving the browser / locking the phone: keep going
   if (wantPlay && P.source === 'yt') setTimeout(() => { try { if (wantPlay && ytPlayer?.getPlayerState?.() !== 1) ytPlayer.playVideo(); } catch { } }, 500);
   if (wantPlay && P.source === 'local' && audio.paused) audio.play().catch(() => { });
   persist();
 });
+// ---------- Keep playing when you come back ----------
+// Leaving the app (switching apps, locking the phone, closing the tab) and coming back carries on with
+// the music if it was playing when you left. If the browser needs a tap first, one tap anywhere does it.
+let leftAt = 0, resumeOnLaunch = false, quietStart = false, autoResumeOn = true, tapArmed = false;
+try { autoResumeOn = localStorage.getItem('bz_autoresume') !== '0'; } catch { }
+const setAutoResume = on => { autoResumeOn = !!on; try { localStorage.setItem('bz_autoresume', on ? '1' : '0'); } catch { } };
+const leavingNow = () => Date.now() - leftAt < 1500;
+// (focus moving into the YouTube video itself isn't leaving)
+window.addEventListener('blur', () => setTimeout(() => { if (document.activeElement?.tagName !== 'IFRAME') leftAt = Date.now(); }, 0));
+window.addEventListener('pagehide', () => { leftAt = Date.now(); saveNow(); });
+document.addEventListener('freeze', () => { leftAt = Date.now(); saveNow(); });
+window.addEventListener('pageshow', e => { if (e.persisted) comeBack(); });
+window.addEventListener('focus', () => { if (!document.hidden) comeBack(); });
+let backT = null;
+function comeBack() {
+  resumeTries = 0;
+  if (!wantPlay || !autoResumeOn || !current()) return;
+  clearTimeout(backT);
+  backT = setTimeout(() => {
+    if (!wantPlay || document.hidden) return;
+    if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); if (st === 2 || st === 5 || st === -1) ytPlayer.playVideo(); } catch { } }
+    else if (P.source === 'local' && audio.paused) audio.play().catch(() => blocked());
+    else if (!P.source) load(true);
+    // still silent a moment later: the browser wants a tap
+    setTimeout(() => {
+      if (!wantPlay || document.hidden || !current() || reallyPlaying()) return;
+      P.playing = false; P.loading = false; changed(); // show the true state (it may still say "playing" from before you left)
+      blocked();
+    }, 1800);
+  }, 150);
+}
+const reallyPlaying = () => {
+  if (P.source === 'yt') { try { const st = ytPlayer?.getPlayerState?.(); return st === 1 || st === 3; } catch { return P.playing; } }
+  if (P.source === 'local') return !audio.paused;
+  return false;
+};
+// The browser blocked starting on its own: the next tap anywhere carries on (and the app shows a Play button)
+function blocked() {
+  emit('resume-blocked');
+  if (tapArmed) return; tapArmed = true;
+  const go = e => {
+    off();
+    if (e.target?.closest?.('[data-p="toggle"],[data-p="next"],[data-p="prev"],.row,[data-act^="play"]')) return; // that tap already starts something
+    if (!P.playing && current()) play();
+  };
+  const off = () => { tapArmed = false; document.removeEventListener('pointerdown', go, true); document.removeEventListener('keydown', go, true); };
+  document.addEventListener('pointerdown', go, true); document.addEventListener('keydown', go, true);
+  setTimeout(off, 120e3);
+}
+// Called once the app is on screen after starting up
+function resumeLast() {
+  if (!resumeOnLaunch || !autoResumeOn || !current() || isOn()) return false;
+  resumeOnLaunch = false; quietStart = true;
+  play();
+  setTimeout(() => { if (quietStart && wantPlay && !P.playing && !P.needsTap) blocked(); }, 4500);
+  return true;
+}
 async function ytError(code) {
   const t = current(); if (!t) return;
   // 101/150 = embedding disabled by owner; try the other version, then re-search once
@@ -2582,7 +2736,7 @@ async function startYT(id, start = 0) {
   startWatch = setTimeout(() => {
     if (my !== loadToken || !wantPlay || P.source !== 'yt' || document.hidden) return;
     let st = -9; try { st = ytPlayer.getPlayerState(); } catch { }
-    if (st === -1 || st === 5 || st === 2 && !P.playing) { P.needsTap = true; P.loading = false; changed(); emit('needs-tap'); }
+    if (st === -1 || st === 5 || st === 2 && !P.playing) { P.needsTap = true; P.loading = false; changed(); if (quietStart) { quietStart = false; blocked(); } else emit('needs-tap'); }
   }, 3500);
 }
 // Load the YouTube player in the background right after start-up, so the first song starts instantly
@@ -2615,7 +2769,7 @@ async function load(autoplay = true) {
       try { ytPlayer?.pauseVideo?.(); } catch { }
       audio.volume = outVol();
       try { audio.currentTime = at || 0; } catch { }
-      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); if (quietStart) { quietStart = false; blocked(); } });
       P.loading = false; changed(); startTick();
       return;
     }
@@ -2630,7 +2784,7 @@ async function load(autoplay = true) {
       audio.src = objUrl; applySink(audio);
       audio.volume = outVol();
       if (at) audio.addEventListener('loadedmetadata', () => { try { audio.currentTime = at; } catch { } }, { once: true });
-      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); });
+      if (autoplay) audio.play().catch(() => { P.playing = false; changed(); if (quietStart) { quietStart = false; blocked(); } });
       P.loading = false; changed(); startTick();
       return;
     }
@@ -2703,7 +2857,7 @@ function ended() {
 for (const el of [audio, audioNext]) {
   el.addEventListener('ended', () => el === audio && P.source === 'local' && ended());
   el.addEventListener('play', () => { if (el !== audio) return; P.playing = true; if (!tick) startTick(); changed(); });
-  el.addEventListener('pause', () => { if (el !== audio || isRerouting()) return; P.playing = false; changed(); });
+  el.addEventListener('pause', () => { if (el !== audio || isRerouting()) return; P.playing = false; if (!document.hidden && !leavingNow() && !el.ended && !fadeT) wantPlay = false; changed(); });
   el.addEventListener('error', () => { if (el !== audio) { if (preLocal) { URL.revokeObjectURL(preLocal.url); preLocal = null; } return; } if (P.source === 'local') { P.error = 'Could not play the offline file.'; changed(); } });
 }
 
@@ -2722,7 +2876,7 @@ function play() {
   else load(true);
 }
 function pause() {
-  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify);
+  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify); quietStart = false;
   P.playing = false; P.loading = false; changed();
   if (P.source === 'local') audio.pause();
   else if (ytPlayer?.pauseVideo) try { ytPlayer.pauseVideo(); } catch { }
@@ -2741,6 +2895,7 @@ function seek(sec) {
 const queueIsNew = () => P.queue.length > 1 && (P.origin === 'mix' || !!P.shuffle);
 function next(auto = false) {
   if (!P.queue.length) return;
+  if (!auto) noteSkip();
   if (P.cursor < P.queue.length - 1) P.cursor++;
   else if (P.repeat === 'all') P.cursor = 0;
   else {
@@ -2748,7 +2903,7 @@ function next(auto = false) {
     const plan = endHook?.(P.queue.map(q => q.id));
     if (plan?.ids?.length) {
       let list = plan.ids.filter(id => lib.tracks.has(id)).map(id => ({ id, user: false }));
-      if (plan.shuffle) list.sort(() => Math.random() - 0.5);
+      if (plan.shuffle) { resetSkips(); list = genreShuffle(list.map(q => q.id)).map(id => ({ id, user: false })); }
       if (list.length) { P.queue = list; P.cursor = 0; P.origin = ''; if (plan.msg) toast(plan.msg); load(true); return; }
     }
     if (auto) { P.playing = false; wantPlay = false; changed(); }
@@ -2768,9 +2923,8 @@ function playList(ids, start = 0, { shuffle = P.shuffle, origin = '' } = {}) {
   if (!ids.length) return toast('Nothing to play');
   let list = ids.map(id => ({ id, user: false }));
   if (shuffle) {
-    const first = list.splice(start, 1)[0];
-    list.sort(() => Math.random() - 0.5);
-    list.unshift(first); start = 0;
+    resetSkips();
+    list = genreShuffle(ids, { first: ids[start] }).map(id => ({ id, user: false })); start = 0;
   }
   P.queue = list; P.cursor = start; P.shuffle = shuffle; P.origin = origin;
   load(true);
@@ -2816,10 +2970,7 @@ function clearUserQueue() { P.queue = P.queue.filter((q, i) => i <= P.cursor || 
 
 function setShuffle(v) {
   P.shuffle = v;
-  if (v && P.cursor >= 0) {
-    const rest = P.queue.slice(P.cursor + 1).sort(() => Math.random() - 0.5);
-    P.queue = [...P.queue.slice(0, P.cursor + 1), ...rest];
-  }
+  if (v && P.cursor >= 0) { resetSkips(); reshuffleRest(); }
   persist(); changed(); queueChanged();
 }
 function cycleRepeat() { P.repeat = { off: 'all', all: 'one', one: 'off' }[P.repeat]; persist(); changed(); }
@@ -2941,7 +3092,74 @@ async function outputsChanged() {
 try { navigator.mediaDevices?.addEventListener?.('devicechange', outputsChanged); listOutputs().then(l => { lastOuts = new Set(l.map(d => d.deviceId)); }); } catch { }
 applySink(audio); applySink(audioNext);
 
-return { NO_MATCH, P, isOn, setEndHook, audioMode, current, syncState, lastActive, adopt, restore, warmup, prefetch, setStopAfterSong, stopsAfterSong, fadeOutAndPause, cancelFade, play, pause, toggle, seek, queueIsNew, next, prev, playList, addToQueue, appendToQueue, removeFromQueue, moveInQueue, jumpTo, clearQueue, clearUserQueue, setShuffle, cycleRepeat, setVolume, duck, setMode, setPreferOffline, reloadCurrent, refreshOutput, stopAll, canPickOutput, canSelectOutput, canAirPlay, outputId, listOutputs, outputsNamed, setOutput, chooseOutput, unlockOutputNames, airplay };
+// ---------- Shuffle by genre ----------
+// Shuffle plays songs in little runs of 3 from the same genre, and moves on to a similar genre next
+// (Hip-Hop → R&B → Soul…), so it flows like a DJ set instead of jumping around. Skip one genre more
+// than 5 times and the rest of the shuffle plays less of it (one song at a time, mostly later on).
+const NEAR = {
+  'Hip-Hop/Rap': ['R&B', 'Afrobeats', 'Reggae', 'Pop', 'Electronic'], 'R&B': ['Hip-Hop/Rap', 'Soul', 'Pop', 'Afrobeats', 'Gospel'],
+  'Soul': ['R&B', 'Jazz', 'Blues', 'Gospel'], 'Pop': ['R&B', 'K-Pop', 'Electronic', 'Rock', 'Latin'], 'K-Pop': ['Pop', 'Electronic', 'R&B'],
+  'Electronic': ['Pop', 'Hip-Hop/Rap', 'Latin', 'Afrobeats', 'K-Pop'], 'Afrobeats': ['Reggae', 'Hip-Hop/Rap', 'R&B', 'Latin', 'World'],
+  'Reggae': ['Afrobeats', 'Latin', 'Hip-Hop/Rap'], 'Latin': ['Reggae', 'Pop', 'Afrobeats', 'Electronic'], 'Rock': ['Metal', 'Pop', 'Folk', 'Blues'],
+  'Metal': ['Rock'], 'Folk': ['Country', 'Rock', 'Soundtrack'], 'Country': ['Folk', 'Rock', 'Blues'], 'Jazz': ['Blues', 'Soul', 'Classical'],
+  'Blues': ['Jazz', 'Soul', 'Rock', 'Country'], 'Classical': ['Soundtrack', 'Jazz'], 'Soundtrack': ['Classical', 'Pop'], 'Gospel': ['Soul', 'R&B'],
+  'World': ['Afrobeats', 'Latin', 'Folk'], 'Kids': ['Holiday', 'Soundtrack'], 'Holiday': ['Kids', 'Pop'], 'Comedy': []
+};
+const near = (a, b) => (NEAR[a] || []).includes(b) || (NEAR[b] || []).includes(a);
+const RUN = 3;
+let skips = new Map(), lessOf = new Set();
+function resetSkips() { skips = new Map(); lessOf = new Set(); }
+const gOf = id => genreOf(lib.tracks.get(id)) || '';
+function mix(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; }
+// ids → shuffled ids in genre runs. first: song that must play first; prev: genre playing right now.
+function genreShuffle(ids, { first = null, prev = null, prevRun = 1 } = {}) {
+  const buckets = new Map();
+  for (const id of ids) { if (id === first) continue; const g = gOf(id); (buckets.get(g) || buckets.set(g, []).get(g)).push(id); }
+  for (const b of buckets.values()) mix(b);
+  const size = new Map([...buckets].map(([g, v]) => [g, v.length]));
+  const out = []; let cur = prev, run = prev == null ? 0 : prevRun; // (the song playing now counts toward its run)
+  if (first && lib.tracks.has(first)) { out.push(first); cur = gOf(first); run = 1; }
+  const runFor = g => lessOf.has(g) ? 1 : RUN;
+  while (out.length < ids.length) {
+    const b = buckets.get(cur);
+    if (b?.length && run < runFor(cur)) { out.push(b.pop()); run++; continue; }
+    // next genre: similar ones are much more likely, never the same genre twice in a row if there's a choice,
+    // genres you keep skipping only once the others are mostly done
+    const left = [...buckets].filter(([, v]) => v.length);
+    if (!left.length) break;
+    const pool = left.length > 1 ? left.filter(([g]) => g !== cur) : left;
+    let tot = 0;
+    // (a genre that's falling behind gets a boost, so no genre piles up at the end — except ones you skip)
+    const w = pool.map(([g, v]) => { const f = v.length / size.get(g); const x = (cur == null ? 1 : g && cur && near(cur, g) ? 4 : 1) * v.length * f * f * f * (lessOf.has(g) ? 0.04 : 1); tot += x; return x; });
+    let r = Math.random() * tot, k = 0;
+    while (k < w.length - 1 && (r -= w[k]) > 0) k++;
+    cur = pool[k][0]; run = 0;
+  }
+  return out;
+}
+// Re-shuffle everything after the current song (songs you queued yourself stay first, in order)
+function reshuffleRest() {
+  const head = P.queue.slice(0, P.cursor + 1), rest = P.queue.slice(P.cursor + 1);
+  const mine = rest.filter(q => q.user), others = rest.filter(q => !q.user).map(q => q.id);
+  const cur = current();
+  const g = cur ? gOf(cur.id) : null;
+  P.queue = [...head, ...mine, ...genreShuffle(others, { prev: g, prevRun: lessOf.has(g) ? 99 : 1 }).map(id => ({ id, user: false }))];
+}
+// Skipping: tapping Next before most of the song has played (shuffle only)
+function noteSkip() {
+  const t = current(); if (!P.shuffle || !t) return;
+  const played = P.time || 0, dur = P.duration || (t.durationMs || 0) / 1000;
+  if (dur ? played > dur * 0.6 : played > 90) return; // (listened to most of it: not a skip)
+  const g = genreOf(t); if (!g || lessOf.has(g)) return;
+  const n = (skips.get(g) || 0) + 1; skips.set(g, n);
+  if (n > 5) {
+    lessOf.add(g);
+    reshuffleRest(); persist(); queueChanged();
+    toast(`Playing less ${g} for the rest of this shuffle`);
+  }
+}
+
+return { NO_MATCH, P, isOn, setEndHook, audioMode, current, syncState, lastActive, adopt, restore, setAutoResume, resumeLast, warmup, prefetch, setStopAfterSong, stopsAfterSong, fadeOutAndPause, cancelFade, play, pause, toggle, seek, queueIsNew, next, prev, playList, addToQueue, appendToQueue, removeFromQueue, moveInQueue, jumpTo, clearQueue, clearUserQueue, setShuffle, cycleRepeat, setVolume, duck, setMode, setPreferOffline, reloadCurrent, refreshOutput, stopAll, canPickOutput, canSelectOutput, canAirPlay, outputId, listOutputs, outputsNamed, setOutput, chooseOutput, unlockOutputNames, airplay, genreShuffle };
 })();
 // ---------- backup.js ----------
 const __m_backup = (() => {
@@ -4242,7 +4460,7 @@ async function answer(q) {
   return decide(p.action, [q], { shuffle: p.opts.shuffle });
 }
 
-const PAGES = { home: '#/home', library: '#/library/songs', songs: '#/library/songs', 'liked songs': '#/library/liked', likes: '#/library/liked', liked: '#/library/liked', playlists: '#/library/playlists', albums: '#/library/albums', artists: '#/library/artists', search: '#/search', settings: '#/settings', import: '#/import', offline: '#/offline', queue: '#/queue', 'privacy policy': '#/legal', terms: '#/legal' };
+const PAGES = { home: '#/home', library: '#/library/liked', songs: '#/library/songs', 'liked songs': '#/library/liked', likes: '#/library/liked', liked: '#/library/liked', playlists: '#/library/playlists', albums: '#/library/albums', artists: '#/library/artists', search: '#/search', settings: '#/settings', import: '#/import', offline: '#/offline', queue: '#/queue', 'privacy policy': '#/legal', terms: '#/legal' };
 
 async function handle(raw, alts = []) {
   const q = clean(raw);
@@ -4657,7 +4875,7 @@ const __m_app = (() => {
 // BAZINGA — app shell, router and views
 const { db, kv } = __m_db;
 const { $, $$, esc, on, emit, toast, debounce, fmtTime, fmtDur, imageToDataURL, mainArtist, norm, trackKey, albumKey, yearOf, packToString, unpackString, sleep, downloadBlob, uid, displayTitle, genreOf } = __m_util;
-const { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, filterBar, empty, likedCover, loader, sized, toastUndo, THEMES, applyTheme, currentTheme, logoSrc } = __m_ui;
+const { icon, cover, trackRow, card, modal, promptText, confirmBox, menu, applyFilters, setPopularity, filterBar, empty, likedCover, loader, sized, toastUndo, THEMES, applyTheme, currentTheme, logoSrc } = __m_ui;
 const { initVoice, openVoice, canListen, voiceOptions, setVoicePrefs, previewVoice, setWake, wakeSupported } = __m_voice;
 const store = __m_store;
 const { lib } = __m_store;
@@ -4678,7 +4896,7 @@ const lists = new Map();      // listKey -> [trackIds] for "play from here"
 const sections = new Map();   // sectionKey -> {tracks, opts}
 const fstate = {};            // sectionKey -> filter state
 let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
-const APP_VERSION = 'v1.1';
+const APP_VERSION = 'v1.7.3'; // shown at the bottom of Settings — bump with each release
 const APP_TAGLINE = 'Music Made For You';
 const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
 let profile = null;
@@ -4974,6 +5192,7 @@ function applySettings() {
   meta.setCountry(settings.country);
   yt.setYTSettings({ ytKey: settings.ytKey, customInstance: settings.customInstance, ownerKey: window.BAZINGA_CONFIG?.youtubeApiKey || '' });
   store.setEnrich(settings.enrich !== false);
+  player.setAutoResume(settings.autoResume !== false);
   keepAwake();
 }
 
@@ -5159,7 +5378,7 @@ async function showApp() {
     search: (q, tab = 'all') => { lastSearch.q = q; if (location.hash === '#/search/' + tab) route(); else location.hash = '#/search/' + tab; },
     openNP: () => openNP(), closeNP: () => closeNP(), lyrics: on => setLyrics(on), toast
   });
-  route().finally(() => hideSplash());
+  route().finally(() => { hideSplash(); setTimeout(() => player.resumeLast(), 2000); }); // carry on with the music if it was playing when you left
   (window.requestIdleCallback || (f => setTimeout(f, 2500)))(iosStartupImage);
   try { speechSynthesis.addEventListener('voiceschanged', () => { if (location.hash.startsWith('#/settings') && !$('#set-voice')) rerender(); }); } catch { }
   setVoicePrefs({ name: settings.voiceName || '' });
@@ -5247,15 +5466,22 @@ const isInstalled = async () => isStandalone() || !!((await kv.get('a2hs')) || {
 // (if it lands on an Add to Home Screen visit, it follows right after that popup).
 async function launchPopups() {
   const { n, fresh } = await countLaunch();
-  if (!fresh || !profile || $('.modal-wrap') || document.body.classList.contains('np-open')) return;
+  // "Help BAZINGA! get to Phase 2": every 7th time the app is loaded (reloads count), until "Don't show this again"
+  const loads = ((await kv.get('loads')) || 0) + 1; await kv.set('loads', loads);
+  const cof0 = (await kv.get('phase2')) || {};
+  const wantP2 = !cof0.never && (loads % 7 === 0 || cof0.p2pending);
+  const busy = () => !profile || $('.modal-wrap') || $('#mix-ov') || document.body.classList.contains('np-open');
+  if (!fresh || busy()) { if (wantP2) { if (busy()) { cof0.p2pending = true; await kv.set('phase2', cof0); } else showP2(cof0); } return; }
   const a2 = (await kv.get('a2hs')) || {}, cof = (await kv.get('phase2')) || {};
   const wantA2 = !a2.never && !(await isInstalled()) && (n === 1 || n % 5 === 0);
   const wantCoffee = !cof.never && (n % 10 === 0 || (cof.pending && n > 1));
   if (wantA2) await maybeInstallPrompt();
-  if (!wantCoffee) return;
+  if (!wantCoffee) { if (wantP2) { if (wantA2 || busy()) { cof.p2pending = true; await kv.set('phase2', cof); } else showP2(cof); } return; }
+  if (wantP2) { cof.p2pending = true; } // (the love popup comes first; Phase 2 waits for the next load)
   cof.pending = false; await kv.set('phase2', cof);
   setTimeout(() => { if (!$('.modal-wrap') && !$('#mix-ov')) phase2Popup({ love: true }); else { cof.pending = true; kv.set('phase2', cof); } }, wantA2 ? 700 : 0);
 }
+async function showP2(st) { st.p2pending = false; await kv.set('phase2', st); phase2Popup({ ask: true }); }
 async function maybeInstallPrompt(force = false) {
   if (isStandalone()) { if (force) toast('BAZINGA! is already installed on this device ✓', 'ok'); return; }
   const st = (await kv.get('a2hs')) || {};
@@ -5353,7 +5579,7 @@ const showLegal = () => modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3>
 // Browser tab title: "BAZINGA! - <page>"
 const setTitle = x => { document.title = 'BAZINGA! - ' + (x || APP_TAGLINE); };
 const TITLES = { new: 'New from your top artists', home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
-const LIB_TABS = { songs: 'Songs', liked: 'Liked Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
+const LIB_TABS = { liked: 'Liked Songs', songs: 'Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
 // Where "Back" goes when there's no in-app history (e.g. a shared link opened directly)
 const BACK_TO = { new: ['#/home', 'Home'], artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
 const navStack = [];
@@ -5371,7 +5597,7 @@ async function route() {
   if (navStack.length > 50) navStack.shift();
   const h = location.hash.replace(/^#\/?/, '') || 'home';
   const [name, ...rest] = h.split('/');
-  setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'songs'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
+  setTitle(name === 'library' ? (LIB_TABS[rest[0] || 'liked'] || 'Library') : (TITLES[name] || (name === 'genre' ? decodeURIComponent(rest[0] || '') : APP_TAGLINE)));
   const arg = rest.map(decodeURIComponent);
   lists.clear(); sections.clear(); pagers.clear();
   $('#main')?.removeEventListener('scroll', settingsSpy);
@@ -5410,7 +5636,7 @@ async function route() {
 }
 function backLabel(hash) {
   const [n, a] = hash.replace(/^#\/?/, '').split('/');
-  if (n === 'library') return LIB_TABS[a || 'songs'] || 'Library';
+  if (n === 'library') return LIB_TABS[a || 'liked'] || 'Library';
   if (n === 'artist') return decodeURIComponent(a || 'Artist');
   if (n === 'playlist') return lib.playlists.get(a)?.name || 'Playlist';
   if (n === 'album') return 'Album';
@@ -5426,14 +5652,30 @@ const rerender = debounce(() => {
 
 // ================= TRACK LIST SECTIONS =================
 const PAGE = 150;
+// Filters & sort are remembered on this device, per list, so they're still set when you come back
+const FKEEP = ['sort', 'genres', 'years', 'liked', 'offline', 'q', 'from', 'to', 'open'];
+// (only lists that are always the same list: Liked Songs, Songs, Offline and each playlist — not album/artist/genre pages)
+const FREMEMBER = new Set(['liked', 'songs', 'offline', 'pl']);
+const fmemKey = (key, f) => key === 'pl' ? 'pl:' + (f?._id || '') : key;
+let fmem = {}; try { fmem = JSON.parse(localStorage.getItem('bz_filters') || '{}') || {}; } catch { }
+function saveFilters(key) {
+  const f = fstate[key]; if (!f || !FREMEMBER.has(key)) return;
+  const keep = {}; for (const k of FKEEP) if (f[k] !== undefined && f[k] !== '' && !(Array.isArray(f[k]) && !f[k].length) && f[k] !== false) keep[k] = f[k];
+  const mk = fmemKey(key, f);
+  if (Object.keys(keep).length) fmem[mk] = keep; else delete fmem[mk];
+  const ks = Object.keys(fmem); if (ks.length > 60) delete fmem[ks[0]];
+  try { localStorage.setItem('bz_filters', JSON.stringify(fmem)); } catch { }
+}
+const savedFilters = mk => { const m = fmem[mk]; return m ? JSON.parse(JSON.stringify(m)) : null; };
 function tracksSection(key, tracks, opts = {}) {
   sections.set(key, { tracks, opts });
-  fstate[key] = fstate[key] || { sort: opts.defaultSort ?? 'added', open: false };
+  fstate[key] = fstate[key] || { sort: opts.defaultSort ?? 'added', open: false, ...(key !== 'pl' && FREMEMBER.has(key) ? savedFilters(key) || {} : {}) };
   return `<div class="tsec" data-tsec="${key}">${tracksSectionInner(key)}</div>`;
 }
 function tracksSectionInner(key) {
   const { tracks, opts } = sections.get(key);
   const f = fstate[key];
+  if (!opts.noFilter && f.sort === 'popular') popKick(key, tracks);
   const shown = opts.noFilter ? tracks : applyFilters(tracks, f);
   lists.set(key, shown.map(t => t.id));
   const cur = player.current()?.id;
@@ -5443,7 +5685,25 @@ function tracksSectionInner(key) {
   const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
   return head + count + `<div class="rows">${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
 }
+// "Most popular": numbers load once from the device (fast), then missing views/likes fill in quietly in the
+// background; the list re-sorts itself at most every few seconds while they arrive.
+setPopularity(yt.popularity);
+let popLoaded = false, popRefreshT = 0, popLastRefresh = 0;
+const popRefresh = () => {
+  clearTimeout(popRefreshT);
+  popRefreshT = setTimeout(() => {
+    if (isTyping() || ($('#main')?.scrollTop || 0) > 1500 || $('.menu, .modal-wrap')) return popRefresh(); // (never re-sort under someone reading far down or using a menu)
+    popLastRefresh = Date.now();
+    for (const [k, f] of Object.entries(fstate)) if (f.sort === 'popular' && sections.has(k) && document.querySelector(`[data-tsec="${k}"]`)) refreshSection(k, true);
+  }, Math.max(400, 4000 - (Date.now() - popLastRefresh)));
+};
+function popKick(key, tracks) {
+  if (!popLoaded) { yt.loadPopularity().then(() => { popLoaded = true; popRefresh(); }); }
+  const ids = tracks.map(t => t.id);
+  (window.requestIdleCallback || (f => setTimeout(f, 300)))(() => yt.wantStats(ids, popRefresh));
+}
 function refreshSection(key, keepFocus) {
+  saveFilters(key);
   const el = $(`[data-tsec="${key}"]`); if (!el) return;
   const active = document.activeElement?.dataset?.f;
   const pos = document.activeElement?.selectionStart;
@@ -5516,7 +5776,7 @@ async function vHome(_, my) {
         <div class="row-btns">
           ${bzBtn('primary')}
           ${liked.length ? `<button class="btn" data-act="play-list" data-id="home-liked">${icon('play')}Play Liked Songs</button>` : ''}
-          <button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>
+          ${liked.length ? `<button class="btn" data-act="play-list" data-id="home-liked" data-shuffle="1">${icon('shuffle')}Shuffle Liked Songs</button>` : `<button class="btn" data-act="play-list" data-id="home-all" data-shuffle="1">${icon('shuffle')}Shuffle everything</button>`}
         </div>
       </div>
       ${collage.length >= 2 ? `<div class="hh-collage">${collage.map((src, i) => `<img src="${esc(sized(src, 300))}" alt="" style="--i:${i}" loading="lazy">`).join('')}</div>` : ''}
@@ -5878,9 +6138,9 @@ async function vGenre([g]) {
 }
 
 // ---------- LIBRARY ----------
-async function vLibrary([tab = 'songs']) {
+async function vLibrary([tab = 'liked']) {
   const all = store.saved();
-  const tabs = [['songs', 'Songs', all.length], ['liked', 'Liked', all.filter(t => t.liked).length], ['playlists', 'Playlists', lib.playlists.size], ['albums', 'Albums', lib.albums.size + store.implicitAlbums().length], ['artists', 'Artists', store.artists().length]];
+  const tabs = [['liked', 'Liked', all.filter(t => t.liked).length], ['songs', 'Songs', all.length], ['playlists', 'Playlists', lib.playlists.size], ['albums', 'Albums', lib.albums.size + store.implicitAlbums().length], ['artists', 'Artists', store.artists().length]];
   let body = '';
   if (tab === 'songs' || tab === 'liked') {
     const tracks = tab === 'liked' ? all.filter(t => t.liked) : all;
@@ -5967,7 +6227,7 @@ async function vPlaylist([id]) {
   const tracks = p.trackIds.map(i => lib.tracks.get(i)).filter(Boolean);
   setTitle(p.name);
   const dur = tracks.reduce((s, t) => s + (t.durationMs || 0), 0);
-  fstate['pl'] = fstate['pl'] && fstate['pl']._id === id ? fstate['pl'] : { sort: '', open: false, _id: id };
+  fstate['pl'] = fstate['pl'] && fstate['pl']._id === id ? fstate['pl'] : { sort: '', open: false, ...(savedFilters('pl:' + id) || {}), _id: id };
   view().innerHTML = `<div class="page">
     ${header(esc(p.name), `${esc(profile.username)} · ${tracks.length} songs${dur ? ' · ' + fmtTime(dur / 1000) : ''}${p.source ? ' · from ' + esc(p.source) : ''}`, cover(plCover(p), p.name), '', 'Playlist')}
     <div class="actions">${playBtns('play-list', 'pl')}
@@ -6606,6 +6866,7 @@ async function vSettings([section] = []) {
         ${[['liked', 'Play Liked Songs'], ['replay', 'Replay the queue'], ['off', 'Stop']].map(([v, l]) => `<label><input type="radio" name="autoplay" value="${v}" ${(settings.autoplay || 'liked') === v ? 'checked' : ''}><span>${l}</span></label>`).join('')}
       </div></div>
       <p class="tiny muted">Autoplay keeps the music going: after the last song it starts your Liked Songs (shuffled), or plays the same queue again from the top. If the queue already was your Liked Songs, it replays them.</p>
+      <label class="toggle"><input type="checkbox" id="set-autoresume" ${settings.autoResume !== false ? 'checked' : ''}><span></span><div>Keep playing when you come back<small class="tiny muted" style="display:block">Leave BAZINGA! (or close it) while music plays, and it carries on where it was when you return.</small></div></label>
       <label class="toggle"><input type="checkbox" id="set-prefoff" ${P.preferOffline ? 'checked' : ''}><span></span>Prefer offline files when online too</label>
       <label class="toggle"><input type="checkbox" id="set-awake" ${settings.keepAwake !== false ? 'checked' : ''}><span></span><div>Keep the screen on while BAZINGA! is open<small class="tiny muted" style="display:block">Phones stop web music when they lock — this keeps your songs playing.</small></div></label>
       <label class="toggle"><input type="checkbox" id="set-lock" ${settings.lockFeature !== false ? 'checked' : ''}><span></span><div>Screen lock<small class="tiny muted" style="display:block">Shows a lock button (top bar on phones, sidebar on computers), and tapping an empty spot 3 times quickly locks the app so pocket touches and accidental taps do nothing. Tap 3 times again to unlock — the music keeps playing.</small></div></label>
@@ -6662,7 +6923,7 @@ async function vSettings([section] = []) {
     <div class="panel danger-zone" id="erase"><h2>${icon('trash')} Erase this device</h2>
       <p class="muted">Erases your name, library, playlists, albums, offline files and on-device backups from this browser. ${sync.linked() ? 'Your other synced devices keep their music. ' : ''}A backup file you saved elsewhere is not touched.</p>
       <button class="btn danger" data-act="delete-account">Erase everything here</button></div>
-    <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a></p>
+    <p class="tiny muted center"><a class="lnk" href="#/legal">Privacy Policy & Terms</a><br><span class="app-ver">BAZINGA! ${APP_VERSION}</span></p>
   </div>`;
   settingsAccordions(section);
   $('#pf-file').onchange = async e => { const f = e.target.files[0]; if (!f) return; profile.picture = await imageToDataURL(f, 256); await profileChanged(); rerender(); };
@@ -6671,9 +6932,11 @@ async function vSettings([section] = []) {
   $$('#set-autoplay input').forEach(i => i.onchange = () => saveSettings({ autoplay: i.value }));
   $$('.ah-theme [data-theme]').forEach(b => b.onclick = async () => {
     const k = b.dataset.theme; markThemePicks(k); await saveSettings({ theme: k });
-    toast(`${THEMES.find(t => t[0] === k)[1]} it is ⚡`, 'ok');
+    const nm = THEMES.find(t => t[0] === k)[1];
+    toast(isStandalone() ? (isIOS() ? `${nm} it is ⚡ iPhone keeps the Home Screen icon from when BAZINGA! was added.` : `${nm} it is ⚡ Your Home Screen icon switches too the next time your phone checks for app updates.`) : `${nm} it is ⚡`, 'ok');
   });
   $('#set-prefoff').onchange = e => player.setPreferOffline(e.target.checked);
+  $('#set-autoresume').onchange = e => { saveSettings({ autoResume: e.target.checked }); player.setAutoResume(e.target.checked); };
   $('#set-lock').onchange = e => { saveSettings({ lockFeature: e.target.checked }); applyLockSetting(); toast(e.target.checked ? 'Screen lock is on — tap 3 times or use the lock button' : 'Screen lock is off', e.target.checked ? 'ok' : 'info'); };
   $('#set-awake').onchange = e => { saveSettings({ keepAwake: e.target.checked }); toast(e.target.checked ? 'Your screen stays on while BAZINGA! is open ⚡' : 'Screen can lock again — music may stop when it does', e.target.checked ? 'ok' : 'info'); };
   $('#set-voice')?.addEventListener('change', e => { saveSettings({ voiceName: e.target.value }); setVoicePrefs({ name: e.target.value }); previewVoice(e.target.value); });
@@ -7055,7 +7318,7 @@ const coffeeBack = () => {
 };
 document.addEventListener('visibilitychange', coffeeBack);
 window.addEventListener('focus', coffeeBack);
-async function phase2Popup({ love = false, step = '' } = {}) {
+async function phase2Popup({ love = false, step = '', ask: askFirst = false } = {}) {
   const st = (await kv.get('phase2')) || {};
   st.lastShown = new Date().toISOString().slice(0, 10); await kv.set('phase2', st);
   // Step 1: a quick "do you love it?" — only people who do are asked for a coffee
@@ -7074,7 +7337,7 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   const sad = () => `<div class="sad-face" aria-label="Sad face">${icon('sad')}</div>`;
   const ask = () => `
       <div class="kicker">Phase 2 ⚡ Lock-screen listening</div>
-      <h3>Help unlock music on your lock screen</h3>
+      <h3>Help BAZINGA! get to Phase 2</h3>
       <p>Right now your phone pauses BAZINGA! when the screen locks or you leave the app. To let everyone enjoy music and streams on the lock screen, BAZINGA! needs a music license — and that's what Phase 2 is for.</p>
       ${p2GoalHTML()}
       <a class="coffee-btn big p2-support" href="${BMC_URL}" target="_blank" rel="noopener"><span class="cb-cup"><i></i><i></i><i></i>${icon('coffee')}</span><span class="cb-txt"><b>Support Phase 2</b><small>Every coffee counts ☕</small></span><span class="cb-shine"></span></a>
@@ -7112,7 +7375,7 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   const r = await modal(`<div class="p2"><div class="p2-bg" aria-hidden="true"><i></i><i></i><i></i></div><div class="p2-body"></div></div>`, {
     onMount: (m, close) => {
       m.classList.add('p2-modal');
-      body = m.querySelector('.p2-body'); if (step === 'wait') show('wait', waiting()); else if (love) show('love', loveQ()); else show('yay', yay());
+      body = m.querySelector('.p2-body'); if (step === 'wait') show('wait', waiting()); else if (love) show('love', loveQ()); else if (askFirst) show('ask', ask()); else show('yay', yay());
       m.addEventListener('click', e => {
         if (e.target.closest('.p2-support')) {
           st.supportClickedAt = Date.now(); kv.set('phase2', st);
@@ -7141,6 +7404,9 @@ async function phase2Popup({ love = false, step = '' } = {}) {
   if (onBack) { document.removeEventListener('visibilitychange', onBack); window.removeEventListener('focus', onBack); }
   if (state === 'later') { st.declinedAt = Date.now(); kv.set('phase2', st); }
 }
+// Coming back to BAZINGA!: the browser wants a tap before the music can carry on
+on('resume-blocked', () => { if (!$('#toasts .resume-t')) { toastUndo('Tap anywhere to keep listening', () => player.play(), '▶ Play'); setTimeout(() => $('#toasts .toast:last-child')?.classList.add('resume-t'), 0); } });
+
 // ================= SHORT ERRORS WITH A FIX =================
 // Player/search errors stay one short line, with a button that fixes them right there.
 function errHTML(msg, compact = false, where = 'player') {
@@ -7557,7 +7823,7 @@ function wireGlobal() {
       case 'f-genre': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const g = a.dataset.g; f.genres = f.genres?.includes(g) ? f.genres.filter(x => x !== g) : [...(f.genres || []), g]; refreshSection(key); break; }
       case 'f-year': { const key = a.closest('[data-tsec]').dataset.tsec; const f = fstate[key]; const y = +a.dataset.y; f.years = f.years?.includes(y) ? f.years.filter(x => x !== y) : [...(f.years || []), y]; refreshSection(key); break; }
       case 'f-flag': { const key = a.closest('[data-tsec]').dataset.tsec; fstate[key][a.dataset.k] = !fstate[key][a.dataset.k]; refreshSection(key); break; }
-      case 'f-clear': { const key = a.closest('[data-tsec]').dataset.tsec; Object.assign(fstate[key], { genres: [], years: [], liked: false, offline: false, q: '' }); refreshSection(key); break; }
+      case 'f-clear': { const key = a.closest('[data-tsec]').dataset.tsec; Object.assign(fstate[key], { genres: [], years: [], from: '', to: '', liked: false, offline: false, q: '' }); refreshSection(key); break; }
       case 'new-playlist': { const n = await promptText('New playlist', '', 'Name', 'Create'); if (n) { const p = await store.createPlaylist(n); renderSidebarPlaylists(); location.hash = '#/playlist/' + p.id; } break; }
       case 'playlist-menu': playlistMenu(a, id); break;
       case 'share-playlist': { const p = lib.playlists.get(id); shareTracks('playlist', p.name, p.trackIds.map(x => lib.tracks.get(x)).filter(Boolean), plCover(p)); break; }
@@ -7678,7 +7944,8 @@ function wireGlobal() {
     const f = e.target.dataset.f; if (!f) return;
     const key = e.target.closest('[data-tsec]')?.dataset.tsec; if (!key) return;
     fstate[key][f] = e.target.value;
-    if (f === 'q' || f === 'from' || f === 'to') debouncedRefresh(key);
+    if (f === 'from' || f === 'to') { delete fstate[key].years; refreshSection(key); return; }
+    if (f === 'q') debouncedRefresh(key);
     else refreshSection(key);
   });
   document.addEventListener('change', e => {
@@ -7728,6 +7995,11 @@ function wireGlobal() {
   // Re-place the video on any size change (window, phone rotation, browser bars)
   const schedulePlace = () => requestAnimationFrame(() => requestAnimationFrame(placeDock));
   window.addEventListener('resize', schedulePlace);
+  // Turning the phone: the browser reports the new size before the new layout has settled, so place it again a few times
+  const afterTurn = () => { schedulePlace(); [120, 300, 600, 1000].forEach(ms => setTimeout(placeDock, ms)); };
+  window.addEventListener('orientationchange', afterTurn);
+  screen.orientation?.addEventListener?.('change', afterTurn);
+  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); new MutationObserver(() => { const sl = $('#np-slot'); if (sl && !sl._ro) { sl._ro = 1; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
   window.visualViewport?.addEventListener('resize', schedulePlace);
   if ('ResizeObserver' in window) new ResizeObserver(schedulePlace).observe($('#np'));
   // Yellow fill on every slider as it moves
@@ -8252,7 +8524,7 @@ function placeDock() {
   const slot = document.body.classList.contains('np-open') ? $('#np-slot') : null;
   if (slot) {
     const r = slot.getBoundingClientRect();
-    const st = dock.style, L = Math.round(r.left + scrollX) + 'px', T = Math.round(r.top + scrollY) + 'px', W = r.width + 'px', H = r.height + 'px';
+    const st = dock.style, L = (r.left + scrollX) + 'px', T = (r.top + scrollY) + 'px', W = r.width + 'px', H = r.height + 'px'; // exact, so the video sits flush in its frame
     if (st.left !== L || st.top !== T || st.width !== W || st.height !== H) Object.assign(st, { left: L, top: T, width: W, height: H, right: 'auto', bottom: 'auto' });
     dock.classList.add('in-np');
   } else if (dock.classList.contains('in-np') || dock.hasAttribute('style')) {

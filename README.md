@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v44`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v47`) so phones fetch the new version.
 
 ## Features
 
@@ -34,6 +34,26 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Offline**: add music files you own; they're matched to your songs automatically, grouped into albums, and play without internet. The app itself also opens offline.
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
+
+### New in v1.7.3
+- **Corner video always 16:9**: on tablets and mid-size windows the small video box was 296×200, so videos didn't fill it; it now keeps the video's shape at every width (and the big size too).
+- **"Help BAZINGA! get to Phase 2" pop-up** every 7th time the app is loaded (reloads count), until *Don't show this again*. If another pop-up is already showing, it waits for the next load.
+- **Home**: "Shuffle everything" is now **Shuffle Liked Songs** (it shuffles everything only while nothing is liked yet).
+- **Pop-ups clear the iPhone status bar, camera and home bar** (safe-area padding), with extra top room for Help on phones held upright.
+- **Version shown** at the bottom of Settings (e.g. "BAZINGA! v1.7.3"), to check which build a device is running. Bump `APP_VERSION` in `src/app.js` with each release.
+
+### New in v1.7.2
+- **Shuffle by genre**: shuffle plays runs of 3 songs from the same genre, then usually moves to a similar genre (Hip-Hop → R&B → Soul…). Genres that fall behind get a boost, so none piles up at the end. Songs you queued yourself stay first.
+- **Learns from skips**: skip one genre more than 5 times during a shuffle (Next before 60% of the song) and the rest of that shuffle plays less of it: one song at a time and mostly later on. Starting a new shuffle starts fresh.
+- **Year filter is a range**: two pickers, From and To (either can stay on Any). Older multi-year picks turn into a range automatically.
+- **Sort: Most popular**: by the music video's YouTube views and likes. View counts are saved free while songs are matched; likes and fresh numbers fill in quietly in the background only for lists sorted this way (50 per request with a YouTube key, otherwise gently paced through free services, max 400 per visit, stops if the services are down), and are kept for 30 days. Songs without numbers yet stay at the bottom. 2,000 songs sort in under 20 ms.
+
+### New in v1.7.1
+- **Keeps playing when you come back**: leave BAZINGA! (switch apps, lock the phone, close it) while music plays and it carries on when you return — even if the phone closed the app (within 30 min). A pause you pressed yourself is respected. If the browser insists on a tap first, one tap anywhere (or the toast's ▶ Play) carries on. On/off: Settings → Playback → *Keep playing when you come back*.
+- **Library opens on Liked Songs**; tabs are Liked, Songs, Playlists, Albums, Artists.
+- **Filters & sort are remembered** for Liked Songs, Songs, Offline and each playlist (on this device), so they're still set when you return. Album, artist and genre pages start fresh.
+- **Video fits after turning the phone**: the video is placed exactly on its frame (no 1px offset) and re-placed as the new layout settles after a rotation.
+- **Home Screen icon**: the installed-app manifest and icon addresses answer in your colour the moment you switch. Android/desktop apply it at their next app-update check (usually within a day of opening; Chrome may ask to confirm). iPhone/iPad keep the icon from when the app was added — that's an Apple limit; new "Add to Home Screen" always uses your current colour.
 
 ### New in v1.7
 - **Settings sections fold away**: every section is one button (icon, title, one-line description). Tap it and the whole section drops open underneath; tap again and it folds back up. Section tabs, "Fix issue" links and `#/settings/<section>` open the right one automatically.
