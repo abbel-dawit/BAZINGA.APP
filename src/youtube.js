@@ -102,10 +102,18 @@ async function hit(base, q, ms = 7000) {
 }
 
 // Normalised result: {id, title, author, seconds, views}
+const isoSecs = d => { const m = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/.exec(d || ''); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
 async function searchViaKey(q, key = settings.ytKey) {
   const u = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=12&q=${encodeURIComponent(q)}&key=${encodeURIComponent(key)}`;
   const d = await fetchJSON(u);
-  return (d.items || []).map(i => ({ id: i.id.videoId, title: decodeEntities(i.snippet.title), author: i.snippet.channelTitle, seconds: 0 }));
+  const out = (d.items || []).map(i => ({ id: i.id.videoId, title: decodeEntities(i.snippet.title), author: i.snippet.channelTitle, seconds: 0, views: 0 }));
+  // views + length for all of them in one cheap call, so "most played" and length checks work with a key too
+  if (out.length) try {
+    const v = await fetchJSON(`https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${out.map(r => r.id).join(',')}&key=${encodeURIComponent(key)}`, 5000);
+    const by = new Map((v.items || []).map(i => [i.id, i]));
+    for (const r of out) { const i = by.get(r.id); if (i) { r.views = +i.statistics?.viewCount || 0; r.seconds = isoSecs(i.contentDetails?.duration); } }
+  } catch { }
+  return out;
 }
 async function searchInvidious(base, q, ms) {
   const d = await fetchJSON(`${base}/api/v1/search?type=video&q=${encodeURIComponent(q)}&fields=type,videoId,title,author,lengthSeconds,viewCount`, ms);
@@ -277,9 +285,90 @@ function score(r, t, mode) {
   if (r.views > 1e6) s += 1;
   return s;
 }
-function pick(list, t, mode, notId) {
+// Loose fallback (the older scoring): used only when no result passes the strict rules below
+function pickLoose(list, t, mode, notId) {
   const b = list.filter(r => r.id !== notId).map(r => [score(r, t, mode), r]).sort((a, b) => b[0] - a[0])[0];
   return b && b[0] >= 8 ? b[1] : null;
+}
+
+// ---------- Strict matching ----------
+// 1. The artist's own upload first: their channel, their "Artist - Topic" profile, or their VEVO.
+// 2. Otherwise the most-played upload whose title is exactly this song (by this artist).
+// 3. Audio: if no audio upload matches, the music video is used for audio too.
+export const MATCH_V = 2; // bump when these rules change, so older matches get quietly re-checked
+const FILLER = new Set(['official', 'video', 'music', 'audio', 'lyric', 'lyrics', 'visualizer', 'visualiser', 'hd', 'hq', '4k', 'mv', 'm', 'v', 'explicit', 'clean', 'topic', 'vevo', 'and', 'x', 'vs', 'ft', 'feat', 'featuring', 'with', 'prod', 'by', 'the', 'new', 'song', 'full', 'track', 'single', 'remastered', 'remaster', 'premiere', 'color', 'coded', 'eng', 'sub', 'subs', 'lyricvideo', 'officialvideo']);
+const NOISE_BR = /[\(\[\{【][^\)\]\}】]*[\)\]\}】]/g;
+const BAD_VARIANT = /\b(cover|karaoke|instrumental|reaction|react|8d|slowed|sped ?up|nightcore|reverb|remix|live|acoustic|extended|1 ?hour|loop|piano version|tutorial|lesson|fan ?made|mashup|dance practice|choreography|bass boosted|a ?cappella|acapella|unplugged|demo|rehearsal)\b/;
+const songCore = t => norm(String(t.title || '').replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '').replace(/\s+(feat|ft)\.?\s.*$/i, ''));
+const artistNames = t => [...new Set([mainArtist(t.artist), ...(t.artists || [])].map(norm).filter(Boolean))];
+const tokens = s => s.split(' ').filter(Boolean);
+const squash = s => s.replace(/ /g, '');
+const isTopic = r => /\s-\stopic$/i.test(String(r.author || ''));
+// The channel name, minus the bits that aren't the artist ("- Topic", "VEVO", "Official", "Music"…)
+const channelCore = r => norm(String(r.author || '').replace(/\s*-\s*topic$/i, '').replace(/vevo$/i, '').replace(/\b(official|music|tv|channel|records?|hq)\b/gi, ''));
+// From the artist's own channel / Topic profile / VEVO?
+export function fromArtist(r, t) {
+  const c = squash(channelCore(r)); if (!c) return false;
+  return artistNames(t).some(a => { const s = squash(a); return s && (c === s || (s.length >= 4 && (c === s + 'official' || c === 'the' + s || c === s + 'music'))); });
+}
+// The result's title is this song and nothing else (once artist names, "Official Video" etc. are set aside)
+// Plain words, for comparing titles (keeps everything norm() would strip, like "(Live)" or "- Remix")
+const plain = x => String(x ?? '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/&/g, ' and ').replace(/['’‘`´]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+// Set aside brackets/segments that only say "Official Video", "feat. X", "Remastered 2011"…;
+// anything else, like "(Taylor's Version)" or "(Sped Up)", stays part of the title
+function cleanTitle(title, noise) {
+  let raw = String(title || '').replace(NOISE_BR, m => {
+    const inner = plain(m);
+    return !inner || /^(feat|ft|featuring|with|prod|from)\b/.test(inner) || tokens(inner).every(noise) ? ' ' : ' ' + m.slice(1, -1) + ' ';
+  });
+  raw = raw.replace(/[|｜].*$/, ' ').split(/\s[-–—]\s/).map(seg => seg.replace(/\s+(feat|ft|featuring)\.?\s.*$/i, ' ')).filter(seg => !tokens(plain(seg)).every(noise) || !plain(seg)).join(' ');
+  return tokens(plain(raw));
+}
+const fillerOnly = w => FILLER.has(w) || /^\d{4}$/.test(w);
+// The result's title is this song and nothing else (apart from artist names, "Official Video" etc.)
+export function titleMatches(r, t) {
+  const song = cleanTitle(t.title, w => fillerOnly(w) && !['the', 'and', 'x', 'new', 'song', 'music', 'track', 'with', 'by', 'full', 'original'].includes(w));
+  if (!song.length) return false; // (titles in other scripts: the looser matching handles those)
+  const skip = new Set([...artistNames(t).flatMap(w => tokens(plain(w))), ...tokens(plain(channelCore(r))), ...tokens(plain(r.author))]);
+  const noise = w => fillerOnly(w) || skip.has(w);
+  const res = cleanTitle(r.title, noise);
+  for (let k = 0; k + song.length <= res.length; k++) {
+    if (song.every((w, n) => res[k + n] === w)) return [...res.slice(0, k), ...res.slice(k + song.length)].every(noise);
+  }
+  return false;
+}
+// Says it's another version (remix, live, cover, sped up…) when the song itself isn't
+function otherVersion(r, t) {
+  const raw = String(r.title || '').toLowerCase(), song = String(t.title || '').toLowerCase();
+  const m = raw.match(BAD_VARIANT);
+  return !!m && !song.includes(m[1].split(' ')[0]);
+}
+// How well an upload suits the mode: audio wants the Topic track / official audio, video wants the music video
+function kindOf(r, mode) {
+  const raw = String(r.title || '').toLowerCase(), topic = isTopic(r);
+  const mv = /official (music )?video|music video|\bm\/?v\b|official visual|official film/.test(raw);
+  const aud = /official audio|\baudio\b/.test(raw);
+  const lyr = /lyric|visuali[sz]er/.test(raw);
+  if (mode === 'audio') return topic ? 4 : aud ? 3 : lyr ? 2 : mv ? 0 : 1;
+  return topic ? -1 : mv ? 4 : (aud || lyr) ? 0 : 2;
+}
+function lengthOK(r, t, mode) {
+  const full = t.durationMs ? t.durationMs / 1000 : 0;
+  if (!full || !r.seconds) return true;
+  if (mode === 'audio') return Math.abs(r.seconds - full) <= Math.max(20, full * 0.12);
+  return r.seconds >= full * 0.8 && r.seconds <= full + 300; // music videos often run longer (intros, skits)
+}
+function strictPick(list, t, mode, notId) {
+  const ok = list.filter(r => r.id && r.id !== notId && r.seconds <= 1200 && !isPreview(r, t) && !otherVersion(r, t) && titleMatches(r, t) && lengthOK(r, t, mode));
+  const byViews = (a, b) => (b.views || 0) - (a.views || 0);
+  // 1. the artist's own upload
+  const own = ok.filter(r => fromArtist(r, t) && kindOf(r, mode) >= 2);
+  if (own.length) { const best = Math.max(...own.map(r => kindOf(r, mode))); return own.filter(r => kindOf(r, mode) === best).sort(byViews)[0]; }
+  // 2. the most-played upload that's clearly this song by this artist
+  const names = artistNames(t);
+  const byArtist = r => { const hay = ' ' + norm(r.title) + ' ' + norm(r.author) + ' '; return names.some(a => hay.includes(' ' + a + ' ') || squash(hay).includes(squash(a))); };
+  const rest = ok.filter(r => byArtist(r) && kindOf(r, mode) >= (mode === 'audio' ? 3 : 4));
+  return rest.sort(byViews)[0] || null;
 }
 
 const inflight = new Map();
@@ -294,17 +383,29 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
       const c = await db.get('ytcache', t.id);
       // a match saved earlier that turns out to be a preview gets looked up again (your own links are kept)
       const stalePreview = c && !c.manual && !c.fromSearch && [c.videoTitle, c.audioTitle].some(x => x && isPreview({ title: x }, t));
-      if (c && (c.video || c.audio) && !stalePreview) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
+      if (c && (c.video || c.audio) && !stalePreview) {
+        hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value);
+        if (!c.manual && !c.fromSearch && c.mv !== MATCH_V) recheckLater(t);
+        return c;
+      }
     }
     const base = `${mainArtist(t.artist)} ${t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')}`;
-    const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now() };
+    const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now(), mv: MATCH_V };
     let list = await rawSearch(base, { prefer });
-    let v = pick(list, t, 'video'), a = pick(list, t, 'audio', v?.id);
+    let v = strictPick(list, t, 'video'), a = strictPick(list, t, 'audio', v?.id);
     const save = async () => {
-      if (v) { out.video = v.id; out.videoTitle = v.title; if (v.views) out.videoViews = v.views; }
-      if (a) { out.audio = a.id; out.audioTitle = a.title; if (a.views) out.audioViews = a.views; }
-      const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
+      // nothing passed the strict rules: fall back to the looser scoring (video), and for audio use the music video
+      let vv = v || pickLoose(list, t, 'video', a?.id), aa = a, fromVideo = false;
+      if (!aa && vv) { aa = vv; fromVideo = true; }
+      if (!aa) aa = pickLoose(list, t, 'audio', vv?.id);
+      Object.assign(out, { video: null, audio: null, videoTitle: '', audioTitle: '', guess: undefined, audioFromVideo: undefined, strict: !!(v || a) || undefined });
+      if (vv) { out.video = vv.id; out.videoTitle = vv.title; if (vv.views) out.videoViews = vv.views; }
+      if (aa) { out.audio = aa.id; out.audioTitle = aa.title; if (aa.views) out.audioViews = aa.views; if (fromVideo) out.audioFromVideo = true; }
+      // last resort, only if the title still matches (songs in other scripts can't be checked this way)
+      const sp = plain(songCore(t)), named = r => !sp || (' ' + plain(r.title) + ' ').includes(' ' + sp + ' ');
+      const guess = !out.video && !out.audio && (list.find(r => named(r) && !isPreview(r, t) && !otherVersion(r, t)) || list.find(r => named(r) && !isPreview(r, t)) || (!sp ? list[0] : null));
       if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; if (guess.views) out.audioViews = guess.views; }
+      for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
       await db.put('ytcache', { ...out }, t.id);
       notePop(t.id, out);
       if (out.video || out.audio) hot.set(t.id, { ...out });
@@ -315,10 +416,11 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
       const second = rawSearch(`${base} ${!a ? 'official audio' : 'official music video'}`, { prefer }).then(more => {
         const seen = new Set(list.map(r => r.id));
         list = [...list, ...more.filter(r => !seen.has(r.id))];
-        v = v || pick(list, t, 'video', a?.id); a = a || pick(list, t, 'audio', v?.id);
+        v = v || strictPick(list, t, 'video', a?.id); a = a || strictPick(list, t, 'audio', v?.id);
       }).catch(() => { });
       // The version you're about to play is already known: start it now, finish the other quietly
-      if (need && (need === 'video' ? v : a)) { const first = await save(); second.then(save).catch(() => { }); return first; }
+      // (audio can start on the music video straight away: it's the fallback anyway)
+      if (need && (need === 'video' ? v : (a || v))) { const first = await save(); second.then(save).catch(() => { }); return first; }
       await Promise.race([second, sleep(need ? 2500 : 60000)]);
     }
     return save();
@@ -326,6 +428,34 @@ export function findForTrack(t, { force = false, prefer = null, need = null } = 
   inflight.set(t.id, p);
   p.finally(() => inflight.delete(t.id)).catch(() => { }); // (the caller handles the error; this copy mustn't show up as unhandled)
   return p;
+}
+
+// Matches made by older rules are re-checked quietly in the background, one at a time and gently paced,
+// only for songs you actually play or that come up next — the song keeps playing with its current match
+// meanwhile, and the better match is used from the next time it plays.
+const recheckQ = new Map();
+let recheckOn = false, recheckBudget = 150;
+function recheckLater(t) {
+  if (recheckBudget <= 0 || recheckQ.size >= Math.min(40, recheckBudget) || recheckQ.has(t.id) || inflight.has(t.id)) return; // (a short list: the songs you're actually playing)
+  recheckQ.set(t.id, t);
+  if (!recheckOn) runRecheck();
+}
+async function runRecheck() {
+  recheckOn = true;
+  try {
+    while (recheckQ.size && recheckBudget > 0) {
+      await sleep(document.hidden ? 6000 : 2500);
+      if (!navigator.onLine) continue;
+      const [id, t] = recheckQ.entries().next().value; recheckQ.delete(id);
+      const c = await db.get('ytcache', id);
+      if (!c || c.manual || c.fromSearch || c.mv === MATCH_V) continue;
+      recheckBudget--;
+      try {
+        const n = await findForTrack(t, { force: true });
+        if (!n.video && !n.audio) await db.put('ytcache', { ...c, mv: MATCH_V }, id); // nothing better found: keep the old match
+      } catch { await db.put('ytcache', { ...c, mv: MATCH_V }, id).catch(() => { }); }
+    }
+  } finally { recheckOn = false; }
 }
 
 // Match many songs quickly: a few parallel workers, each pinned to a different server.

@@ -49,6 +49,7 @@ const db = {
   put: (store, val, key) => tx(store, 'readwrite', s => { key === undefined ? s.put(val) : s.put(val, key); }),
   putMany: (store, vals) => tx(store, 'readwrite', s => { for (const v of vals) s.put(v); }),
   del: (store, key) => tx(store, 'readwrite', s => { s.delete(key); }),
+  delMany: (store, keys) => tx(store, 'readwrite', s => { for (const k of keys) s.delete(k); }),
   clear: (store) => tx(store, 'readwrite', s => { s.clear(); }),
   async destroy() {
     if (dbp) { (await dbp).close(); dbp = null; }
@@ -101,8 +102,16 @@ function esc(s) {
 }
 
 // Normalise a title/artist for matching ("Song (feat. X) - Remastered 2011" -> "song")
+// (remembered: the same few thousand names and titles get normalised over and over while you browse)
+const normMemo = new Map();
 function norm(s) {
-  return String(s ?? '')
+  const k = String(s ?? '');
+  let v = normMemo.get(k);
+  if (v === undefined) { v = normNow(k); if (normMemo.size > 30000) normMemo.clear(); normMemo.set(k, v); }
+  return v;
+}
+function normNow(s) {
+  return s
     .toLowerCase()
     .normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/\s*[\(\[][^\)\]]*(feat|ft\.|with|remaster|version|edit|mono|stereo|live|deluxe)[^\)\]]*[\)\]]/g, '')
@@ -417,7 +426,9 @@ window.__bzImg = img => {
   img.parentNode?.classList.add('ld');
   const u = img.getAttribute('src'); if (!u || seenImg.has(u)) return;
   seenImg.add(u);
-  clearTimeout(saveImgT); saveImgT = setTimeout(() => { try { localStorage.setItem('bz_imgs', JSON.stringify([...seenImg].slice(-4000))); } catch { } }, 1500);
+  if (seenImg.size > 5000) seenImg.delete(seenImg.values().next().value); // (bounded, for long sessions)
+  // saved in a quiet moment, not while pictures are pouring in as you scroll
+  clearTimeout(saveImgT); saveImgT = setTimeout(() => (window.requestIdleCallback || setTimeout)(() => { try { localStorage.setItem('bz_imgs', JSON.stringify([...seenImg].slice(-4000))); } catch { } }), 5000);
 };
 function cover(src, label, cls = '') {
   const px = /\bsm\b|qt-art|pb-art/.test(cls) ? 64 : /np-art|hero/.test(cls) ? 600 : 200;
@@ -435,7 +446,7 @@ function trackRow(t, i, ctx = {}, playingId) {
   const isNow = false; // highlighting is done by markNow() so only ONE row lights up
   const main = t.artist || '';
   const artists = `<a href="#/artist/${encodeURIComponent(main)}" class="lnk">${esc(main)}</a>`;
-  return `<div class="row ${isNow ? 'now' : ''} ${t.isVideo ? 'is-video' : ''}" data-act="play-row" data-list="${ctx.list}" data-i="${i}" data-id="${esc(t.id)}" role="button" tabindex="0">
+  return `<div class="row ${isNow ? 'now' : ''} ${t.isVideo ? 'is-video' : ''}" data-act="play-row" data-list="${ctx.list}" data-i="${i}" data-id="${esc(t.id)}" role="button" tabindex="0">${ctx.grip ? `<span class="grip row-grip" title="Drag to reorder" aria-hidden="true">${icon('grip')}</span>` : ''}
     <div class="row-num">${isNow ? '<span class="eq"><i></i><i></i><i></i></span>' : (ctx.numbered ? (t.trackNumber || i + 1) : '')}${cover(t.artwork, t.title, t.isVideo ? 'sm wide' : 'sm')}</div>
     <div class="row-main">
       <div class="row-title"><span class="tt">${esc(displayTitle(t))}</span>${t.explicit ? '<span class="e">E</span>' : ''}${t.localFileId ? `<span class="off" title="Available offline">${icon('offline')}</span>` : ''}</div>
@@ -477,7 +488,7 @@ on('toast', ({ msg, kind, action, ms }) => {
 const toastUndo = (msg, fn, label = 'Undo') => emit('toast', { msg, kind: 'info', action: { label, fn } });
 
 // ---------- Modal ----------
-function modal(html, { wide = false, onMount, locked = false, ownForms = false } = {}) {
+function modal(html, { wide = false, onMount, locked = false, ownForms = false, focus = true } = {}) {
   return new Promise(resolve => {
     const root = $('#modal-root');
     const wrap = document.createElement('div');
@@ -499,7 +510,7 @@ function modal(html, { wide = false, onMount, locked = false, ownForms = false }
       close(o);
     });
     onMount?.(wrap.querySelector('.modal'), close);
-    setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
+    if (focus) setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
   });
 }
 async function promptText(title, value = '', label = 'Name', okText = 'Save') {
@@ -970,7 +981,14 @@ const lib = {
 };
 
 const changed = debounce(() => emit('library'), 120);
-const notify = (why = 'change') => { changed(); emit('dirty', why); };
+// Library version: bumped on every change, so derived lists (artists, genres, albums…) are worked out
+// once per change instead of on every screen draw — that matters with big libraries.
+let ver = 0;
+const bump = () => { ver++; };
+const version = () => ver;
+const memo = new Map(); // name -> [version, value]
+function cached(name, fn) { const m = memo.get(name); if (m && m[0] === ver) return m[1]; const v = fn(); memo.set(name, [ver, v]); return v; }
+const notify = (why = 'change') => { ver++; changed(); emit('dirty', why); };
 
 // ---- deletion markers, used when syncing between devices ----
 let tomb = { t: {}, p: {}, a: {} };
@@ -986,7 +1004,8 @@ async function load() {
   lib.tracks = new Map(t.map(x => [x.id, x]));
   lib.albums = new Map(a.map(x => [x.id, x]));
   lib.playlists = new Map(p.map(x => [x.id, x]));
-  await migrateArtists();
+  ver++;
+  await migrateArtists(); ver++;
   // Liked songs from before "recently liked" ordering existed: use when they were added
   const fix = [];
   for (const t of lib.tracks.values()) if (t.liked && !t.likedAt) { t.likedAt = t.addedAt || 1; fix.push(t); }
@@ -1055,7 +1074,8 @@ function remember(t) {
   if (!lib.tracks.has(t.id)) lib.tracks.set(t.id, { ...t, transient: true });
   return lib.tracks.get(t.id);
 }
-const saved = () => [...lib.tracks.values()].filter(t => !t.transient);
+const savedList = () => cached('saved', () => { const out = []; for (const t of lib.tracks.values()) if (!t.transient) out.push(t); return out; });
+const saved = () => savedList().slice();
 
 async function updateTrack(id, patch, { quiet = false } = {}) {
   const t = lib.tracks.get(id); if (!t) return;
@@ -1063,7 +1083,7 @@ async function updateTrack(id, patch, { quiet = false } = {}) {
   if ('liked' in patch && !!patch.liked !== !!t.liked) patch.likeTs = Date.now();
   patch.updatedAt = Date.now();
   if (t.transient) { Object.assign(t, patch); await upsertTracks([t]); return; }
-  Object.assign(t, patch);
+  Object.assign(t, patch); ver++;
   if (quiet) { emit('dirty', 'track'); await db.put('tracks', t); return; }
   await db.put('tracks', t);
   notify('track');
@@ -1084,23 +1104,33 @@ async function toggleLike(id) {
   return setLiked(id, !(t.liked && !t.transient));
 }
 
-function isReferenced(id) {
-  const t = lib.tracks.get(id);
-  if (!t) return false;
-  if (t.liked || t.localFileId) return true;
-  for (const p of lib.playlists.values()) if (p.trackIds.includes(id)) return true;
-  for (const a of lib.albums.values()) if (a.trackIds?.includes(id)) return true;
-  return false;
+// Every song some playlist or album uses (built once per clean-up, not once per song)
+function referencedIds() {
+  const s = new Set();
+  for (const p of lib.playlists.values()) for (const id of p.trackIds) s.add(id);
+  for (const a of lib.albums.values()) for (const id of a.trackIds || []) s.add(id);
+  return s;
 }
 async function gc(ids) {
-  for (const id of ids) if (!isReferenced(id)) { lib.tracks.delete(id); await db.del('tracks', id); await markDeleted('t', id); }
+  if (!ids?.length) return;
+  const used = referencedIds(), gone = [];
+  for (const id of new Set(ids)) {
+    const t = lib.tracks.get(id);
+    if (!t || t.liked || t.localFileId || used.has(id)) continue;
+    lib.tracks.delete(id); gone.push(id); tomb.t[id] = Date.now();
+  }
+  if (!gone.length) return;
+  ver++;
+  await delTracks(gone);
+  await kv.set('tombstones', tomb);
 }
+const delTracks = ids => db.delMany('tracks', ids);
 
 async function deleteTrack(id) {
   const t = lib.tracks.get(id);
   if (t?.localFileId) await db.del('files', t.localFileId);
   for (const p of lib.playlists.values()) {
-    if (p.trackIds.includes(id)) { p.trackIds = p.trackIds.filter(x => x !== id); await db.put('playlists', p); }
+    if (p.trackIds.includes(id)) { p.trackIds = p.trackIds.filter(x => x !== id); p.updatedAt = Date.now(); await db.put('playlists', p); }
   }
   for (const a of lib.albums.values()) {
     if (a.trackIds?.includes(id)) { a.trackIds = a.trackIds.filter(x => x !== id); await db.put('albums', a); }
@@ -1118,7 +1148,12 @@ async function createPlaylist(name, trackIds = [], extra = {}) {
   notify('playlist');
   return p;
 }
-async function savePlaylist(p) { p.updatedAt = Date.now(); lib.playlists.set(p.id, p); await db.put('playlists', p); notify('playlist'); }
+// quiet: the screen already shows the change (e.g. a drag to reorder), so don't redraw the page
+async function savePlaylist(p, { quiet = false } = {}) {
+  p.updatedAt = Date.now(); lib.playlists.set(p.id, p); ver++;
+  await db.put('playlists', p);
+  if (quiet) emit('dirty', 'playlist'); else notify('playlist');
+}
 async function addToPlaylist(pid, ids) {
   const p = lib.playlists.get(pid); if (!p) return 0;
   const before = p.trackIds.length;
@@ -1133,6 +1168,32 @@ async function removeFromPlaylist(pid, id) {
   p.trackIds = p.trackIds.filter(x => x !== id);
   await savePlaylist(p); await gc([id]);
   return { pid, id, index, snapshot };
+}
+// Take several songs out of a playlist at once (undo with undoRemoveMany)
+async function removeManyFromPlaylist(pid, ids, opts) {
+  const p = lib.playlists.get(pid); if (!p) return null;
+  const drop = new Set(ids), removed = [];
+  p.trackIds.forEach((id, index) => { if (drop.has(id)) removed.push({ id, index, snapshot: lib.tracks.get(id) ? { ...lib.tracks.get(id) } : null }); });
+  if (!removed.length) return { pid, removed };
+  p.trackIds = p.trackIds.filter(x => !drop.has(x));
+  await savePlaylist(p, opts); await gc(removed.map(r => r.id));
+  return { pid, removed };
+}
+async function undoRemoveMany(r, opts) {
+  const p = r && lib.playlists.get(r.pid); if (!p) return;
+  const back = r.removed.filter(x => !lib.tracks.has(x.id) && x.snapshot).map(x => x.snapshot);
+  if (back.length) await upsertTracks(back);
+  for (const x of [...r.removed].sort((a, b) => a.index - b.index)) if (!p.trackIds.includes(x.id)) p.trackIds.splice(Math.min(x.index, p.trackIds.length), 0, x.id);
+  await savePlaylist(p, opts);
+}
+// Move one song to a new spot in a playlist (custom order)
+async function moveInPlaylist(pid, id, toIndex, opts = { quiet: true }) {
+  const p = lib.playlists.get(pid); if (!p) return;
+  const from = p.trackIds.indexOf(id); if (from < 0) return;
+  const ids = p.trackIds.slice(); ids.splice(from, 1);
+  ids.splice(Math.max(0, Math.min(toIndex, ids.length)), 0, id);
+  p.trackIds = ids;
+  await savePlaylist(p, opts);
 }
 // Undo for removeFromPlaylist: put the song back exactly where it was
 async function undoRemoveFromPlaylist(r) {
@@ -1173,9 +1234,10 @@ async function removeAlbum(id) {
 }
 
 // ---------- Derived views ----------
-function artists() {
+const artists = () => cached('artists', artistsNow).slice();
+function artistsNow() {
   const m = new Map();
-  for (const t of saved()) {
+  for (const t of savedList()) {
     const names = t.artists?.length ? t.artists : [mainArtist(t.artist)];
     for (const name of names) {
       const k = norm(name); if (!k) continue;
@@ -1190,16 +1252,18 @@ function artists() {
   return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function genres() {
+const genres = () => cached('genres', genresNow).slice();
+function genresNow() {
   const m = new Map();
-  for (const t of saved()) { const g = genreOf(t); if (g) m.set(g, (m.get(g) || 0) + 1); }
+  for (const t of savedList()) { const g = genreOf(t); if (g) m.set(g, (m.get(g) || 0) + 1); }
   return [...m.entries()].sort((a, b) => b[1] - a[1]);
 }
 
 // Albums the user has songs from but hasn't explicitly saved
-function implicitAlbums() {
+const implicitAlbums = () => cached('implicitAlbums', implicitNow).slice();
+function implicitNow() {
   const m = new Map();
-  for (const t of saved()) {
+  for (const t of savedList()) {
     if (!t.album) continue;
     const id = t.albumId || albumKey(t.artist, t.album);
     if (lib.albums.has(id)) continue;
@@ -1228,7 +1292,7 @@ function queueEnrich(list) {
   runEnrich(); runCovers();
 }
 async function patchTrack(t, patch) {
-  Object.assign(t, patch);
+  Object.assign(t, patch); ver++;
   await db.put('tracks', t);
   if (patch.artwork) emit('track-art', { id: t.id, artwork: patch.artwork });
   emit('dirty', 'enrich'); // backups only; no full re-render while browsing
@@ -1284,7 +1348,7 @@ async function coverFromVideo(id, vid) {
   await patchTrack(t, { artwork });
 }
 
-return { lib, notify, tombstones, setTombstones, load, upsertTracks, remember, saved, updateTrack, setLiked, toggleLike, deleteTrack, createPlaylist, savePlaylist, addToPlaylist, removeFromPlaylist, undoRemoveFromPlaylist, replacePlaylistTracks, deletePlaylist, saveAlbum, removeAlbum, artists, genres, implicitAlbums, setEnrich, enrichPending, queueEnrich, coverFromVideo };
+return { lib, bump, version, notify, tombstones, setTombstones, load, upsertTracks, remember, saved, updateTrack, setLiked, toggleLike, deleteTrack, createPlaylist, savePlaylist, addToPlaylist, removeFromPlaylist, removeManyFromPlaylist, undoRemoveMany, moveInPlaylist, undoRemoveFromPlaylist, replacePlaylistTracks, deletePlaylist, saveAlbum, removeAlbum, artists, genres, implicitAlbums, setEnrich, enrichPending, queueEnrich, coverFromVideo };
 })();
 // ---------- youtube.js ----------
 const __m_youtube = (() => {
@@ -1392,10 +1456,18 @@ async function hit(base, q, ms = 7000) {
 }
 
 // Normalised result: {id, title, author, seconds, views}
+const isoSecs = d => { const m = /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/.exec(d || ''); return m ? (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0) : 0; };
 async function searchViaKey(q, key = settings.ytKey) {
   const u = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=12&q=${encodeURIComponent(q)}&key=${encodeURIComponent(key)}`;
   const d = await fetchJSON(u);
-  return (d.items || []).map(i => ({ id: i.id.videoId, title: decodeEntities(i.snippet.title), author: i.snippet.channelTitle, seconds: 0 }));
+  const out = (d.items || []).map(i => ({ id: i.id.videoId, title: decodeEntities(i.snippet.title), author: i.snippet.channelTitle, seconds: 0, views: 0 }));
+  // views + length for all of them in one cheap call, so "most played" and length checks work with a key too
+  if (out.length) try {
+    const v = await fetchJSON(`https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${out.map(r => r.id).join(',')}&key=${encodeURIComponent(key)}`, 5000);
+    const by = new Map((v.items || []).map(i => [i.id, i]));
+    for (const r of out) { const i = by.get(r.id); if (i) { r.views = +i.statistics?.viewCount || 0; r.seconds = isoSecs(i.contentDetails?.duration); } }
+  } catch { }
+  return out;
 }
 async function searchInvidious(base, q, ms) {
   const d = await fetchJSON(`${base}/api/v1/search?type=video&q=${encodeURIComponent(q)}&fields=type,videoId,title,author,lengthSeconds,viewCount`, ms);
@@ -1567,9 +1639,90 @@ function score(r, t, mode) {
   if (r.views > 1e6) s += 1;
   return s;
 }
-function pick(list, t, mode, notId) {
+// Loose fallback (the older scoring): used only when no result passes the strict rules below
+function pickLoose(list, t, mode, notId) {
   const b = list.filter(r => r.id !== notId).map(r => [score(r, t, mode), r]).sort((a, b) => b[0] - a[0])[0];
   return b && b[0] >= 8 ? b[1] : null;
+}
+
+// ---------- Strict matching ----------
+// 1. The artist's own upload first: their channel, their "Artist - Topic" profile, or their VEVO.
+// 2. Otherwise the most-played upload whose title is exactly this song (by this artist).
+// 3. Audio: if no audio upload matches, the music video is used for audio too.
+const MATCH_V = 2; // bump when these rules change, so older matches get quietly re-checked
+const FILLER = new Set(['official', 'video', 'music', 'audio', 'lyric', 'lyrics', 'visualizer', 'visualiser', 'hd', 'hq', '4k', 'mv', 'm', 'v', 'explicit', 'clean', 'topic', 'vevo', 'and', 'x', 'vs', 'ft', 'feat', 'featuring', 'with', 'prod', 'by', 'the', 'new', 'song', 'full', 'track', 'single', 'remastered', 'remaster', 'premiere', 'color', 'coded', 'eng', 'sub', 'subs', 'lyricvideo', 'officialvideo']);
+const NOISE_BR = /[\(\[\{【][^\)\]\}】]*[\)\]\}】]/g;
+const BAD_VARIANT = /\b(cover|karaoke|instrumental|reaction|react|8d|slowed|sped ?up|nightcore|reverb|remix|live|acoustic|extended|1 ?hour|loop|piano version|tutorial|lesson|fan ?made|mashup|dance practice|choreography|bass boosted|a ?cappella|acapella|unplugged|demo|rehearsal)\b/;
+const songCore = t => norm(String(t.title || '').replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '').replace(/\s+(feat|ft)\.?\s.*$/i, ''));
+const artistNames = t => [...new Set([mainArtist(t.artist), ...(t.artists || [])].map(norm).filter(Boolean))];
+const tokens = s => s.split(' ').filter(Boolean);
+const squash = s => s.replace(/ /g, '');
+const isTopic = r => /\s-\stopic$/i.test(String(r.author || ''));
+// The channel name, minus the bits that aren't the artist ("- Topic", "VEVO", "Official", "Music"…)
+const channelCore = r => norm(String(r.author || '').replace(/\s*-\s*topic$/i, '').replace(/vevo$/i, '').replace(/\b(official|music|tv|channel|records?|hq)\b/gi, ''));
+// From the artist's own channel / Topic profile / VEVO?
+function fromArtist(r, t) {
+  const c = squash(channelCore(r)); if (!c) return false;
+  return artistNames(t).some(a => { const s = squash(a); return s && (c === s || (s.length >= 4 && (c === s + 'official' || c === 'the' + s || c === s + 'music'))); });
+}
+// The result's title is this song and nothing else (once artist names, "Official Video" etc. are set aside)
+// Plain words, for comparing titles (keeps everything norm() would strip, like "(Live)" or "- Remix")
+const plain = x => String(x ?? '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/&/g, ' and ').replace(/['’‘`´]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+// Set aside brackets/segments that only say "Official Video", "feat. X", "Remastered 2011"…;
+// anything else, like "(Taylor's Version)" or "(Sped Up)", stays part of the title
+function cleanTitle(title, noise) {
+  let raw = String(title || '').replace(NOISE_BR, m => {
+    const inner = plain(m);
+    return !inner || /^(feat|ft|featuring|with|prod|from)\b/.test(inner) || tokens(inner).every(noise) ? ' ' : ' ' + m.slice(1, -1) + ' ';
+  });
+  raw = raw.replace(/[|｜].*$/, ' ').split(/\s[-–—]\s/).map(seg => seg.replace(/\s+(feat|ft|featuring)\.?\s.*$/i, ' ')).filter(seg => !tokens(plain(seg)).every(noise) || !plain(seg)).join(' ');
+  return tokens(plain(raw));
+}
+const fillerOnly = w => FILLER.has(w) || /^\d{4}$/.test(w);
+// The result's title is this song and nothing else (apart from artist names, "Official Video" etc.)
+function titleMatches(r, t) {
+  const song = cleanTitle(t.title, w => fillerOnly(w) && !['the', 'and', 'x', 'new', 'song', 'music', 'track', 'with', 'by', 'full', 'original'].includes(w));
+  if (!song.length) return false; // (titles in other scripts: the looser matching handles those)
+  const skip = new Set([...artistNames(t).flatMap(w => tokens(plain(w))), ...tokens(plain(channelCore(r))), ...tokens(plain(r.author))]);
+  const noise = w => fillerOnly(w) || skip.has(w);
+  const res = cleanTitle(r.title, noise);
+  for (let k = 0; k + song.length <= res.length; k++) {
+    if (song.every((w, n) => res[k + n] === w)) return [...res.slice(0, k), ...res.slice(k + song.length)].every(noise);
+  }
+  return false;
+}
+// Says it's another version (remix, live, cover, sped up…) when the song itself isn't
+function otherVersion(r, t) {
+  const raw = String(r.title || '').toLowerCase(), song = String(t.title || '').toLowerCase();
+  const m = raw.match(BAD_VARIANT);
+  return !!m && !song.includes(m[1].split(' ')[0]);
+}
+// How well an upload suits the mode: audio wants the Topic track / official audio, video wants the music video
+function kindOf(r, mode) {
+  const raw = String(r.title || '').toLowerCase(), topic = isTopic(r);
+  const mv = /official (music )?video|music video|\bm\/?v\b|official visual|official film/.test(raw);
+  const aud = /official audio|\baudio\b/.test(raw);
+  const lyr = /lyric|visuali[sz]er/.test(raw);
+  if (mode === 'audio') return topic ? 4 : aud ? 3 : lyr ? 2 : mv ? 0 : 1;
+  return topic ? -1 : mv ? 4 : (aud || lyr) ? 0 : 2;
+}
+function lengthOK(r, t, mode) {
+  const full = t.durationMs ? t.durationMs / 1000 : 0;
+  if (!full || !r.seconds) return true;
+  if (mode === 'audio') return Math.abs(r.seconds - full) <= Math.max(20, full * 0.12);
+  return r.seconds >= full * 0.8 && r.seconds <= full + 300; // music videos often run longer (intros, skits)
+}
+function strictPick(list, t, mode, notId) {
+  const ok = list.filter(r => r.id && r.id !== notId && r.seconds <= 1200 && !isPreview(r, t) && !otherVersion(r, t) && titleMatches(r, t) && lengthOK(r, t, mode));
+  const byViews = (a, b) => (b.views || 0) - (a.views || 0);
+  // 1. the artist's own upload
+  const own = ok.filter(r => fromArtist(r, t) && kindOf(r, mode) >= 2);
+  if (own.length) { const best = Math.max(...own.map(r => kindOf(r, mode))); return own.filter(r => kindOf(r, mode) === best).sort(byViews)[0]; }
+  // 2. the most-played upload that's clearly this song by this artist
+  const names = artistNames(t);
+  const byArtist = r => { const hay = ' ' + norm(r.title) + ' ' + norm(r.author) + ' '; return names.some(a => hay.includes(' ' + a + ' ') || squash(hay).includes(squash(a))); };
+  const rest = ok.filter(r => byArtist(r) && kindOf(r, mode) >= (mode === 'audio' ? 3 : 4));
+  return rest.sort(byViews)[0] || null;
 }
 
 const inflight = new Map();
@@ -1584,17 +1737,29 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
       const c = await db.get('ytcache', t.id);
       // a match saved earlier that turns out to be a preview gets looked up again (your own links are kept)
       const stalePreview = c && !c.manual && !c.fromSearch && [c.videoTitle, c.audioTitle].some(x => x && isPreview({ title: x }, t));
-      if (c && (c.video || c.audio) && !stalePreview) { hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value); return c; }
+      if (c && (c.video || c.audio) && !stalePreview) {
+        hot.set(t.id, c); if (hot.size > 2000) hot.delete(hot.keys().next().value);
+        if (!c.manual && !c.fromSearch && c.mv !== MATCH_V) recheckLater(t);
+        return c;
+      }
     }
     const base = `${mainArtist(t.artist)} ${t.title.replace(/\s*[\(\[](feat|ft|with)[^\)\]]*[\)\]]/i, '')}`;
-    const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now() };
+    const out = { video: null, audio: null, videoTitle: '', audioTitle: '', checkedAt: Date.now(), mv: MATCH_V };
     let list = await rawSearch(base, { prefer });
-    let v = pick(list, t, 'video'), a = pick(list, t, 'audio', v?.id);
+    let v = strictPick(list, t, 'video'), a = strictPick(list, t, 'audio', v?.id);
     const save = async () => {
-      if (v) { out.video = v.id; out.videoTitle = v.title; if (v.views) out.videoViews = v.views; }
-      if (a) { out.audio = a.id; out.audioTitle = a.title; if (a.views) out.audioViews = a.views; }
-      const guess = !out.video && !out.audio && (list.find(r => !isPreview(r, t)) || list[0]);
+      // nothing passed the strict rules: fall back to the looser scoring (video), and for audio use the music video
+      let vv = v || pickLoose(list, t, 'video', a?.id), aa = a, fromVideo = false;
+      if (!aa && vv) { aa = vv; fromVideo = true; }
+      if (!aa) aa = pickLoose(list, t, 'audio', vv?.id);
+      Object.assign(out, { video: null, audio: null, videoTitle: '', audioTitle: '', guess: undefined, audioFromVideo: undefined, strict: !!(v || a) || undefined });
+      if (vv) { out.video = vv.id; out.videoTitle = vv.title; if (vv.views) out.videoViews = vv.views; }
+      if (aa) { out.audio = aa.id; out.audioTitle = aa.title; if (aa.views) out.audioViews = aa.views; if (fromVideo) out.audioFromVideo = true; }
+      // last resort, only if the title still matches (songs in other scripts can't be checked this way)
+      const sp = plain(songCore(t)), named = r => !sp || (' ' + plain(r.title) + ' ').includes(' ' + sp + ' ');
+      const guess = !out.video && !out.audio && (list.find(r => named(r) && !isPreview(r, t) && !otherVersion(r, t)) || list.find(r => named(r) && !isPreview(r, t)) || (!sp ? list[0] : null));
       if (guess) { out.audio = guess.id; out.audioTitle = guess.title; out.guess = true; if (guess.views) out.audioViews = guess.views; }
+      for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
       await db.put('ytcache', { ...out }, t.id);
       notePop(t.id, out);
       if (out.video || out.audio) hot.set(t.id, { ...out });
@@ -1605,10 +1770,11 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
       const second = rawSearch(`${base} ${!a ? 'official audio' : 'official music video'}`, { prefer }).then(more => {
         const seen = new Set(list.map(r => r.id));
         list = [...list, ...more.filter(r => !seen.has(r.id))];
-        v = v || pick(list, t, 'video', a?.id); a = a || pick(list, t, 'audio', v?.id);
+        v = v || strictPick(list, t, 'video', a?.id); a = a || strictPick(list, t, 'audio', v?.id);
       }).catch(() => { });
       // The version you're about to play is already known: start it now, finish the other quietly
-      if (need && (need === 'video' ? v : a)) { const first = await save(); second.then(save).catch(() => { }); return first; }
+      // (audio can start on the music video straight away: it's the fallback anyway)
+      if (need && (need === 'video' ? v : (a || v))) { const first = await save(); second.then(save).catch(() => { }); return first; }
       await Promise.race([second, sleep(need ? 2500 : 60000)]);
     }
     return save();
@@ -1616,6 +1782,34 @@ function findForTrack(t, { force = false, prefer = null, need = null } = {}) {
   inflight.set(t.id, p);
   p.finally(() => inflight.delete(t.id)).catch(() => { }); // (the caller handles the error; this copy mustn't show up as unhandled)
   return p;
+}
+
+// Matches made by older rules are re-checked quietly in the background, one at a time and gently paced,
+// only for songs you actually play or that come up next — the song keeps playing with its current match
+// meanwhile, and the better match is used from the next time it plays.
+const recheckQ = new Map();
+let recheckOn = false, recheckBudget = 150;
+function recheckLater(t) {
+  if (recheckBudget <= 0 || recheckQ.size >= Math.min(40, recheckBudget) || recheckQ.has(t.id) || inflight.has(t.id)) return; // (a short list: the songs you're actually playing)
+  recheckQ.set(t.id, t);
+  if (!recheckOn) runRecheck();
+}
+async function runRecheck() {
+  recheckOn = true;
+  try {
+    while (recheckQ.size && recheckBudget > 0) {
+      await sleep(document.hidden ? 6000 : 2500);
+      if (!navigator.onLine) continue;
+      const [id, t] = recheckQ.entries().next().value; recheckQ.delete(id);
+      const c = await db.get('ytcache', id);
+      if (!c || c.manual || c.fromSearch || c.mv === MATCH_V) continue;
+      recheckBudget--;
+      try {
+        const n = await findForTrack(t, { force: true });
+        if (!n.video && !n.audio) await db.put('ytcache', { ...c, mv: MATCH_V }, id); // nothing better found: keep the old match
+      } catch { await db.put('ytcache', { ...c, mv: MATCH_V }, id).catch(() => { }); }
+    }
+  } finally { recheckOn = false; }
 }
 
 // Match many songs quickly: a few parallel workers, each pinned to a different server.
@@ -1811,7 +2005,7 @@ async function freeStats(vid) {
   return null;
 }
 
-return { setYTSettings, startInstances, proxySearch, YT_UNREACHABLE, rawSearch, isPreview, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist, popularity, loadPopularity, wantStats };
+return { setYTSettings, startInstances, proxySearch, YT_UNREACHABLE, rawSearch, isPreview, MATCH_V, fromArtist, titleMatches, forget, findForTrack, matchMany, setManual, thumb, parseYouTubeId, videoToSong, youtubePlaylistLinks, parsePlaylistId, publicPlaylist, popularity, loadPopularity, wantStats };
 })();
 // ---------- ytaccount.js ----------
 const __m_ytaccount = (() => {
@@ -2799,7 +2993,7 @@ async function load(autoplay = true) {
     const id = c[P.mode] || c[P.mode === 'video' ? 'audio' : 'video'];
     if (!t.artwork) store.coverFromVideo(t.id, c.audio || c.video);
     if (!id) throw new Error(NO_MATCH);
-    if (!c[P.mode]) toast(`No ${P.mode === 'video' ? 'music video' : 'audio upload'} found — playing the other version`);
+    if (!c[P.mode] && P.mode === 'video') toast('No music video found — playing the audio version'); // (audio quietly uses the music video when there's no audio upload)
     if (preYT && preYT.tid === t.id && preYT.vid === id && ytPre) swapYT(id, at);
     else await startYT(id, at);
     if (!autoplay) ytPlayer.pauseVideo();
@@ -3169,20 +3363,17 @@ const __m_backup = (() => {
 //    so it survives even if the browser's data is wiped.
 //  • One-tap download / restore of a .json backup file on every browser.
 const { db, kv } = __m_db;
-const { debounce, emit, downloadBlob, on, toast } = __m_util;
+const { emit, downloadBlob, on, toast } = __m_util;
 
 const KEEP = 5;
 const fsSupported = 'showSaveFilePicker' in window;
 
 async function snapshot() {
-  const [tracks, albums, playlists] = await Promise.all([db.all('tracks'), db.all('albums'), db.all('playlists')]);
-  const ytKeys = await db.keys('ytcache');
-  const ytVals = await db.all('ytcache');
+  const [tracks, albums, playlists, ytKeys, ytVals, profile, settings, player] = await Promise.all([
+    db.all('tracks'), db.all('albums'), db.all('playlists'), db.keys('ytcache'), db.all('ytcache'), kv.get('profile'), kv.get('settings'), kv.get('player')]);
   return {
     app: 'BAZINGA', version: 1, createdAt: new Date().toISOString(),
-    profile: await kv.get('profile'),
-    settings: await kv.get('settings'),
-    player: await kv.get('player'),
+    profile, settings, player,
     tracks: tracks.map(t => ({ ...t, localFileId: undefined, hadLocalFile: !!t.localFileId || t.hadLocalFile })),
     albums, playlists,
     ytcache: ytKeys.map((k, i) => [k, ytVals[i]])
@@ -3201,46 +3392,72 @@ async function restore(data) {
   }));
   await db.putMany('albums', data.albums || []);
   await db.putMany('playlists', data.playlists || []);
-  for (const [k, v] of data.ytcache || []) await db.put('ytcache', v, k);
+  { const yc = data.ytcache || []; for (let i = 0; i < yc.length; i += 500) await putPairs('ytcache', yc.slice(i, i + 500)); }
   if (data.profile) await kv.set('profile', data.profile);
   if (data.settings) await kv.set('settings', data.settings);
   if (data.player) await kv.set('player', data.player);
 }
 
-async function writeInternal(snap) {
+const putPairs = (store, pairs) => Promise.all(pairs.map(([k, v]) => db.put(store, v, k)));
+// The snapshot itself is kept apart from its summary, so listing snapshots (Settings) and keeping only the
+// newest 5 never has to load every old copy of the library into memory.
+const dataKey = id => 'bkdata:' + id;
+async function writeInternal(snap, size) {
   const id = 'bk_' + Date.now();
-  await db.put('backups', { id, ts: Date.now(), size: JSON.stringify(snap).length, counts: { tracks: snap.tracks.length, playlists: snap.playlists.length, albums: snap.albums.length }, data: snap });
-  const all = (await db.all('backups')).sort((a, b) => b.ts - a.ts);
-  for (const old of all.slice(KEEP)) await db.del('backups', old.id);
+  await kv.set(dataKey(id), snap);
+  await db.put('backups', { id, ts: Date.now(), size, counts: { tracks: snap.tracks.length, playlists: snap.playlists.length, albums: snap.albums.length } });
+  const ids = (await db.keys('backups')).sort((a, b) => (+String(b).slice(3) || 0) - (+String(a).slice(3) || 0));
+  for (const old of ids.slice(KEEP)) { await db.del('backups', old); await kv.del(dataKey(old)); }
 }
 
 let fileState = 'none'; // none | ok | needs-permission | error
 const linkedFileState = () => fileState;
 
-async function writeFile(snap) {
+async function writeFile(json) {
   const h = await kv.get('backupHandle');
   if (!h) { fileState = 'none'; return; }
   const perm = await h.queryPermission({ mode: 'readwrite' });
   if (perm !== 'granted') { fileState = 'needs-permission'; emit('backup-state'); return; }
   try {
     const w = await h.createWritable();
-    await w.write(JSON.stringify(snap));
+    await w.write(json);
     await w.close();
     fileState = 'ok';
   } catch (e) { fileState = 'error'; console.warn(e); }
 }
 
+let running = null, again = false;
 async function runBackup() {
-  const profile = await kv.get('profile');
-  if (!profile) return; // no account yet
-  const snap = await snapshot();
-  await writeInternal(snap);
-  if (fsSupported) await writeFile(snap);
-  await kv.set('lastBackup', Date.now());
-  emit('backup-state');
+  if (running) { again = true; return running; } // one at a time; a change during a backup gets one more pass
+  running = (async () => {
+    do {
+      again = false;
+      const profile = await kv.get('profile');
+      if (!profile) return; // no account yet
+      const snap = await snapshot();
+      const json = JSON.stringify(snap); // once, for both the size and the linked file
+      await writeInternal(snap, json.length);
+      if (fsSupported) await writeFile(json);
+      await kv.set('lastBackup', Date.now());
+      emit('backup-state');
+    } while (again);
+  })().finally(() => { running = null; });
+  return running;
 }
 
-const scheduled = debounce(runBackup, 4000);
+// Backups wait for a quiet moment: a few seconds after you change something (a minute for background
+// tidying like genres and covers), never more than 2 minutes behind, and only when the device is idle.
+const idle = fn => (window.requestIdleCallback ? requestIdleCallback(fn, { timeout: 4000 }) : setTimeout(fn, 200));
+let dueAt = 0, firstDirty = 0, timer = 0;
+function scheduled(why) {
+  const now = Date.now();
+  if (!firstDirty) firstDirty = now;
+  const wait = why === 'enrich' || why === 'yt' ? 60e3 : 8e3;
+  const at = Math.min(now + wait, firstDirty + 120e3);
+  if (dueAt && dueAt <= at && timer) return;
+  dueAt = at; clearTimeout(timer);
+  timer = setTimeout(() => { timer = 0; dueAt = 0; firstDirty = 0; idle(() => runBackup().catch(e => console.warn('backup failed', e))); }, Math.max(0, at - now));
+}
 function startAuto() {
   on('dirty', scheduled);
   // Also back up when the app is hidden/closed so nothing is lost
@@ -3277,8 +3494,8 @@ async function download() {
   emit('backup-state');
 }
 
-const listInternal = async () => (await db.all('backups')).sort((a, b) => b.ts - a.ts);
-async function restoreInternal(id) { const b = await db.get('backups', id); if (b) await restore(b.data); }
+const listInternal = async () => (await db.all('backups')).map(({ data, ...meta }) => meta).sort((a, b) => b.ts - a.ts);
+async function restoreInternal(id) { const b = await db.get('backups', id); if (!b) return; await restore(b.data || await kv.get(dataKey(id))); }
 async function restoreFromFile(file) { await restore(JSON.parse(await file.text())); }
 
 return { fsSupported, snapshot, restore, linkedFileState, runBackup, startAuto, linkFile, regrant, unlinkFile, download, listInternal, restoreInternal, restoreFromFile };
@@ -3540,7 +3757,7 @@ async function localSnap() {
   snap.tombstones = store.tombstones();
   snap.tracks = snap.tracks.map(t => { const x = { ...t }; delete x.hadLocalFile; delete x.localFileId; return x; }).sort((a, b) => a.id < b.id ? -1 : 1);
   // YouTube matches travel as ids only (titles are just for display and get filled in again when needed)
-  snap.ytcache = (snap.ytcache || []).filter(([, v]) => v && (v.video || v.audio)).map(([k, v]) => [k, Object.fromEntries(Object.entries({ video: v.video, audio: v.audio, manual: v.manual, fromSearch: v.fromSearch, guess: v.guess }).filter(([, x]) => x))]);
+  snap.ytcache = (snap.ytcache || []).filter(([, v]) => v && (v.video || v.audio)).map(([k, v]) => [k, Object.fromEntries(Object.entries({ video: v.video, audio: v.audio, manual: v.manual, fromSearch: v.fromSearch, guess: v.guess, mv: v.mv }).filter(([, x]) => x))]);
   snap.albums.sort((a, b) => a.id < b.id ? -1 : 1); snap.playlists.sort((a, b) => a.id < b.id ? -1 : 1);
   const p = snap.profile;
   snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
@@ -3924,7 +4141,7 @@ function start() {
   syncNow();
   listen();
   if (started) return; started = true;
-  on('dirty', why => { if (link && why !== 'synced') schedule(); });
+  on('dirty', why => { if (link && why !== 'synced' && why !== 'enrich') schedule(); }); // (genres/covers found in the background are found again on each device; no need to re-send the library for them)
   onSyncedKvChange(() => { if (link) schedule(); });
   document.addEventListener('visibilitychange', () => {
     if (!link) return;
@@ -4896,7 +5113,7 @@ const lists = new Map();      // listKey -> [trackIds] for "play from here"
 const sections = new Map();   // sectionKey -> {tracks, opts}
 const fstate = {};            // sectionKey -> filter state
 let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
-const APP_VERSION = 'v1.7.3'; // shown at the bottom of Settings — bump with each release
+const APP_VERSION = 'v1.8.0'; // shown at the bottom of Settings — bump with each release
 const APP_TAGLINE = 'Music Made For You';
 const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
 let profile = null;
@@ -5589,7 +5806,8 @@ function goBack() {
   else location.hash = (BACK_TO[name] || ['#/home'])[0];
 }
 
-async function route() {
+// soft: redraw the page you're on in place (library changed) — no loader flash, no scroll jump, menus stay
+async function route({ soft = false } = {}) {
   if (/^#\/(link|c)\//.test(location.hash)) { const req = readJoinLink(); if (req) joinFlow(req); return route(); }
   const my = ++routeToken;
   const full = location.hash || '#/home';
@@ -5602,14 +5820,18 @@ async function route() {
   lists.clear(); sections.clear(); pagers.clear();
   $('#main')?.removeEventListener('scroll', settingsSpy);
   $$('.nav a, .tabbar a').forEach(a => a.classList.toggle('on', a.dataset.r === name || (name === 'import' && a.dataset.r === 'settings')));
-  if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
-  $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
-  closeQueueOnMobile();
   const v = view();
-  v.scrollTop = 0; $('#main').scrollTop = 0;
+  if (!soft) {
+    if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
+    $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
+    closeQueueOnMobile();
+    v.scrollTop = 0; $('#main').scrollTop = 0;
+  }
   const routes = { new: vNewReleases, home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
   const fn = routes[name] || vHome;
-  v.innerHTML = loader();
+  // the old page's "load more" / artist-picture watchers go with it (they'd otherwise pile up over a long session)
+  moreObs.disconnect(); apicObs?.disconnect();
+  if (!soft) v.innerHTML = loader();
   // Back button on detail pages (artist, album, playlist, genre, shared, …) — added as soon as the
   // page appears, not after slow lookups finish
   const addBack = () => {
@@ -5647,7 +5869,7 @@ const stale = my => my !== routeToken;
 const rerender = debounce(() => {
   // Re-render the current view softly when library changes (keeps scroll)
   const sc = $('#main').scrollTop;
-  route().then(() => { $('#main').scrollTop = sc; });
+  route({ soft: true }).then(() => { if (Math.abs($('#main').scrollTop - sc) > 1) $('#main').scrollTop = sc; });
 }, 250);
 
 // ================= TRACK LIST SECTIONS =================
@@ -5681,9 +5903,12 @@ function tracksSectionInner(key) {
   const cur = player.current()?.id;
   const head = opts.noFilter ? '' : filterBar(f, tracks, { keepOrder: opts.keepOrder, likedSort: opts.likedSort });
   const count = !opts.noFilter && shown.length !== tracks.length ? `<div class="muted tiny count">${shown.length} of ${tracks.length} songs</div>` : '';
-  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered }, cur)).join('');
+  // A playlist in its own (custom) order with nothing filtered out: drag the grips to rearrange it, like the queue
+  const grip = !!opts.reorder && canReorder(f) && shown.length > 1;
+  opts.grip = grip;
+  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered, grip }, cur)).join('');
   const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
-  return head + count + `<div class="rows">${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
+  return head + count + `<div class="rows${grip ? ' reorder' : ''}" ${grip ? `data-reorder="${esc(opts.playlistId)}"` : ''}>${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
 }
 // "Most popular": numbers load once from the device (fast), then missing views/likes fill in quietly in the
 // background; the list re-sorts itself at most every few seconds while they arrive.
@@ -5720,12 +5945,75 @@ const moreObs = new IntersectionObserver(entries => {
     const rowsEl = el.previousElementSibling;
     const cur = player.current()?.id;
     const { opts } = sections.get(key) || { opts: {} };
-    rowsEl.insertAdjacentHTML('beforeend', ids.slice(at, at + PAGE).map((id, j) => trackRow(lib.tracks.get(id), at + j, { list: key, playlistId: opts.playlistId }, cur)).join(''));
+    rowsEl.insertAdjacentHTML('beforeend', ids.slice(at, at + PAGE).map((id, j) => trackRow(lib.tracks.get(id), at + j, { list: key, playlistId: opts.playlistId, grip: opts.grip }, cur)).join(''));
     if (at + PAGE >= ids.length) { moreObs.unobserve(el); el.remove(); } else el.dataset.at = at + PAGE;
     markNow();
   }
 }, { rootMargin: '600px' });
 function observeMore() { $$('[data-more]').forEach(el => moreObs.observe(el)); }
+
+// ---------- Rearranging a playlist (custom order) ----------
+const canReorder = f => !f.sort && !f.q && !f.genres?.length && !f.years?.length && !f.from && !f.to && !f.liked && !f.offline;
+// The playlist's order changed: keep the page's lists in step without redrawing it
+function plOrderChanged(p, redraw = false) {
+  const sec = sections.get('pl');
+  if (!sec || fstate.pl?._id !== p.id) return;
+  sec.tracks = p.trackIds.map(i => lib.tracks.get(i)).filter(Boolean);
+  if (redraw) { refreshSection('pl'); return; }
+  lists.set('pl', sec.tracks.map(t => t.id));
+  $$('[data-tsec="pl"] .rows > .row').forEach((r, i) => { r.dataset.i = i; });
+  if (nowCtx.list === 'pl') nowCtx.i = -1;
+  markNow();
+}
+let rowDragged = 0;
+function wirePlaylistDrag() {
+  document.addEventListener('pointerdown', e => {
+    const g = e.target.closest?.('.row-grip'); if (!g || e.button > 0) return;
+    const rowEl = g.closest('.row'), rowsEl = rowEl?.closest('.rows[data-reorder]'); if (!rowsEl) return;
+    const p = lib.playlists.get(rowsEl.dataset.reorder); if (!p) return;
+    e.preventDefault(); e.stopPropagation();
+    const fromId = rowEl.dataset.id, from = [...rowsEl.children].indexOf(rowEl);
+    const scroller = $('#main');
+    rowEl.classList.add('dragging'); document.body.classList.add('row-dragging');
+    let lastY = e.clientY, raf = 0, moved = false;
+    const place = () => {
+      // only the neighbours are measured, so long lists stay smooth
+      let prev = rowEl.previousElementSibling, next = rowEl.nextElementSibling;
+      while (prev && lastY < prev.getBoundingClientRect().top + prev.offsetHeight / 2) { rowsEl.insertBefore(rowEl, prev); prev = rowEl.previousElementSibling; moved = true; }
+      while (next && lastY > next.getBoundingClientRect().top + next.offsetHeight / 2) { rowsEl.insertBefore(rowEl, next.nextElementSibling); next = rowEl.nextElementSibling; moved = true; }
+    };
+    const loop = () => {
+      const r = scroller.getBoundingClientRect(), edge = 70;
+      const top = Math.max(r.top, 0) + edge, bot = Math.min(r.bottom, innerHeight - (document.body.classList.contains('has-track') ? 90 : 0)) - edge;
+      if (lastY < top) scroller.scrollTop -= Math.min(18, (top - lastY) / 3 + 2);
+      else if (lastY > bot) scroller.scrollTop += Math.min(18, (lastY - bot) / 3 + 2);
+      place();
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    // (listened for on the window: moving the row in the list drops the grip's pointer capture)
+    const move = ev => { if (ev.pointerId === e.pointerId) { lastY = ev.clientY; if (ev.cancelable) ev.preventDefault(); } };
+    const up = async ev => {
+      if (ev && ev.pointerId !== e.pointerId) return;
+      cancelAnimationFrame(raf);
+      removeEventListener('pointermove', move); removeEventListener('pointerup', up); removeEventListener('pointercancel', up);
+      rowEl.classList.remove('dragging'); document.body.classList.remove('row-dragging');
+      rowDragged = Date.now();
+      const to = [...rowsEl.children].indexOf(rowEl);
+      if (!moved || to === from) return;
+      // the song now sits just before the next row on screen (or after the previous one)
+      const nextId = rowEl.nextElementSibling?.dataset.id;
+      const ids = p.trackIds.filter(x => x !== fromId);
+      let at = nextId ? ids.indexOf(nextId) : -1;
+      if (at < 0) { const prevId = rowEl.previousElementSibling?.dataset.id; at = prevId ? ids.indexOf(prevId) + 1 : 0; }
+      const before = p.trackIds.slice();
+      await store.moveInPlaylist(p.id, fromId, at);
+      plOrderChanged(p);
+      toastUndo('Moved', async () => { p.trackIds = before; await store.savePlaylist(p, { quiet: true }); plOrderChanged(p, true); });
+    };
+    addEventListener('pointermove', move, { passive: false }); addEventListener('pointerup', up); addEventListener('pointercancel', up);
+  });
+}
 
 // ================= VIEWS =================
 function header(title, sub = '', art = '', actions = '', kind = '') {
@@ -5766,6 +6054,7 @@ async function vHome(_, my) {
   const collage = [...new Set([cur, ...liked, ...recent].filter(t => t?.artwork).map(t => t.artwork))].slice(0, 4);
   lists.set('recent', recent.map(t => t.id));
   if (cur) lists.set('cont', [cur.id]);
+  const keepNR = $('#new-releases')?.innerHTML || ''; // a quiet redraw keeps the row that's already there (no flash)
   view().innerHTML = `<div class="page home">
     <section class="home-hero">${helpBtn()}
       <div class="hh-bg" ${heroArt ? `style="background-image:url('${esc(sized(heroArt, 300))}')"` : ''}></div>
@@ -5788,7 +6077,7 @@ async function vHome(_, my) {
         ${pls.slice(0, 5).map(p => card({ href: `#/playlist/${p.id}`, img: plCover(p), title: p.name, sub: `${p.trackIds.length} songs`, act: 'play-playlist', id: p.id })).join('')}
         ${!pls.length ? `<button class="card card-new" data-act="new-playlist"><div class="card-art"><div class="cover noimg new-pl">${icon('plus')}</div></div><div class="card-t">New playlist</div><div class="card-s">Make your own mix</div></button>` : ''}
       </div></section>
-    <section id="new-releases" class="shelf-sec"></section>
+    <section id="new-releases" class="shelf-sec">${keepNR}</section>
     <section class="home-recent"><div class="sec-h"><h2>Recently added</h2><a href="#/library/songs" class="lnk">See all</a></div>
       <div class="rows two">${recent.map((t, i) => trackRow(t, i, { list: 'recent' })).join('')}</div></section>
     <section class="shelf-sec"><div class="sec-h"><h2>Your artists</h2><a href="#/library/artists" class="lnk">See all</a></div>
@@ -5811,7 +6100,7 @@ async function vHome(_, my) {
 const BOLT_SVG = `<svg class="bz-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="#ffd60a" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="#ff9500"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix">${BOLT_SVG}BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
-const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
+const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2 class="tclamp">${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
 function updateJump() {
   const box = $('#jump'); if (!box) return;
@@ -6125,7 +6414,7 @@ const apicObs = 'IntersectionObserver' in window ? new IntersectionObserver(entr
 function fillArtistPics(root = document) { if (apicObs) root.querySelectorAll('[data-apic]').forEach(el => apicObs.observe(el)); }
 
 function genreColor(g) { let h = 7; for (const c of g) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 42%)`; }
-const plCover = p => p.image || (p.trackIds.map(id => lib.tracks.get(id)?.artwork).find(Boolean) || '');
+const plCover = p => { if (p.image) return p.image; for (const id of p.trackIds) { const a = lib.tracks.get(id)?.artwork; if (a) return a; } return ''; }; // (stops at the first cover)
 const albumCard = a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: [a.year, a.artist].filter(Boolean).join(' · '), act: 'play-album', id: a.id });
 const albumHref = a => lib.albums.has(a.id) || !a.itunesAlbumId ? `#/album/${encodeURIComponent(a.id)}` : `#/album/it/${a.itunesAlbumId}`;
 
@@ -6234,7 +6523,7 @@ async function vPlaylist([id]) {
       <button class="ib lg" data-act="share-playlist" data-id="${p.id}" title="Share">${icon('share')}</button>
       <button class="ib lg" data-act="playlist-menu" data-id="${p.id}" aria-label="More options" title="More">${icon('more')}</button>
       ${matchBtn('pl', p.name, p.id, '', true)}</div>
-    ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
+    ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, reorder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
   </div>`;
   observeMore();
 }
@@ -7584,7 +7873,7 @@ async function trackMenu(btn, id, plId) {
   const c = await db.get('ytcache', id) || {};
   const pls = [...lib.playlists.values()];
   const k = await menu(btn, [
-    { header: `<b>${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
+    { header: `<b class="tclamp">${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
     { k: 'next', label: 'Play next', icon: 'play' },
     { k: 'like', label: t.liked ? 'Remove from Liked' : 'Add to Liked Songs', icon: t.liked ? 'heartFill' : 'heart' },
     { k: 'addpl', label: 'Add to playlist…', icon: 'plus' },
@@ -7601,6 +7890,8 @@ async function trackMenu(btn, id, plId) {
     { k: 'file', label: t.localFileId ? 'Replace offline file' : 'Attach offline file', icon: 'offline' },
     t.localFileId ? { k: 'unfile', label: 'Remove offline file', icon: 'cloudOff' } : null,
     '-',
+    plId ? { k: 'pltop', label: 'Move to top of playlist', icon: 'up' } : null,
+    plId ? { k: 'plbottom', label: 'Move to bottom of playlist', icon: 'down' } : null,
     plId ? { k: 'unpl', label: 'Remove from this playlist', icon: 'trash', danger: true } : null,
     !t.transient ? { k: 'del', label: 'Remove from library', icon: 'trash', danger: true } : null
   ]);
@@ -7616,6 +7907,14 @@ async function trackMenu(btn, id, plId) {
   if (k === 'ytopen') window.open('https://www.youtube.com/watch?v=' + (c[P.mode] || c.video || c.audio), '_blank', 'noopener');
   if (k === 'file') pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', f => attachFile(t, f));
   if (k === 'unfile') { await db.del('files', t.localFileId); await store.updateTrack(id, { localFileId: null }); toast('Offline file removed'); }
+  if (k === 'pltop' || k === 'plbottom') {
+    const p = lib.playlists.get(plId); if (!p) return;
+    const before = p.trackIds.slice();
+    await store.moveInPlaylist(plId, id, k === 'pltop' ? 0 : p.trackIds.length);
+    if (fstate.pl?._id === plId) fstate.pl.sort = ''; // show the playlist in its own order so the move is visible
+    plOrderChanged(p, true);
+    toastUndo(k === 'pltop' ? 'Moved to the top' : 'Moved to the bottom', async () => { p.trackIds = before; await store.savePlaylist(p, { quiet: true }); plOrderChanged(p, true); });
+  }
   if (k === 'unpl') { const r = await store.removeFromPlaylist(plId, id); toastUndo('Removed from playlist', async () => { await store.undoRemoveFromPlaylist(r); toast('Put back ✓'); }); }
   if (k === 'del' && await confirmBox('Remove from library?', `"${esc(t.title)}" will be removed from your library and all playlists.`, 'Remove', true)) { await store.deleteTrack(id); toast('Removed'); }
 }
@@ -7647,18 +7946,71 @@ async function setYTLink(t, mode, c) {
   if (player.current()?.id === t.id && P.mode === mode) player.reloadCurrent();
 }
 
+// Add to playlist: a big list of your playlists. Ones that already have the song show a ✓ —
+// tap again to take it out, or tap others to add it there too. Every change can be undone from its toast.
 async function addToPlaylistDialog(ids) {
-  const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
-  const r = await modal(`<h3>Add to playlist</h3><div class="pick-list">
-    <button class="pick" data-resolve="__new">${'<div class="cover sm noimg"><span>+</span></div>'}<span><b>New playlist</b></span></button>
-    ${pls.map(p => `<button class="pick" data-resolve="${p.id}">${cover(plCover(p), p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} songs</small></span></button>`).join('')}</div>`);
-  if (!r) return;
-  for (const id of ids) { const t = lib.tracks.get(id); if (t?.transient) await store.upsertTracks([t]); }
-  if (r === '__new') {
-    const name = await promptText('New playlist', '', 'Name', 'Create'); if (!name) return;
-    await store.createPlaylist(name, ids); toast(`Added to "${name}"`);
-  } else { const n = await store.addToPlaylist(r, ids); toast(n ? `Added to "${lib.playlists.get(r).name}"` : 'Already in that playlist'); }
-  renderSidebarPlaylists();
+  ids = [...new Set(ids)].filter(id => lib.tracks.has(id));
+  if (!ids.length) return;
+  // a copy of each song, so a song taken out (and cleaned up) can still be added somewhere else
+  const snaps = new Map(ids.map(id => [id, stripTransient(lib.tracks.get(id))]));
+  const ensure = async () => { const need = ids.filter(id => !lib.tracks.has(id) || lib.tracks.get(id).transient).map(id => snaps.get(id)); if (need.length) await store.upsertTracks(need); };
+  const one = ids.length === 1 ? lib.tracks.get(ids[0]) : null;
+  let changed = false, q = '';
+  const stateOf = p => { let n = 0; const has = new Set(p.trackIds); for (const id of ids) if (has.has(id)) n++; return n === 0 ? 'off' : n === ids.length ? 'on' : 'some'; };
+  const rowHTML = p => { const st = stateOf(p); return `<button type="button" class="pick pl-pick ${st}" data-pk="${esc(p.id)}" aria-pressed="${st === 'on' ? 'true' : st === 'some' ? 'mixed' : 'false'}">
+      ${cover(plCover(p), p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} song${p.trackIds.length === 1 ? '' : 's'}${st === 'on' ? ' · added' : ''}</small></span>
+      <i class="pl-check" aria-hidden="true">${icon(st === 'some' ? 'minus' : 'check')}</i></button>`; };
+  const listHTML = () => {
+    const nq = norm(q);
+    const pls = [...lib.playlists.values()].filter(p => !nq || norm(p.name).includes(nq)).sort((a, b) => a.name.localeCompare(b.name));
+    return `<button type="button" class="pick pl-pick pl-new" data-pk="__new"><div class="cover sm noimg"><span>${icon('plus')}</span></div><span><b>New playlist</b><small>${q ? `Name it "${esc(q)}"` : 'Start a new one with this song'}</small></span></button>`
+      + (pls.length ? pls.map(rowHTML).join('') : `<p class="muted tiny pad">No playlists match "${esc(q)}".</p>`);
+  };
+  const many = lib.playlists.size > 6;
+  await modal(`<div class="pl-dlg"><h3>Add to playlist</h3>
+    <p class="muted tiny pl-dlg-sub">${one ? `<b>${esc(displayTitle(one))}</b> · ${esc(one.artist)}` : `${ids.length} songs`}</p>
+    ${many ? `<label class="searchbox sm pl-q">${icon('search')}<input type="search" placeholder="Find a playlist" autocomplete="off" enterkeyhint="search" aria-label="Find a playlist"></label>` : ''}
+    <div class="pick-list pl-list">${listHTML()}</div>
+    <div class="modal-actions"><button type="button" class="btn primary" data-close>Done</button></div></div>`, {
+    focus: !matchMedia('(pointer: coarse)').matches,
+    onMount: (m) => {
+      m.classList.add('pl-modal');
+      const list = m.querySelector('.pl-list');
+      const redraw = () => { const sc = list.scrollTop; list.innerHTML = listHTML(); list.scrollTop = sc; };
+      const redrawOne = pid => { const b = list.querySelector(`[data-pk="${CSS.escape(pid)}"]`), p = lib.playlists.get(pid); if (b && p) b.outerHTML = rowHTML(p); else redraw(); };
+      m.querySelector('.pl-q input')?.addEventListener('input', e => { q = e.target.value; redraw(); });
+      list.addEventListener('click', async e => {
+        const b = e.target.closest('[data-pk]'); if (!b || b.dataset.busy) return;
+        const pid = b.dataset.pk;
+        b.dataset.busy = '1';
+        try {
+          if (pid === '__new') {
+            const name = await promptText('New playlist', q, 'Name', 'Create'); if (!name) return;
+            await ensure();
+            const np = await store.createPlaylist(name, ids); changed = true;
+            renderSidebarPlaylists(); redraw();
+            toastUndo(`Added to "${name}"`, async () => { await store.deletePlaylist(np.id); renderSidebarPlaylists(); if (list.isConnected) redraw(); toast('Undone'); });
+            return;
+          }
+          const p = lib.playlists.get(pid); if (!p) return;
+          if (stateOf(p) === 'on') {
+            const r = await store.removeManyFromPlaylist(pid, ids, { quiet: true }); changed = true;
+            redrawOne(pid);
+            toastUndo(`Removed from "${p.name}"`, async () => { await store.undoRemoveMany(r); if (list.isConnected) redrawOne(pid); toast('Put back ✓'); });
+          } else {
+            await ensure();
+            const has = new Set(p.trackIds), added = ids.filter(id => !has.has(id));
+            p.trackIds = [...p.trackIds, ...added];
+            await store.savePlaylist(p, { quiet: true }); changed = true;
+            redrawOne(pid);
+            const b2 = list.querySelector(`[data-pk="${CSS.escape(pid)}"]`); b2?.classList.add('pop');
+            toastUndo(`Added to "${p.name}"`, async () => { await store.removeManyFromPlaylist(pid, added); if (list.isConnected) redrawOne(pid); toast('Undone'); });
+          }
+        } finally { if (b.isConnected) delete b.dataset.busy; }
+      });
+    }
+  });
+  if (changed) { renderSidebarPlaylists(); store.bump(); softRefresh(); }
 }
 
 async function resolveAlbum(t) {
@@ -7779,7 +8131,20 @@ function idsForPlayAct(el) {
   return [];
 }
 
+// Long song titles show 2 lines with "…"; tap one to see all of it for 3 seconds
+function wireTitleReveal() {
+  document.addEventListener('click', e => {
+    const el = e.target.closest?.('.tclamp'); if (!el) return;
+    if (!el.classList.contains('full') && el.scrollHeight <= el.clientHeight + 1) return; // it already fits
+    e.stopPropagation();
+    el.classList.add('full');
+    clearTimeout(el._revealT);
+    el._revealT = setTimeout(() => el.classList.remove('full'), 3000);
+  }, true);
+}
 function wireGlobal() {
+  wireTitleReveal();
+  wirePlaylistDrag();
   document.addEventListener('click', async e => {
     const a = e.target.closest('[data-act]');
     if (!a) return;
@@ -7787,6 +8152,7 @@ function wireGlobal() {
     switch (act) {
       case 'play-row': {
         if (e.target.closest('a')) return; // artist/album links
+        if (e.target.closest('.row-grip') || Date.now() - rowDragged < 400) return; // rearranging, not playing
         if (a.dataset.list === 'pl') notePlaylistPlay(location.hash.split('/')[2]);
         const ids = lists.get(a.dataset.list) || [a.dataset.id];
         const i = +a.dataset.i;
@@ -7930,8 +8296,9 @@ function wireGlobal() {
     const r = e.target.closest?.('.row[data-id], .qrow [data-qjump]'); if (!r) return;
     clearTimeout(hoverT);
     const id = r.dataset.id || P.queue[+r.dataset.qjump]?.id;
-    if (id) hoverT = setTimeout(() => player.prefetch(id), e.pointerType === 'mouse' ? 220 : 0);
+    if (id) hoverT = setTimeout(() => player.prefetch(id), e.pointerType === 'mouse' ? 220 : 140);
   }, { passive: true });
+  document.addEventListener('pointercancel', () => clearTimeout(hoverT), { passive: true }); // (a touch that turned into a scroll)
   document.addEventListener('pointerout', e => { if (e.target.closest?.('.row')) clearTimeout(hoverT); }, { passive: true });
   // Keyboard: Enter on a row plays it; space toggles playback
   document.addEventListener('keydown', e => {
@@ -7999,7 +8366,7 @@ function wireGlobal() {
   const afterTurn = () => { schedulePlace(); [120, 300, 600, 1000].forEach(ms => setTimeout(placeDock, ms)); };
   window.addEventListener('orientationchange', afterTurn);
   screen.orientation?.addEventListener?.('change', afterTurn);
-  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); new MutationObserver(() => { const sl = $('#np-slot'); if (sl && !sl._ro) { sl._ro = 1; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
+  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); let slotNow = null; new MutationObserver(() => { const sl = $('#np-slot'); if (sl && sl !== slotNow) { if (slotNow) slotRO.unobserve(slotNow); slotNow = sl; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
   window.visualViewport?.addEventListener('resize', schedulePlace);
   if ('ResizeObserver' in window) new ResizeObserver(schedulePlace).observe($('#np'));
   // Yellow fill on every slider as it moves
@@ -8010,11 +8377,15 @@ function wireGlobal() {
 const debouncedRefresh = debounce(k => refreshSection(k, true), 200);
 const isTyping = () => document.activeElement?.matches('input,textarea');
 // Lighter refresh: only re-render sections in place when possible
+// (while the full-screen player covers the page, or the app is in the background, it waits until you're back)
+let libPending = false;
 function softRefresh() {
   const h = location.hash;
   if (/^#\/(search|import|settings|s\/)/.test(h)) return;
+  if (document.hidden || document.body.classList.contains('np-open')) { libPending = true; return; }
   rerender();
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && libPending && !document.body.classList.contains('np-open')) { libPending = false; softRefresh(); } });
 
 async function deleteAccount() {
   const ok = await modal(`<h3>Erase this device?</h3>
@@ -8037,6 +8408,9 @@ function renderProfileChip() {
 function renderSidebarPlaylists() {
   const el = $('#side-pl'); if (!el) return;
   const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const sig = pls.map(p => p.id + '\u0001' + p.name + '\u0001' + (plCover(p) || '').slice(0, 200)).join('\u0002');
+  if (el.dataset.sig === sig && el.firstChild) return; // nothing in the sidebar changed (most library changes)
+  el.dataset.sig = sig;
   el.innerHTML = `<a href="#/library/liked" class="spl">${likedCover('sm')}<span>Liked Songs</span></a>` +
     pls.map(p => `<a href="#/playlist/${p.id}" class="spl">${cover(plCover(p), p.name, 'sm')}<span>${esc(p.name)}</span></a>`).join('');
 }
@@ -8190,17 +8564,46 @@ function wireSeek(r) {
 // instead of leaving the page. Any navigation closes it properly (the video goes back to its corner).
 function openNP() {
   if (!player.current()) return;
+  if (document.body.classList.contains('np-closing')) finishCloseNP();
   const was = document.body.classList.contains('np-open');
   if (!was) window.scrollTo(0, 0);
   document.body.classList.add('np-open'); renderNP(true); requestAnimationFrame(placeDock); setTimeout(placeDock, 320);
   if (!was && !history.state?.bzNP) { try { history.pushState({ bzNP: 1 }, ''); } catch { } }
   saveSpotSoon();
 }
+// Closing slides the sheet down in one smooth move: what's on screen stays exactly where it is (no jump
+// back to the top), the video rides down with the sheet, and it's only moved to its corner once the
+// slide has finished (resizing the YouTube player mid-animation is what made closing stutter).
+let npCloseT = 0;
 function closeNP(how = 'ui') {
-  const was = document.body.classList.contains('np-open');
-  document.body.classList.remove('np-open'); if (was) window.scrollTo(0, 0); placeDock(); saveSpotSoon();
+  const body = document.body, was = body.classList.contains('np-open');
+  if (was) {
+    const sc = window.scrollY || 0;
+    const dock = $('#yt-dock');
+    const r = dock.classList.contains('in-np') && dock.classList.contains('show') ? dock.getBoundingClientRect() : null;
+    body.classList.add('np-closing');
+    body.classList.remove('np-open', 'np-pulling');
+    const scr = $('#np .np-scroll'); if (scr && sc) scr.scrollTop = sc;
+    if (sc) window.scrollTo(0, 0);
+    if (r) {
+      dock.classList.add('np-leaving');
+      Object.assign(dock.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', right: 'auto', bottom: 'auto', transform: 'none' });
+      void dock.offsetWidth;
+      dock.style.transform = `translate3d(0, ${Math.max(0, innerHeight - r.top)}px, 0)`;
+    }
+    clearTimeout(npCloseT); npCloseT = setTimeout(finishCloseNP, 330);
+  } else placeDock();
+  saveSpotSoon();
   if (!was || how === 'pop' || !history.state?.bzNP) return;
   if (how === 'ui') history.back(); else { try { history.replaceState(null, ''); } catch { } }
+}
+function finishCloseNP() {
+  clearTimeout(npCloseT);
+  document.body.classList.remove('np-closing');
+  const dock = $('#yt-dock');
+  if (dock.classList.contains('np-leaving')) { dock.classList.remove('np-leaving', 'in-np'); dock.removeAttribute('style'); }
+  placeDock();
+  if (libPending) { libPending = false; softRefresh(); } // library changes that happened while the player covered the page
 }
 window.addEventListener('popstate', e => { if (document.body.classList.contains('np-open') && !e.state?.bzNP) closeNP('pop'); });
 function toggleQueue() {
@@ -8280,7 +8683,7 @@ function renderPlayer() {
   const dl = $('#yt-dock .dl-art');
   if (dl && t && dl.dataset.src !== (t.artwork || '')) { dl.dataset.src = t.artwork || ''; dl.style.backgroundImage = t.artwork ? `url("${sized(t.artwork, 300).replace(/"/g, '%22')}")` : ''; }
   const bar = $('#playerbar');
-  if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; return; }
+  if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; timeElsStale(); return; }
   // Play/pause/buffering only touch the play button — the rest of the bar is left alone (instant, no flicker)
   const key = [t.id, t.artwork, displayTitle(t), t.artist, t.liked && !t.transient, P.error, P.mode, P.source, P.shuffle, P.repeat, document.body.classList.contains('queue-open'), P.volume > 0].join('|');
   if (bar.dataset.key === key && bar.firstElementChild) { patchPlayButtons(); playerTail(t); return; }
@@ -8311,6 +8714,7 @@ function renderPlayer() {
       <button class="ib" data-p="mute" aria-label="Mute">${icon(P.volume > 0 ? 'volume' : 'mute')}</button>
       <input type="range" class="vol" min="0" max="1" step="0.01" value="${P.volume}" aria-label="Volume">
     </div>`;
+  timeElsStale();
   const s = bar.querySelector('.seek');
   if (s) wireSeek(s);
   bar.querySelector('.vol')?.addEventListener('input', e => player.setVolume(+e.target.value));
@@ -8359,15 +8763,31 @@ function markNow() {
   if (el && (!el.classList.contains('now') || !el.querySelector('.eq'))) { el.classList.add('now'); (el.querySelector('.row-num .cover') || el.querySelector('.row-num')).insertAdjacentHTML('beforeend', '<span class="eq"><i></i><i></i><i></i></span>'); }
 }
 
+// Runs twice a second for as long as the app is open, so it stays cheap: the few elements it updates are
+// looked up once (again only after the player bar / full-screen player is rebuilt), and nothing is
+// written when the value on screen wouldn't change.
+let timeEls = null, timeLast = '';
+const timeElsStale = () => { timeEls = null; timeLast = ''; };
 function renderTime() {
   if (seeking && !seeking.isConnected) { clearTimeout(seekIdle); seeking = null; } // the bar was redrawn mid-drag
+  if (!timeEls || (timeEls.any && !timeEls.any.isConnected)) {
+    timeEls = { prog: $$('.pb-progress i'), seek: $$('.seek'), now: $$('.t-now'), dur: $$('.t-dur') };
+    timeEls.any = timeEls.prog[0] || timeEls.seek[0] || null;
+    timeLast = '';
+  }
+  if (document.hidden) return; // nobody's looking; it catches up the moment the app is visible
   const pct = P.duration ? Math.max(0, Math.min(1, (P.time || 0) / P.duration)) : 0;
-  $$('.pb-progress i').forEach(i => i.style.width = (pct * 100) + '%');
+  const pctS = (pct * 100).toFixed(2), nowS = fmtTime(P.time), durS = fmtTime(P.duration);
+  const sig = pctS + '|' + nowS + '|' + durS + '|' + !!seeking;
+  if (sig === timeLast) return;
+  timeLast = sig;
+  for (const i of timeEls.prog) i.style.width = pctS + '%';
   if (seeking) return;
-  $$('.seek').forEach(s => { s.value = Math.round(pct * 1000); s.style.setProperty('--p', (pct * 100).toFixed(2) + '%'); });
-  $$('.t-now').forEach(x => x.textContent = fmtTime(P.time));
-  $$('.t-dur').forEach(x => x.textContent = fmtTime(P.duration));
+  for (const s of timeEls.seek) { s.value = Math.round(pct * 1000); s.style.setProperty('--p', pctS + '%'); }
+  for (const x of timeEls.now) if (x.textContent !== nowS) x.textContent = nowS;
+  for (const x of timeEls.dur) if (x.textContent !== durS) x.textContent = durS;
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { timeLast = ''; renderTime(); } });
 
 let qDragging = false;
 // Full-screen player. The first render builds the page; after that (play/pause, like,
@@ -8435,7 +8855,7 @@ function renderNP(full = false) {
     <div class="np-main">
       <div class="np-scroll"><div class="np-inner">
         <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
-        <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
+        <div class="np-info"><div><h2 class="tclamp">${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
           <div class="np-side">${npLike(t)}<div class="np-tags np-tags-side">${npTags(t)}</div></div></div>
         <p class="np-err" data-e="${esc(P.error || '')}" ${P.error ? '' : 'hidden'}>${P.error ? errHTML(P.error) : ''}</p>
         <div class="np-seek"><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><div class="np-times"><span class="t-now">0:00</span><span class="t-dur">0:00</span></div></div>
@@ -8448,6 +8868,7 @@ function renderNP(full = false) {
     </div>
     ${qOn && !narrow ? npQueueHTML() : ''}
     </div>`;
+  timeElsStale();
   wireSeek(np.querySelector('.seek'));
   if (qOn) renderQueue(np.querySelector('.np-q-body'));
   if (document.body.classList.contains('np-lyr')) showLyrics(t);
@@ -8518,6 +8939,7 @@ async function showLyrics(t) {
 // Otherwise it sits in its corner mini-dock.
 function placeDock() {
   const dock = $('#yt-dock');
+  if (dock.classList.contains('np-leaving')) return; // sliding away with the full-screen player
   const vis = P.source === 'yt' && !!player.current();
   dock.classList.toggle('show', vis);
   if (!vis) return;
@@ -8583,31 +9005,36 @@ function renderQueue(el, force = false) {
     const from = +rowEl.dataset.qi;
     const startOrder = [...list.children].map(r => +r.dataset.qi);
     rowEl.classList.add('dragging'); qDragging = true;
-    g.setPointerCapture(e.pointerId);
     const scroller = el.closest('.np-q-body, .qp-body, #main, .np-scroll') || el;
+    const winScroll = document.body.classList.contains('np-open') && !el.closest('.np-q-body'); // (the full-screen player scrolls the page itself)
     let raf = null, lastY = e.clientY;
+    // only the neighbours are measured, so long queues stay smooth
+    const place = () => {
+      let prev = rowEl.previousElementSibling, next = rowEl.nextElementSibling;
+      while (prev && lastY < prev.getBoundingClientRect().top + prev.offsetHeight / 2) { list.insertBefore(rowEl, prev); prev = rowEl.previousElementSibling; }
+      while (next && lastY > next.getBoundingClientRect().top + next.offsetHeight / 2) { list.insertBefore(rowEl, next.nextElementSibling); next = rowEl.nextElementSibling; }
+    };
     const autoscroll = () => {
-      const r = scroller.getBoundingClientRect();
-      if (lastY < r.top + 50) scroller.scrollTop -= 10; else if (lastY > r.bottom - 50) scroller.scrollTop += 10;
+      const r = winScroll ? { top: 0, bottom: innerHeight } : scroller.getBoundingClientRect();
+      const step = lastY < r.top + 50 ? -10 : lastY > r.bottom - 50 ? 10 : 0;
+      if (step) { if (winScroll) window.scrollBy(0, step); else scroller.scrollTop += step; }
+      place();
       raf = requestAnimationFrame(autoscroll);
     };
     raf = requestAnimationFrame(autoscroll);
-    const move = ev => {
-      lastY = ev.clientY;
-      const sibs = [...list.children].filter(r => r !== rowEl);
-      const before = sibs.find(r => { const b = r.getBoundingClientRect(); return ev.clientY < b.top + b.height / 2; });
-      if (before) { if (rowEl.nextSibling !== before) list.insertBefore(rowEl, before); }
-      else if (list.lastElementChild !== rowEl) list.appendChild(rowEl);
-    };
-    const up = () => {
+    // (listened for on the window: moving the row in the list drops the grip's pointer capture, which
+    // used to stop a drag after the first step)
+    const move = ev => { if (ev.pointerId === e.pointerId) { lastY = ev.clientY; if (ev.cancelable) ev.preventDefault(); } };
+    const up = ev => {
+      if (ev && ev.pointerId !== e.pointerId) return;
       cancelAnimationFrame(raf);
-      g.removeEventListener('pointermove', move); g.removeEventListener('pointerup', up); g.removeEventListener('pointercancel', up);
+      removeEventListener('pointermove', move); removeEventListener('pointerup', up); removeEventListener('pointercancel', up);
       rowEl.classList.remove('dragging'); qDragging = false;
       const newPos = [...list.children].indexOf(rowEl);
       const to = startOrder[newPos];
       if (to !== from) { el._dragged = true; player.moveInQueue(from, to); } else emit('player', P);
     };
-    g.addEventListener('pointermove', move); g.addEventListener('pointerup', up); g.addEventListener('pointercancel', up);
+    addEventListener('pointermove', move, { passive: false }); addEventListener('pointerup', up); addEventListener('pointercancel', up);
   };
 }
 

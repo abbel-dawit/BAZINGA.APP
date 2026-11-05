@@ -403,7 +403,7 @@ async function load(autoplay = true) {
     const id = c[P.mode] || c[P.mode === 'video' ? 'audio' : 'video'];
     if (!t.artwork) store.coverFromVideo(t.id, c.audio || c.video);
     if (!id) throw new Error(NO_MATCH);
-    if (!c[P.mode]) toast(`No ${P.mode === 'video' ? 'music video' : 'audio upload'} found — playing the other version`);
+    if (!c[P.mode] && P.mode === 'video') toast('No music video found — playing the audio version'); // (audio quietly uses the music video when there's no audio upload)
     if (preYT && preYT.tid === t.id && preYT.vid === id && ytPre) swapYT(id, at);
     else await startYT(id, at);
     if (!autoplay) ytPlayer.pauseVideo();

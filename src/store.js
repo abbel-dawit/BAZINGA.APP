@@ -10,7 +10,14 @@ export const lib = {
 };
 
 const changed = debounce(() => emit('library'), 120);
-export const notify = (why = 'change') => { changed(); emit('dirty', why); };
+// Library version: bumped on every change, so derived lists (artists, genres, albums…) are worked out
+// once per change instead of on every screen draw — that matters with big libraries.
+let ver = 0;
+export const bump = () => { ver++; };
+export const version = () => ver;
+const memo = new Map(); // name -> [version, value]
+function cached(name, fn) { const m = memo.get(name); if (m && m[0] === ver) return m[1]; const v = fn(); memo.set(name, [ver, v]); return v; }
+export const notify = (why = 'change') => { ver++; changed(); emit('dirty', why); };
 
 // ---- deletion markers, used when syncing between devices ----
 let tomb = { t: {}, p: {}, a: {} };
@@ -26,7 +33,8 @@ export async function load() {
   lib.tracks = new Map(t.map(x => [x.id, x]));
   lib.albums = new Map(a.map(x => [x.id, x]));
   lib.playlists = new Map(p.map(x => [x.id, x]));
-  await migrateArtists();
+  ver++;
+  await migrateArtists(); ver++;
   // Liked songs from before "recently liked" ordering existed: use when they were added
   const fix = [];
   for (const t of lib.tracks.values()) if (t.liked && !t.likedAt) { t.likedAt = t.addedAt || 1; fix.push(t); }
@@ -95,7 +103,8 @@ export function remember(t) {
   if (!lib.tracks.has(t.id)) lib.tracks.set(t.id, { ...t, transient: true });
   return lib.tracks.get(t.id);
 }
-export const saved = () => [...lib.tracks.values()].filter(t => !t.transient);
+const savedList = () => cached('saved', () => { const out = []; for (const t of lib.tracks.values()) if (!t.transient) out.push(t); return out; });
+export const saved = () => savedList().slice();
 
 export async function updateTrack(id, patch, { quiet = false } = {}) {
   const t = lib.tracks.get(id); if (!t) return;
@@ -103,7 +112,7 @@ export async function updateTrack(id, patch, { quiet = false } = {}) {
   if ('liked' in patch && !!patch.liked !== !!t.liked) patch.likeTs = Date.now();
   patch.updatedAt = Date.now();
   if (t.transient) { Object.assign(t, patch); await upsertTracks([t]); return; }
-  Object.assign(t, patch);
+  Object.assign(t, patch); ver++;
   if (quiet) { emit('dirty', 'track'); await db.put('tracks', t); return; }
   await db.put('tracks', t);
   notify('track');
@@ -124,23 +133,33 @@ export async function toggleLike(id) {
   return setLiked(id, !(t.liked && !t.transient));
 }
 
-function isReferenced(id) {
-  const t = lib.tracks.get(id);
-  if (!t) return false;
-  if (t.liked || t.localFileId) return true;
-  for (const p of lib.playlists.values()) if (p.trackIds.includes(id)) return true;
-  for (const a of lib.albums.values()) if (a.trackIds?.includes(id)) return true;
-  return false;
+// Every song some playlist or album uses (built once per clean-up, not once per song)
+function referencedIds() {
+  const s = new Set();
+  for (const p of lib.playlists.values()) for (const id of p.trackIds) s.add(id);
+  for (const a of lib.albums.values()) for (const id of a.trackIds || []) s.add(id);
+  return s;
 }
 async function gc(ids) {
-  for (const id of ids) if (!isReferenced(id)) { lib.tracks.delete(id); await db.del('tracks', id); await markDeleted('t', id); }
+  if (!ids?.length) return;
+  const used = referencedIds(), gone = [];
+  for (const id of new Set(ids)) {
+    const t = lib.tracks.get(id);
+    if (!t || t.liked || t.localFileId || used.has(id)) continue;
+    lib.tracks.delete(id); gone.push(id); tomb.t[id] = Date.now();
+  }
+  if (!gone.length) return;
+  ver++;
+  await delTracks(gone);
+  await kv.set('tombstones', tomb);
 }
+const delTracks = ids => db.delMany('tracks', ids);
 
 export async function deleteTrack(id) {
   const t = lib.tracks.get(id);
   if (t?.localFileId) await db.del('files', t.localFileId);
   for (const p of lib.playlists.values()) {
-    if (p.trackIds.includes(id)) { p.trackIds = p.trackIds.filter(x => x !== id); await db.put('playlists', p); }
+    if (p.trackIds.includes(id)) { p.trackIds = p.trackIds.filter(x => x !== id); p.updatedAt = Date.now(); await db.put('playlists', p); }
   }
   for (const a of lib.albums.values()) {
     if (a.trackIds?.includes(id)) { a.trackIds = a.trackIds.filter(x => x !== id); await db.put('albums', a); }
@@ -158,7 +177,12 @@ export async function createPlaylist(name, trackIds = [], extra = {}) {
   notify('playlist');
   return p;
 }
-export async function savePlaylist(p) { p.updatedAt = Date.now(); lib.playlists.set(p.id, p); await db.put('playlists', p); notify('playlist'); }
+// quiet: the screen already shows the change (e.g. a drag to reorder), so don't redraw the page
+export async function savePlaylist(p, { quiet = false } = {}) {
+  p.updatedAt = Date.now(); lib.playlists.set(p.id, p); ver++;
+  await db.put('playlists', p);
+  if (quiet) emit('dirty', 'playlist'); else notify('playlist');
+}
 export async function addToPlaylist(pid, ids) {
   const p = lib.playlists.get(pid); if (!p) return 0;
   const before = p.trackIds.length;
@@ -173,6 +197,32 @@ export async function removeFromPlaylist(pid, id) {
   p.trackIds = p.trackIds.filter(x => x !== id);
   await savePlaylist(p); await gc([id]);
   return { pid, id, index, snapshot };
+}
+// Take several songs out of a playlist at once (undo with undoRemoveMany)
+export async function removeManyFromPlaylist(pid, ids, opts) {
+  const p = lib.playlists.get(pid); if (!p) return null;
+  const drop = new Set(ids), removed = [];
+  p.trackIds.forEach((id, index) => { if (drop.has(id)) removed.push({ id, index, snapshot: lib.tracks.get(id) ? { ...lib.tracks.get(id) } : null }); });
+  if (!removed.length) return { pid, removed };
+  p.trackIds = p.trackIds.filter(x => !drop.has(x));
+  await savePlaylist(p, opts); await gc(removed.map(r => r.id));
+  return { pid, removed };
+}
+export async function undoRemoveMany(r, opts) {
+  const p = r && lib.playlists.get(r.pid); if (!p) return;
+  const back = r.removed.filter(x => !lib.tracks.has(x.id) && x.snapshot).map(x => x.snapshot);
+  if (back.length) await upsertTracks(back);
+  for (const x of [...r.removed].sort((a, b) => a.index - b.index)) if (!p.trackIds.includes(x.id)) p.trackIds.splice(Math.min(x.index, p.trackIds.length), 0, x.id);
+  await savePlaylist(p, opts);
+}
+// Move one song to a new spot in a playlist (custom order)
+export async function moveInPlaylist(pid, id, toIndex, opts = { quiet: true }) {
+  const p = lib.playlists.get(pid); if (!p) return;
+  const from = p.trackIds.indexOf(id); if (from < 0) return;
+  const ids = p.trackIds.slice(); ids.splice(from, 1);
+  ids.splice(Math.max(0, Math.min(toIndex, ids.length)), 0, id);
+  p.trackIds = ids;
+  await savePlaylist(p, opts);
 }
 // Undo for removeFromPlaylist: put the song back exactly where it was
 export async function undoRemoveFromPlaylist(r) {
@@ -213,9 +263,10 @@ export async function removeAlbum(id) {
 }
 
 // ---------- Derived views ----------
-export function artists() {
+export const artists = () => cached('artists', artistsNow).slice();
+function artistsNow() {
   const m = new Map();
-  for (const t of saved()) {
+  for (const t of savedList()) {
     const names = t.artists?.length ? t.artists : [mainArtist(t.artist)];
     for (const name of names) {
       const k = norm(name); if (!k) continue;
@@ -230,16 +281,18 @@ export function artists() {
   return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function genres() {
+export const genres = () => cached('genres', genresNow).slice();
+function genresNow() {
   const m = new Map();
-  for (const t of saved()) { const g = genreOf(t); if (g) m.set(g, (m.get(g) || 0) + 1); }
+  for (const t of savedList()) { const g = genreOf(t); if (g) m.set(g, (m.get(g) || 0) + 1); }
   return [...m.entries()].sort((a, b) => b[1] - a[1]);
 }
 
 // Albums the user has songs from but hasn't explicitly saved
-export function implicitAlbums() {
+export const implicitAlbums = () => cached('implicitAlbums', implicitNow).slice();
+function implicitNow() {
   const m = new Map();
-  for (const t of saved()) {
+  for (const t of savedList()) {
     if (!t.album) continue;
     const id = t.albumId || albumKey(t.artist, t.album);
     if (lib.albums.has(id)) continue;
@@ -268,7 +321,7 @@ export function queueEnrich(list) {
   runEnrich(); runCovers();
 }
 async function patchTrack(t, patch) {
-  Object.assign(t, patch);
+  Object.assign(t, patch); ver++;
   await db.put('tracks', t);
   if (patch.artwork) emit('track-art', { id: t.id, artwork: patch.artwork });
   emit('dirty', 'enrich'); // backups only; no full re-render while browsing

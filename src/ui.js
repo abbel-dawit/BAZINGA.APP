@@ -155,7 +155,9 @@ window.__bzImg = img => {
   img.parentNode?.classList.add('ld');
   const u = img.getAttribute('src'); if (!u || seenImg.has(u)) return;
   seenImg.add(u);
-  clearTimeout(saveImgT); saveImgT = setTimeout(() => { try { localStorage.setItem('bz_imgs', JSON.stringify([...seenImg].slice(-4000))); } catch { } }, 1500);
+  if (seenImg.size > 5000) seenImg.delete(seenImg.values().next().value); // (bounded, for long sessions)
+  // saved in a quiet moment, not while pictures are pouring in as you scroll
+  clearTimeout(saveImgT); saveImgT = setTimeout(() => (window.requestIdleCallback || setTimeout)(() => { try { localStorage.setItem('bz_imgs', JSON.stringify([...seenImg].slice(-4000))); } catch { } }), 5000);
 };
 export function cover(src, label, cls = '') {
   const px = /\bsm\b|qt-art|pb-art/.test(cls) ? 64 : /np-art|hero/.test(cls) ? 600 : 200;
@@ -173,7 +175,7 @@ export function trackRow(t, i, ctx = {}, playingId) {
   const isNow = false; // highlighting is done by markNow() so only ONE row lights up
   const main = t.artist || '';
   const artists = `<a href="#/artist/${encodeURIComponent(main)}" class="lnk">${esc(main)}</a>`;
-  return `<div class="row ${isNow ? 'now' : ''} ${t.isVideo ? 'is-video' : ''}" data-act="play-row" data-list="${ctx.list}" data-i="${i}" data-id="${esc(t.id)}" role="button" tabindex="0">
+  return `<div class="row ${isNow ? 'now' : ''} ${t.isVideo ? 'is-video' : ''}" data-act="play-row" data-list="${ctx.list}" data-i="${i}" data-id="${esc(t.id)}" role="button" tabindex="0">${ctx.grip ? `<span class="grip row-grip" title="Drag to reorder" aria-hidden="true">${icon('grip')}</span>` : ''}
     <div class="row-num">${isNow ? '<span class="eq"><i></i><i></i><i></i></span>' : (ctx.numbered ? (t.trackNumber || i + 1) : '')}${cover(t.artwork, t.title, t.isVideo ? 'sm wide' : 'sm')}</div>
     <div class="row-main">
       <div class="row-title"><span class="tt">${esc(displayTitle(t))}</span>${t.explicit ? '<span class="e">E</span>' : ''}${t.localFileId ? `<span class="off" title="Available offline">${icon('offline')}</span>` : ''}</div>
@@ -215,7 +217,7 @@ on('toast', ({ msg, kind, action, ms }) => {
 export const toastUndo = (msg, fn, label = 'Undo') => emit('toast', { msg, kind: 'info', action: { label, fn } });
 
 // ---------- Modal ----------
-export function modal(html, { wide = false, onMount, locked = false, ownForms = false } = {}) {
+export function modal(html, { wide = false, onMount, locked = false, ownForms = false, focus = true } = {}) {
   return new Promise(resolve => {
     const root = $('#modal-root');
     const wrap = document.createElement('div');
@@ -237,7 +239,7 @@ export function modal(html, { wide = false, onMount, locked = false, ownForms = 
       close(o);
     });
     onMount?.(wrap.querySelector('.modal'), close);
-    setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
+    if (focus) setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
   });
 }
 export async function promptText(title, value = '', label = 'Name', okText = 'Save') {

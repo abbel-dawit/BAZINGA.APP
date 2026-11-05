@@ -9,8 +9,16 @@ export function esc(s) {
 }
 
 // Normalise a title/artist for matching ("Song (feat. X) - Remastered 2011" -> "song")
+// (remembered: the same few thousand names and titles get normalised over and over while you browse)
+const normMemo = new Map();
 export function norm(s) {
-  return String(s ?? '')
+  const k = String(s ?? '');
+  let v = normMemo.get(k);
+  if (v === undefined) { v = normNow(k); if (normMemo.size > 30000) normMemo.clear(); normMemo.set(k, v); }
+  return v;
+}
+function normNow(s) {
+  return s
     .toLowerCase()
     .normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/\s*[\(\[][^\)\]]*(feat|ft\.|with|remaster|version|edit|mono|stereo|live|deluxe)[^\)\]]*[\)\]]/g, '')

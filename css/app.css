@@ -2227,3 +2227,70 @@ body.np-pulling #np-head::before { opacity: 1; }
   .help-modal { padding-top: 26px; }
   .help-modal .help-top { margin-top: 4px; }
 }
+
+/* ===== v1.8 ===== */
+/* --- coffee buttons always fit their box: the label shrinks with the space it has, and wraps rather than being cut off --- */
+.coffee-btn { box-sizing: border-box; min-width: 0; }
+.coffee-btn .cb-txt { flex: 0 1 auto; min-width: 0; }
+.coffee-btn .cb-txt b { white-space: normal; overflow-wrap: break-word; line-height: 1.1; }
+.p2-body .coffee-btn.big { container-type: inline-size; padding: 12px 18px 12px 12px; gap: 12px; }
+.p2-body .coffee-btn.big .cb-cup { width: clamp(40px, 15cqi, 58px); height: clamp(40px, 15cqi, 58px); }
+.p2-body .coffee-btn.big .cb-cup .ic { width: clamp(22px, 8cqi, 32px); height: clamp(22px, 8cqi, 32px); }
+.p2-body .coffee-btn.big .cb-txt b { font-size: clamp(15px, 6.6cqi, 22px); }
+.p2-body .coffee-btn.big .cb-txt small { font-size: clamp(11px, 3.7cqi, 12.5px); }
+@media (max-width: 420px) { .coffee-btn.big { padding: 12px 18px 12px 12px; gap: 12px; } .coffee-btn.big .cb-txt b { font-size: 18px; } }
+/* --- long song titles: 2 lines with "…"; tapping one shows the whole title for 3 seconds --- */
+.tclamp { display: -webkit-box !important; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden !important; white-space: normal !important; text-overflow: ellipsis; overflow-wrap: anywhere; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.tclamp.full { -webkit-line-clamp: unset; line-clamp: none; display: block !important; animation: tclampIn .18s ease-out; }
+@keyframes tclampIn { from { opacity: .55 } to { opacity: 1 } }
+.jump h2.tclamp { line-height: 1.15; }
+.menu-h b.tclamp { line-height: 1.25; }
+/* --- Add to playlist: a bigger sheet; playlists that already have the song show a ✓ --- */
+.modal.pl-modal { width: min(580px, 100%); padding: 22px 20px 18px; display: flex; flex-direction: column; height: min(720px, calc(100vh - 40px)); height: min(720px, calc(100dvh - 40px)); overflow: hidden; }
+.pl-dlg { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.pl-dlg > * { flex-shrink: 0; }
+.pl-dlg h3 { margin: 0 40px 4px 4px; font-size: 24px; line-height: 1.2; }
+.pl-dlg-sub { margin: 0 40px 14px 4px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl-dlg-sub b { color: var(--text); }
+.pl-q { margin: 0 0 10px; }
+.pl-q input { width: 100%; }
+.pick-list.pl-list { flex: 1 1 auto; flex-shrink: 1; min-height: 160px; height: auto; max-height: none; margin: 0 -6px; padding: 0 6px 4px; gap: 4px; overflow-y: auto; overscroll-behavior: contain; }
+.pick.pl-pick { grid-template-columns: 52px minmax(0, 1fr) 34px; gap: 14px; padding: 9px 10px; border-radius: 14px; border: 1.5px solid transparent; transition: background .15s, border-color .15s; }
+.pick.pl-pick > span { display: grid; min-width: 0; gap: 1px; }
+.pick.pl-pick .cover.sm { width: 52px; height: 52px; border-radius: 10px; }
+.pick.pl-pick b { font-size: 16px; }
+.pick.pl-pick small { font-size: 13px; }
+.pl-check { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; border: 2px solid var(--surface3); color: transparent; transition: background .15s, border-color .15s, transform .15s; }
+.pl-check .ic { width: 17px; height: 17px; stroke-width: 3; }
+.pick.pl-pick.on { background: rgb(var(--volt-rgb) / .1); border-color: rgb(var(--volt-rgb) / .35); }
+.pick.pl-pick.on .pl-check, .pick.pl-pick.some .pl-check { background: var(--volt); border-color: #000; color: #000; }
+.pick.pl-pick.on small { color: var(--volt); }
+.pick.pl-pick.pop .pl-check { animation: plPop .3s cubic-bezier(.2, 1.6, .4, 1); }
+@keyframes plPop { 0% { transform: scale(.6) } 100% { transform: scale(1) } }
+.pick.pl-new .cover { background: var(--surface2); color: var(--volt); display: grid; place-items: center; }
+.pick.pl-new .cover .ic { width: 24px; height: 24px; }
+.pick.pl-new b { color: var(--volt); }
+.pick.pl-pick[data-busy] { opacity: .7; }
+.pl-dlg .modal-actions { margin-top: 12px; }
+.pl-dlg .modal-actions .btn { flex: 1; justify-content: center; padding: 13px; font-size: 16px; }
+@media (max-width: 700px) {
+  .modal.pl-modal { width: 100%; height: calc(100vh - 40px); height: calc(100dvh - max(16px, env(safe-area-inset-top) + 10px) - max(16px, env(safe-area-inset-bottom) + 10px)); padding: 20px 14px 14px; }
+}
+/* --- playlists in custom order: drag the grip on the left of a song to move it (like the queue) --- */
+.rows.reorder > .row { position: relative; padding-left: 34px; }
+.row-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 34px; height: auto; margin: 0; display: grid; place-items: center; color: var(--dim, var(--muted)); cursor: grab; touch-action: none; z-index: 1; }
+.row-grip:hover { color: var(--text); }
+.rows.reorder > .row.dragging { background: var(--surface3); box-shadow: 0 10px 30px rgb(0 0 0 / .5); outline: 2px solid var(--volt); z-index: 3; content-visibility: visible; cursor: grabbing; }
+.rows.reorder > .row.dragging .row-grip { cursor: grabbing; color: var(--volt); }
+body.row-dragging, body.row-dragging * { user-select: none; -webkit-user-select: none; cursor: grabbing; }
+@media (max-width: 700px) { .rows.reorder > .row { padding-left: 30px; } .row-grip { width: 30px; } }
+/* --- closing the full-screen player: one smooth slide, GPU only --- */
+body.np-closing #np { will-change: transform; pointer-events: none; }
+body.np-closing #np .np-scroll { padding-top: calc(max(10px, env(safe-area-inset-top)) + var(--nph) - 6px) !important; }
+body.np-closing #np-head { display: flex; transform: translate3d(0, 100vh, 0); transition: transform .3s cubic-bezier(.2, .8, .2, 1); pointer-events: none; }
+body.np-closing #np .np-queue { animation: none; }
+#yt-dock.np-leaving { transition: transform .3s cubic-bezier(.2, .8, .2, 1) !important; z-index: 80; pointer-events: none; border-radius: 16px; }
+#yt-dock.np-leaving .dock-bar { display: none; }
+#yt-dock.np-leaving .dock-frame { height: 100% !important; }
+body:not(.np-open) #np { contain: layout paint; }
+.pick.pl-pick, .pick.pl-pick b { color: var(--text); } .pick.pl-new b { color: var(--volt); }

@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v47`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v48`) so phones fetch the new version.
 
 ## Features
 
@@ -34,6 +34,17 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Offline**: add music files you own; they're matched to your songs automatically, grouped into albums, and play without internet. The app itself also opens offline.
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
+
+### New in v1.8.0
+- **Add to playlist is bigger** and shows a ✓ on every playlist that already has the song. Tap a checked playlist to take the song out, or tap others to add it there too — the sheet stays open until *Done*. A search box appears when you have more than 6 playlists.
+- **Undo** on every "Added to …" / "Removed from …" notification.
+- **Rearrange your playlists**: in *Custom order* (with no filters on), drag the ⋮⋮ grip on the left of any song, just like the queue. ⋯ on a song also has *Move to top / bottom of playlist*. Each move can be undone.
+- **Queue drag fixed**: dragging a song in the queue used to stop after one step; it now follows your finger all the way (and scrolls the list at the edges).
+- **Long song titles** show at most 2 lines with "…" (full-screen player, Jump back in, song menus). Tap the title to see all of it for 3 seconds.
+- **Smoother closing of the full-screen player**: the sheet slides down in one GPU-only move, the video rides down with it and only moves to its corner once the slide is done, and the page underneath isn't redrawn mid-slide.
+- **Better YouTube matches**: the artist's own upload comes first (their channel, their "Artist - Topic" profile, or VEVO). Otherwise the most-played upload whose title is exactly the song (other versions like remixes, live, sped up or "(Taylor's Version)" are skipped unless the song itself is one). If there's no audio upload, the music video is used for audio. Matches made by the older rules are re-checked quietly in the background as you play.
+- **Buy BAZINGA! a coffee** button in the pop-up fits its box on every phone.
+- **Faster with big libraries and long sessions**: library pages render about twice as fast, library changes redraw the page in place (no loader flash, no scroll jump), artists/genres/albums are worked out once per change, auto-backups wait for a quiet moment and no longer load every old snapshot into memory, the progress bar update is nearly free, and a few things that slowly piled up during long sessions (page watchers, video-size watchers, picture memory) are now cleaned up.
 
 ### New in v1.7.3
 - **Corner video always 16:9**: on tablets and mid-size windows the small video box was 296×200, so videos didn't fill it; it now keeps the video's shape at every width (and the big size too).

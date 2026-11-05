@@ -44,6 +44,7 @@ export const db = {
   put: (store, val, key) => tx(store, 'readwrite', s => { key === undefined ? s.put(val) : s.put(val, key); }),
   putMany: (store, vals) => tx(store, 'readwrite', s => { for (const v of vals) s.put(v); }),
   del: (store, key) => tx(store, 'readwrite', s => { s.delete(key); }),
+  delMany: (store, keys) => tx(store, 'readwrite', s => { for (const k of keys) s.delete(k); }),
   clear: (store) => tx(store, 'readwrite', s => { s.clear(); }),
   async destroy() {
     if (dbp) { (await dbp).close(); dbp = null; }

@@ -22,7 +22,7 @@ const lists = new Map();      // listKey -> [trackIds] for "play from here"
 const sections = new Map();   // sectionKey -> {tracks, opts}
 const fstate = {};            // sectionKey -> filter state
 let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
-export const APP_VERSION = 'v1.7.3'; // shown at the bottom of Settings — bump with each release
+export const APP_VERSION = 'v1.8.0'; // shown at the bottom of Settings — bump with each release
 const APP_TAGLINE = 'Music Made For You';
 const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
 let profile = null;
@@ -715,7 +715,8 @@ function goBack() {
   else location.hash = (BACK_TO[name] || ['#/home'])[0];
 }
 
-async function route() {
+// soft: redraw the page you're on in place (library changed) — no loader flash, no scroll jump, menus stay
+async function route({ soft = false } = {}) {
   if (/^#\/(link|c)\//.test(location.hash)) { const req = readJoinLink(); if (req) joinFlow(req); return route(); }
   const my = ++routeToken;
   const full = location.hash || '#/home';
@@ -728,14 +729,18 @@ async function route() {
   lists.clear(); sections.clear(); pagers.clear();
   $('#main')?.removeEventListener('scroll', settingsSpy);
   $$('.nav a, .tabbar a').forEach(a => a.classList.toggle('on', a.dataset.r === name || (name === 'import' && a.dataset.r === 'settings')));
-  if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
-  $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
-  closeQueueOnMobile();
   const v = view();
-  v.scrollTop = 0; $('#main').scrollTop = 0;
+  if (!soft) {
+    if (!restoreSpot?.np && document.body.classList.contains('np-open')) closeNP('nav');
+    $('#modal-root').innerHTML = ''; $('#menu-root').innerHTML = '';
+    closeQueueOnMobile();
+    v.scrollTop = 0; $('#main').scrollTop = 0;
+  }
   const routes = { new: vNewReleases, home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
   const fn = routes[name] || vHome;
-  v.innerHTML = loader();
+  // the old page's "load more" / artist-picture watchers go with it (they'd otherwise pile up over a long session)
+  moreObs.disconnect(); apicObs?.disconnect();
+  if (!soft) v.innerHTML = loader();
   // Back button on detail pages (artist, album, playlist, genre, shared, …) — added as soon as the
   // page appears, not after slow lookups finish
   const addBack = () => {
@@ -773,7 +778,7 @@ const stale = my => my !== routeToken;
 const rerender = debounce(() => {
   // Re-render the current view softly when library changes (keeps scroll)
   const sc = $('#main').scrollTop;
-  route().then(() => { $('#main').scrollTop = sc; });
+  route({ soft: true }).then(() => { if (Math.abs($('#main').scrollTop - sc) > 1) $('#main').scrollTop = sc; });
 }, 250);
 
 // ================= TRACK LIST SECTIONS =================
@@ -807,9 +812,12 @@ function tracksSectionInner(key) {
   const cur = player.current()?.id;
   const head = opts.noFilter ? '' : filterBar(f, tracks, { keepOrder: opts.keepOrder, likedSort: opts.likedSort });
   const count = !opts.noFilter && shown.length !== tracks.length ? `<div class="muted tiny count">${shown.length} of ${tracks.length} songs</div>` : '';
-  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered }, cur)).join('');
+  // A playlist in its own (custom) order with nothing filtered out: drag the grips to rearrange it, like the queue
+  const grip = !!opts.reorder && canReorder(f) && shown.length > 1;
+  opts.grip = grip;
+  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered, grip }, cur)).join('');
   const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
-  return head + count + `<div class="rows">${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
+  return head + count + `<div class="rows${grip ? ' reorder' : ''}" ${grip ? `data-reorder="${esc(opts.playlistId)}"` : ''}>${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
 }
 // "Most popular": numbers load once from the device (fast), then missing views/likes fill in quietly in the
 // background; the list re-sorts itself at most every few seconds while they arrive.
@@ -846,12 +854,75 @@ const moreObs = new IntersectionObserver(entries => {
     const rowsEl = el.previousElementSibling;
     const cur = player.current()?.id;
     const { opts } = sections.get(key) || { opts: {} };
-    rowsEl.insertAdjacentHTML('beforeend', ids.slice(at, at + PAGE).map((id, j) => trackRow(lib.tracks.get(id), at + j, { list: key, playlistId: opts.playlistId }, cur)).join(''));
+    rowsEl.insertAdjacentHTML('beforeend', ids.slice(at, at + PAGE).map((id, j) => trackRow(lib.tracks.get(id), at + j, { list: key, playlistId: opts.playlistId, grip: opts.grip }, cur)).join(''));
     if (at + PAGE >= ids.length) { moreObs.unobserve(el); el.remove(); } else el.dataset.at = at + PAGE;
     markNow();
   }
 }, { rootMargin: '600px' });
 function observeMore() { $$('[data-more]').forEach(el => moreObs.observe(el)); }
+
+// ---------- Rearranging a playlist (custom order) ----------
+const canReorder = f => !f.sort && !f.q && !f.genres?.length && !f.years?.length && !f.from && !f.to && !f.liked && !f.offline;
+// The playlist's order changed: keep the page's lists in step without redrawing it
+function plOrderChanged(p, redraw = false) {
+  const sec = sections.get('pl');
+  if (!sec || fstate.pl?._id !== p.id) return;
+  sec.tracks = p.trackIds.map(i => lib.tracks.get(i)).filter(Boolean);
+  if (redraw) { refreshSection('pl'); return; }
+  lists.set('pl', sec.tracks.map(t => t.id));
+  $$('[data-tsec="pl"] .rows > .row').forEach((r, i) => { r.dataset.i = i; });
+  if (nowCtx.list === 'pl') nowCtx.i = -1;
+  markNow();
+}
+let rowDragged = 0;
+function wirePlaylistDrag() {
+  document.addEventListener('pointerdown', e => {
+    const g = e.target.closest?.('.row-grip'); if (!g || e.button > 0) return;
+    const rowEl = g.closest('.row'), rowsEl = rowEl?.closest('.rows[data-reorder]'); if (!rowsEl) return;
+    const p = lib.playlists.get(rowsEl.dataset.reorder); if (!p) return;
+    e.preventDefault(); e.stopPropagation();
+    const fromId = rowEl.dataset.id, from = [...rowsEl.children].indexOf(rowEl);
+    const scroller = $('#main');
+    rowEl.classList.add('dragging'); document.body.classList.add('row-dragging');
+    let lastY = e.clientY, raf = 0, moved = false;
+    const place = () => {
+      // only the neighbours are measured, so long lists stay smooth
+      let prev = rowEl.previousElementSibling, next = rowEl.nextElementSibling;
+      while (prev && lastY < prev.getBoundingClientRect().top + prev.offsetHeight / 2) { rowsEl.insertBefore(rowEl, prev); prev = rowEl.previousElementSibling; moved = true; }
+      while (next && lastY > next.getBoundingClientRect().top + next.offsetHeight / 2) { rowsEl.insertBefore(rowEl, next.nextElementSibling); next = rowEl.nextElementSibling; moved = true; }
+    };
+    const loop = () => {
+      const r = scroller.getBoundingClientRect(), edge = 70;
+      const top = Math.max(r.top, 0) + edge, bot = Math.min(r.bottom, innerHeight - (document.body.classList.contains('has-track') ? 90 : 0)) - edge;
+      if (lastY < top) scroller.scrollTop -= Math.min(18, (top - lastY) / 3 + 2);
+      else if (lastY > bot) scroller.scrollTop += Math.min(18, (lastY - bot) / 3 + 2);
+      place();
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    // (listened for on the window: moving the row in the list drops the grip's pointer capture)
+    const move = ev => { if (ev.pointerId === e.pointerId) { lastY = ev.clientY; if (ev.cancelable) ev.preventDefault(); } };
+    const up = async ev => {
+      if (ev && ev.pointerId !== e.pointerId) return;
+      cancelAnimationFrame(raf);
+      removeEventListener('pointermove', move); removeEventListener('pointerup', up); removeEventListener('pointercancel', up);
+      rowEl.classList.remove('dragging'); document.body.classList.remove('row-dragging');
+      rowDragged = Date.now();
+      const to = [...rowsEl.children].indexOf(rowEl);
+      if (!moved || to === from) return;
+      // the song now sits just before the next row on screen (or after the previous one)
+      const nextId = rowEl.nextElementSibling?.dataset.id;
+      const ids = p.trackIds.filter(x => x !== fromId);
+      let at = nextId ? ids.indexOf(nextId) : -1;
+      if (at < 0) { const prevId = rowEl.previousElementSibling?.dataset.id; at = prevId ? ids.indexOf(prevId) + 1 : 0; }
+      const before = p.trackIds.slice();
+      await store.moveInPlaylist(p.id, fromId, at);
+      plOrderChanged(p);
+      toastUndo('Moved', async () => { p.trackIds = before; await store.savePlaylist(p, { quiet: true }); plOrderChanged(p, true); });
+    };
+    addEventListener('pointermove', move, { passive: false }); addEventListener('pointerup', up); addEventListener('pointercancel', up);
+  });
+}
 
 // ================= VIEWS =================
 function header(title, sub = '', art = '', actions = '', kind = '') {
@@ -892,6 +963,7 @@ async function vHome(_, my) {
   const collage = [...new Set([cur, ...liked, ...recent].filter(t => t?.artwork).map(t => t.artwork))].slice(0, 4);
   lists.set('recent', recent.map(t => t.id));
   if (cur) lists.set('cont', [cur.id]);
+  const keepNR = $('#new-releases')?.innerHTML || ''; // a quiet redraw keeps the row that's already there (no flash)
   view().innerHTML = `<div class="page home">
     <section class="home-hero">${helpBtn()}
       <div class="hh-bg" ${heroArt ? `style="background-image:url('${esc(sized(heroArt, 300))}')"` : ''}></div>
@@ -914,7 +986,7 @@ async function vHome(_, my) {
         ${pls.slice(0, 5).map(p => card({ href: `#/playlist/${p.id}`, img: plCover(p), title: p.name, sub: `${p.trackIds.length} songs`, act: 'play-playlist', id: p.id })).join('')}
         ${!pls.length ? `<button class="card card-new" data-act="new-playlist"><div class="card-art"><div class="cover noimg new-pl">${icon('plus')}</div></div><div class="card-t">New playlist</div><div class="card-s">Make your own mix</div></button>` : ''}
       </div></section>
-    <section id="new-releases" class="shelf-sec"></section>
+    <section id="new-releases" class="shelf-sec">${keepNR}</section>
     <section class="home-recent"><div class="sec-h"><h2>Recently added</h2><a href="#/library/songs" class="lnk">See all</a></div>
       <div class="rows two">${recent.map((t, i) => trackRow(t, i, { list: 'recent' })).join('')}</div></section>
     <section class="shelf-sec"><div class="sec-h"><h2>Your artists</h2><a href="#/library/artists" class="lnk">See all</a></div>
@@ -937,7 +1009,7 @@ async function vHome(_, my) {
 const BOLT_SVG = `<svg class="bz-bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="#ffd60a" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/><path d="M11.4 1.2h1.9L8.2 11.1H6.4z" fill="#fff"/><path d="M18.7 9.1 6.2 22.8l1.2-3.4 9.3-10.3z" fill="#ff9500"/><path d="M11.4 1.2h6.8l-5.1 7.9h5.6L6.2 22.8l3.6-10H5.1z" fill="none" stroke="#000" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
 const bzBtn = (cls = '') => `<button class="btn bz-btn ${cls}" data-act="bz-mix" aria-label="BAZINGA! Make me a fresh mix">${BOLT_SVG}BAZINGA!</button>`;
 const jumpBtn = (on = player.isOn()) => `${icon(on ? 'pause' : 'play')}<span>${on ? 'Pause' : 'Resume'}</span>`;
-const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2>${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
+const jumpInner = t => `<div class="jump-art" data-jid="${esc(t.id)}">${cover(t.artwork, t.title)}</div><div class="jump-txt"><div class="kicker">Jump back in</div><h2 class="tclamp">${esc(displayTitle(t))}</h2><p>${esc(t.artist)}</p>
   <div class="row-btns"><button class="btn primary" data-p-ext="toggle" id="jump-toggle" data-on="${player.isOn() ? 1 : 0}">${jumpBtn()}</button><button class="btn" data-p-ext="open">${icon('expand')}<span>Full screen</span></button></div></div>`;
 function updateJump() {
   const box = $('#jump'); if (!box) return;
@@ -1251,7 +1323,7 @@ const apicObs = 'IntersectionObserver' in window ? new IntersectionObserver(entr
 function fillArtistPics(root = document) { if (apicObs) root.querySelectorAll('[data-apic]').forEach(el => apicObs.observe(el)); }
 
 function genreColor(g) { let h = 7; for (const c of g) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 42%)`; }
-const plCover = p => p.image || (p.trackIds.map(id => lib.tracks.get(id)?.artwork).find(Boolean) || '');
+const plCover = p => { if (p.image) return p.image; for (const id of p.trackIds) { const a = lib.tracks.get(id)?.artwork; if (a) return a; } return ''; }; // (stops at the first cover)
 const albumCard = a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: [a.year, a.artist].filter(Boolean).join(' · '), act: 'play-album', id: a.id });
 const albumHref = a => lib.albums.has(a.id) || !a.itunesAlbumId ? `#/album/${encodeURIComponent(a.id)}` : `#/album/it/${a.itunesAlbumId}`;
 
@@ -1360,7 +1432,7 @@ async function vPlaylist([id]) {
       <button class="ib lg" data-act="share-playlist" data-id="${p.id}" title="Share">${icon('share')}</button>
       <button class="ib lg" data-act="playlist-menu" data-id="${p.id}" aria-label="More options" title="More">${icon('more')}</button>
       ${matchBtn('pl', p.name, p.id, '', true)}</div>
-    ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
+    ${tracks.length ? tracksSection('pl', tracks, { playlistId: p.id, keepOrder: true, reorder: true, defaultSort: '' }) : empty('This playlist is empty', 'Use ⋯ → "Add to playlist" on any song.')}
   </div>`;
   observeMore();
 }
@@ -2710,7 +2782,7 @@ async function trackMenu(btn, id, plId) {
   const c = await db.get('ytcache', id) || {};
   const pls = [...lib.playlists.values()];
   const k = await menu(btn, [
-    { header: `<b>${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
+    { header: `<b class="tclamp">${esc(displayTitle(t))}</b><small>${esc(t.artist)}</small>` },
     { k: 'next', label: 'Play next', icon: 'play' },
     { k: 'like', label: t.liked ? 'Remove from Liked' : 'Add to Liked Songs', icon: t.liked ? 'heartFill' : 'heart' },
     { k: 'addpl', label: 'Add to playlist…', icon: 'plus' },
@@ -2727,6 +2799,8 @@ async function trackMenu(btn, id, plId) {
     { k: 'file', label: t.localFileId ? 'Replace offline file' : 'Attach offline file', icon: 'offline' },
     t.localFileId ? { k: 'unfile', label: 'Remove offline file', icon: 'cloudOff' } : null,
     '-',
+    plId ? { k: 'pltop', label: 'Move to top of playlist', icon: 'up' } : null,
+    plId ? { k: 'plbottom', label: 'Move to bottom of playlist', icon: 'down' } : null,
     plId ? { k: 'unpl', label: 'Remove from this playlist', icon: 'trash', danger: true } : null,
     !t.transient ? { k: 'del', label: 'Remove from library', icon: 'trash', danger: true } : null
   ]);
@@ -2742,6 +2816,14 @@ async function trackMenu(btn, id, plId) {
   if (k === 'ytopen') window.open('https://www.youtube.com/watch?v=' + (c[P.mode] || c.video || c.audio), '_blank', 'noopener');
   if (k === 'file') pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', f => attachFile(t, f));
   if (k === 'unfile') { await db.del('files', t.localFileId); await store.updateTrack(id, { localFileId: null }); toast('Offline file removed'); }
+  if (k === 'pltop' || k === 'plbottom') {
+    const p = lib.playlists.get(plId); if (!p) return;
+    const before = p.trackIds.slice();
+    await store.moveInPlaylist(plId, id, k === 'pltop' ? 0 : p.trackIds.length);
+    if (fstate.pl?._id === plId) fstate.pl.sort = ''; // show the playlist in its own order so the move is visible
+    plOrderChanged(p, true);
+    toastUndo(k === 'pltop' ? 'Moved to the top' : 'Moved to the bottom', async () => { p.trackIds = before; await store.savePlaylist(p, { quiet: true }); plOrderChanged(p, true); });
+  }
   if (k === 'unpl') { const r = await store.removeFromPlaylist(plId, id); toastUndo('Removed from playlist', async () => { await store.undoRemoveFromPlaylist(r); toast('Put back ✓'); }); }
   if (k === 'del' && await confirmBox('Remove from library?', `"${esc(t.title)}" will be removed from your library and all playlists.`, 'Remove', true)) { await store.deleteTrack(id); toast('Removed'); }
 }
@@ -2773,18 +2855,71 @@ async function setYTLink(t, mode, c) {
   if (player.current()?.id === t.id && P.mode === mode) player.reloadCurrent();
 }
 
+// Add to playlist: a big list of your playlists. Ones that already have the song show a ✓ —
+// tap again to take it out, or tap others to add it there too. Every change can be undone from its toast.
 async function addToPlaylistDialog(ids) {
-  const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
-  const r = await modal(`<h3>Add to playlist</h3><div class="pick-list">
-    <button class="pick" data-resolve="__new">${'<div class="cover sm noimg"><span>+</span></div>'}<span><b>New playlist</b></span></button>
-    ${pls.map(p => `<button class="pick" data-resolve="${p.id}">${cover(plCover(p), p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} songs</small></span></button>`).join('')}</div>`);
-  if (!r) return;
-  for (const id of ids) { const t = lib.tracks.get(id); if (t?.transient) await store.upsertTracks([t]); }
-  if (r === '__new') {
-    const name = await promptText('New playlist', '', 'Name', 'Create'); if (!name) return;
-    await store.createPlaylist(name, ids); toast(`Added to "${name}"`);
-  } else { const n = await store.addToPlaylist(r, ids); toast(n ? `Added to "${lib.playlists.get(r).name}"` : 'Already in that playlist'); }
-  renderSidebarPlaylists();
+  ids = [...new Set(ids)].filter(id => lib.tracks.has(id));
+  if (!ids.length) return;
+  // a copy of each song, so a song taken out (and cleaned up) can still be added somewhere else
+  const snaps = new Map(ids.map(id => [id, stripTransient(lib.tracks.get(id))]));
+  const ensure = async () => { const need = ids.filter(id => !lib.tracks.has(id) || lib.tracks.get(id).transient).map(id => snaps.get(id)); if (need.length) await store.upsertTracks(need); };
+  const one = ids.length === 1 ? lib.tracks.get(ids[0]) : null;
+  let changed = false, q = '';
+  const stateOf = p => { let n = 0; const has = new Set(p.trackIds); for (const id of ids) if (has.has(id)) n++; return n === 0 ? 'off' : n === ids.length ? 'on' : 'some'; };
+  const rowHTML = p => { const st = stateOf(p); return `<button type="button" class="pick pl-pick ${st}" data-pk="${esc(p.id)}" aria-pressed="${st === 'on' ? 'true' : st === 'some' ? 'mixed' : 'false'}">
+      ${cover(plCover(p), p.name, 'sm')}<span><b>${esc(p.name)}</b><small>${p.trackIds.length} song${p.trackIds.length === 1 ? '' : 's'}${st === 'on' ? ' · added' : ''}</small></span>
+      <i class="pl-check" aria-hidden="true">${icon(st === 'some' ? 'minus' : 'check')}</i></button>`; };
+  const listHTML = () => {
+    const nq = norm(q);
+    const pls = [...lib.playlists.values()].filter(p => !nq || norm(p.name).includes(nq)).sort((a, b) => a.name.localeCompare(b.name));
+    return `<button type="button" class="pick pl-pick pl-new" data-pk="__new"><div class="cover sm noimg"><span>${icon('plus')}</span></div><span><b>New playlist</b><small>${q ? `Name it "${esc(q)}"` : 'Start a new one with this song'}</small></span></button>`
+      + (pls.length ? pls.map(rowHTML).join('') : `<p class="muted tiny pad">No playlists match "${esc(q)}".</p>`);
+  };
+  const many = lib.playlists.size > 6;
+  await modal(`<div class="pl-dlg"><h3>Add to playlist</h3>
+    <p class="muted tiny pl-dlg-sub">${one ? `<b>${esc(displayTitle(one))}</b> · ${esc(one.artist)}` : `${ids.length} songs`}</p>
+    ${many ? `<label class="searchbox sm pl-q">${icon('search')}<input type="search" placeholder="Find a playlist" autocomplete="off" enterkeyhint="search" aria-label="Find a playlist"></label>` : ''}
+    <div class="pick-list pl-list">${listHTML()}</div>
+    <div class="modal-actions"><button type="button" class="btn primary" data-close>Done</button></div></div>`, {
+    focus: !matchMedia('(pointer: coarse)').matches,
+    onMount: (m) => {
+      m.classList.add('pl-modal');
+      const list = m.querySelector('.pl-list');
+      const redraw = () => { const sc = list.scrollTop; list.innerHTML = listHTML(); list.scrollTop = sc; };
+      const redrawOne = pid => { const b = list.querySelector(`[data-pk="${CSS.escape(pid)}"]`), p = lib.playlists.get(pid); if (b && p) b.outerHTML = rowHTML(p); else redraw(); };
+      m.querySelector('.pl-q input')?.addEventListener('input', e => { q = e.target.value; redraw(); });
+      list.addEventListener('click', async e => {
+        const b = e.target.closest('[data-pk]'); if (!b || b.dataset.busy) return;
+        const pid = b.dataset.pk;
+        b.dataset.busy = '1';
+        try {
+          if (pid === '__new') {
+            const name = await promptText('New playlist', q, 'Name', 'Create'); if (!name) return;
+            await ensure();
+            const np = await store.createPlaylist(name, ids); changed = true;
+            renderSidebarPlaylists(); redraw();
+            toastUndo(`Added to "${name}"`, async () => { await store.deletePlaylist(np.id); renderSidebarPlaylists(); if (list.isConnected) redraw(); toast('Undone'); });
+            return;
+          }
+          const p = lib.playlists.get(pid); if (!p) return;
+          if (stateOf(p) === 'on') {
+            const r = await store.removeManyFromPlaylist(pid, ids, { quiet: true }); changed = true;
+            redrawOne(pid);
+            toastUndo(`Removed from "${p.name}"`, async () => { await store.undoRemoveMany(r); if (list.isConnected) redrawOne(pid); toast('Put back ✓'); });
+          } else {
+            await ensure();
+            const has = new Set(p.trackIds), added = ids.filter(id => !has.has(id));
+            p.trackIds = [...p.trackIds, ...added];
+            await store.savePlaylist(p, { quiet: true }); changed = true;
+            redrawOne(pid);
+            const b2 = list.querySelector(`[data-pk="${CSS.escape(pid)}"]`); b2?.classList.add('pop');
+            toastUndo(`Added to "${p.name}"`, async () => { await store.removeManyFromPlaylist(pid, added); if (list.isConnected) redrawOne(pid); toast('Undone'); });
+          }
+        } finally { if (b.isConnected) delete b.dataset.busy; }
+      });
+    }
+  });
+  if (changed) { renderSidebarPlaylists(); store.bump(); softRefresh(); }
 }
 
 async function resolveAlbum(t) {
@@ -2905,7 +3040,20 @@ function idsForPlayAct(el) {
   return [];
 }
 
+// Long song titles show 2 lines with "…"; tap one to see all of it for 3 seconds
+function wireTitleReveal() {
+  document.addEventListener('click', e => {
+    const el = e.target.closest?.('.tclamp'); if (!el) return;
+    if (!el.classList.contains('full') && el.scrollHeight <= el.clientHeight + 1) return; // it already fits
+    e.stopPropagation();
+    el.classList.add('full');
+    clearTimeout(el._revealT);
+    el._revealT = setTimeout(() => el.classList.remove('full'), 3000);
+  }, true);
+}
 function wireGlobal() {
+  wireTitleReveal();
+  wirePlaylistDrag();
   document.addEventListener('click', async e => {
     const a = e.target.closest('[data-act]');
     if (!a) return;
@@ -2913,6 +3061,7 @@ function wireGlobal() {
     switch (act) {
       case 'play-row': {
         if (e.target.closest('a')) return; // artist/album links
+        if (e.target.closest('.row-grip') || Date.now() - rowDragged < 400) return; // rearranging, not playing
         if (a.dataset.list === 'pl') notePlaylistPlay(location.hash.split('/')[2]);
         const ids = lists.get(a.dataset.list) || [a.dataset.id];
         const i = +a.dataset.i;
@@ -3056,8 +3205,9 @@ function wireGlobal() {
     const r = e.target.closest?.('.row[data-id], .qrow [data-qjump]'); if (!r) return;
     clearTimeout(hoverT);
     const id = r.dataset.id || P.queue[+r.dataset.qjump]?.id;
-    if (id) hoverT = setTimeout(() => player.prefetch(id), e.pointerType === 'mouse' ? 220 : 0);
+    if (id) hoverT = setTimeout(() => player.prefetch(id), e.pointerType === 'mouse' ? 220 : 140);
   }, { passive: true });
+  document.addEventListener('pointercancel', () => clearTimeout(hoverT), { passive: true }); // (a touch that turned into a scroll)
   document.addEventListener('pointerout', e => { if (e.target.closest?.('.row')) clearTimeout(hoverT); }, { passive: true });
   // Keyboard: Enter on a row plays it; space toggles playback
   document.addEventListener('keydown', e => {
@@ -3125,7 +3275,7 @@ function wireGlobal() {
   const afterTurn = () => { schedulePlace(); [120, 300, 600, 1000].forEach(ms => setTimeout(placeDock, ms)); };
   window.addEventListener('orientationchange', afterTurn);
   screen.orientation?.addEventListener?.('change', afterTurn);
-  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); new MutationObserver(() => { const sl = $('#np-slot'); if (sl && !sl._ro) { sl._ro = 1; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
+  if ('ResizeObserver' in window) { const slotRO = new ResizeObserver(schedulePlace); let slotNow = null; new MutationObserver(() => { const sl = $('#np-slot'); if (sl && sl !== slotNow) { if (slotNow) slotRO.unobserve(slotNow); slotNow = sl; slotRO.observe(sl); } }).observe($('#np'), { childList: true, subtree: true }); }
   window.visualViewport?.addEventListener('resize', schedulePlace);
   if ('ResizeObserver' in window) new ResizeObserver(schedulePlace).observe($('#np'));
   // Yellow fill on every slider as it moves
@@ -3136,11 +3286,15 @@ function wireGlobal() {
 const debouncedRefresh = debounce(k => refreshSection(k, true), 200);
 const isTyping = () => document.activeElement?.matches('input,textarea');
 // Lighter refresh: only re-render sections in place when possible
+// (while the full-screen player covers the page, or the app is in the background, it waits until you're back)
+let libPending = false;
 function softRefresh() {
   const h = location.hash;
   if (/^#\/(search|import|settings|s\/)/.test(h)) return;
+  if (document.hidden || document.body.classList.contains('np-open')) { libPending = true; return; }
   rerender();
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && libPending && !document.body.classList.contains('np-open')) { libPending = false; softRefresh(); } });
 
 async function deleteAccount() {
   const ok = await modal(`<h3>Erase this device?</h3>
@@ -3163,6 +3317,9 @@ function renderProfileChip() {
 function renderSidebarPlaylists() {
   const el = $('#side-pl'); if (!el) return;
   const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const sig = pls.map(p => p.id + '\u0001' + p.name + '\u0001' + (plCover(p) || '').slice(0, 200)).join('\u0002');
+  if (el.dataset.sig === sig && el.firstChild) return; // nothing in the sidebar changed (most library changes)
+  el.dataset.sig = sig;
   el.innerHTML = `<a href="#/library/liked" class="spl">${likedCover('sm')}<span>Liked Songs</span></a>` +
     pls.map(p => `<a href="#/playlist/${p.id}" class="spl">${cover(plCover(p), p.name, 'sm')}<span>${esc(p.name)}</span></a>`).join('');
 }
@@ -3316,17 +3473,46 @@ function wireSeek(r) {
 // instead of leaving the page. Any navigation closes it properly (the video goes back to its corner).
 function openNP() {
   if (!player.current()) return;
+  if (document.body.classList.contains('np-closing')) finishCloseNP();
   const was = document.body.classList.contains('np-open');
   if (!was) window.scrollTo(0, 0);
   document.body.classList.add('np-open'); renderNP(true); requestAnimationFrame(placeDock); setTimeout(placeDock, 320);
   if (!was && !history.state?.bzNP) { try { history.pushState({ bzNP: 1 }, ''); } catch { } }
   saveSpotSoon();
 }
+// Closing slides the sheet down in one smooth move: what's on screen stays exactly where it is (no jump
+// back to the top), the video rides down with the sheet, and it's only moved to its corner once the
+// slide has finished (resizing the YouTube player mid-animation is what made closing stutter).
+let npCloseT = 0;
 function closeNP(how = 'ui') {
-  const was = document.body.classList.contains('np-open');
-  document.body.classList.remove('np-open'); if (was) window.scrollTo(0, 0); placeDock(); saveSpotSoon();
+  const body = document.body, was = body.classList.contains('np-open');
+  if (was) {
+    const sc = window.scrollY || 0;
+    const dock = $('#yt-dock');
+    const r = dock.classList.contains('in-np') && dock.classList.contains('show') ? dock.getBoundingClientRect() : null;
+    body.classList.add('np-closing');
+    body.classList.remove('np-open', 'np-pulling');
+    const scr = $('#np .np-scroll'); if (scr && sc) scr.scrollTop = sc;
+    if (sc) window.scrollTo(0, 0);
+    if (r) {
+      dock.classList.add('np-leaving');
+      Object.assign(dock.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', right: 'auto', bottom: 'auto', transform: 'none' });
+      void dock.offsetWidth;
+      dock.style.transform = `translate3d(0, ${Math.max(0, innerHeight - r.top)}px, 0)`;
+    }
+    clearTimeout(npCloseT); npCloseT = setTimeout(finishCloseNP, 330);
+  } else placeDock();
+  saveSpotSoon();
   if (!was || how === 'pop' || !history.state?.bzNP) return;
   if (how === 'ui') history.back(); else { try { history.replaceState(null, ''); } catch { } }
+}
+function finishCloseNP() {
+  clearTimeout(npCloseT);
+  document.body.classList.remove('np-closing');
+  const dock = $('#yt-dock');
+  if (dock.classList.contains('np-leaving')) { dock.classList.remove('np-leaving', 'in-np'); dock.removeAttribute('style'); }
+  placeDock();
+  if (libPending) { libPending = false; softRefresh(); } // library changes that happened while the player covered the page
 }
 window.addEventListener('popstate', e => { if (document.body.classList.contains('np-open') && !e.state?.bzNP) closeNP('pop'); });
 function toggleQueue() {
@@ -3406,7 +3592,7 @@ function renderPlayer() {
   const dl = $('#yt-dock .dl-art');
   if (dl && t && dl.dataset.src !== (t.artwork || '')) { dl.dataset.src = t.artwork || ''; dl.style.backgroundImage = t.artwork ? `url("${sized(t.artwork, 300).replace(/"/g, '%22')}")` : ''; }
   const bar = $('#playerbar');
-  if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; return; }
+  if (!t) { bar.innerHTML = ''; bar.dataset.key = ''; timeElsStale(); return; }
   // Play/pause/buffering only touch the play button — the rest of the bar is left alone (instant, no flicker)
   const key = [t.id, t.artwork, displayTitle(t), t.artist, t.liked && !t.transient, P.error, P.mode, P.source, P.shuffle, P.repeat, document.body.classList.contains('queue-open'), P.volume > 0].join('|');
   if (bar.dataset.key === key && bar.firstElementChild) { patchPlayButtons(); playerTail(t); return; }
@@ -3437,6 +3623,7 @@ function renderPlayer() {
       <button class="ib" data-p="mute" aria-label="Mute">${icon(P.volume > 0 ? 'volume' : 'mute')}</button>
       <input type="range" class="vol" min="0" max="1" step="0.01" value="${P.volume}" aria-label="Volume">
     </div>`;
+  timeElsStale();
   const s = bar.querySelector('.seek');
   if (s) wireSeek(s);
   bar.querySelector('.vol')?.addEventListener('input', e => player.setVolume(+e.target.value));
@@ -3485,15 +3672,31 @@ function markNow() {
   if (el && (!el.classList.contains('now') || !el.querySelector('.eq'))) { el.classList.add('now'); (el.querySelector('.row-num .cover') || el.querySelector('.row-num')).insertAdjacentHTML('beforeend', '<span class="eq"><i></i><i></i><i></i></span>'); }
 }
 
+// Runs twice a second for as long as the app is open, so it stays cheap: the few elements it updates are
+// looked up once (again only after the player bar / full-screen player is rebuilt), and nothing is
+// written when the value on screen wouldn't change.
+let timeEls = null, timeLast = '';
+const timeElsStale = () => { timeEls = null; timeLast = ''; };
 function renderTime() {
   if (seeking && !seeking.isConnected) { clearTimeout(seekIdle); seeking = null; } // the bar was redrawn mid-drag
+  if (!timeEls || (timeEls.any && !timeEls.any.isConnected)) {
+    timeEls = { prog: $$('.pb-progress i'), seek: $$('.seek'), now: $$('.t-now'), dur: $$('.t-dur') };
+    timeEls.any = timeEls.prog[0] || timeEls.seek[0] || null;
+    timeLast = '';
+  }
+  if (document.hidden) return; // nobody's looking; it catches up the moment the app is visible
   const pct = P.duration ? Math.max(0, Math.min(1, (P.time || 0) / P.duration)) : 0;
-  $$('.pb-progress i').forEach(i => i.style.width = (pct * 100) + '%');
+  const pctS = (pct * 100).toFixed(2), nowS = fmtTime(P.time), durS = fmtTime(P.duration);
+  const sig = pctS + '|' + nowS + '|' + durS + '|' + !!seeking;
+  if (sig === timeLast) return;
+  timeLast = sig;
+  for (const i of timeEls.prog) i.style.width = pctS + '%';
   if (seeking) return;
-  $$('.seek').forEach(s => { s.value = Math.round(pct * 1000); s.style.setProperty('--p', (pct * 100).toFixed(2) + '%'); });
-  $$('.t-now').forEach(x => x.textContent = fmtTime(P.time));
-  $$('.t-dur').forEach(x => x.textContent = fmtTime(P.duration));
+  for (const s of timeEls.seek) { s.value = Math.round(pct * 1000); s.style.setProperty('--p', pctS + '%'); }
+  for (const x of timeEls.now) if (x.textContent !== nowS) x.textContent = nowS;
+  for (const x of timeEls.dur) if (x.textContent !== durS) x.textContent = durS;
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { timeLast = ''; renderTime(); } });
 
 let qDragging = false;
 // Full-screen player. The first render builds the page; after that (play/pause, like,
@@ -3561,7 +3764,7 @@ function renderNP(full = false) {
     <div class="np-main">
       <div class="np-scroll"><div class="np-inner">
         <div class="np-media ${showVid ? 'vid' : 'art'}">${showVid ? '<div id="np-slot" class="np-slot"></div>' : cover(t.artwork, t.title, 'np-art')}</div>
-        <div class="np-info"><div><h2>${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
+        <div class="np-info"><div><h2 class="tclamp">${esc(displayTitle(t))}</h2><button class="lnk np-artist" data-p="artist">${esc(t.artist)}</button>${t.album ? `<button class="lnk np-album" data-p="album">${icon('disc')}${esc(t.album)}</button>` : ''}</div>
           <div class="np-side">${npLike(t)}<div class="np-tags np-tags-side">${npTags(t)}</div></div></div>
         <p class="np-err" data-e="${esc(P.error || '')}" ${P.error ? '' : 'hidden'}>${P.error ? errHTML(P.error) : ''}</p>
         <div class="np-seek"><input type="range" class="seek" min="0" max="1000" value="0" aria-label="Seek"><div class="np-times"><span class="t-now">0:00</span><span class="t-dur">0:00</span></div></div>
@@ -3574,6 +3777,7 @@ function renderNP(full = false) {
     </div>
     ${qOn && !narrow ? npQueueHTML() : ''}
     </div>`;
+  timeElsStale();
   wireSeek(np.querySelector('.seek'));
   if (qOn) renderQueue(np.querySelector('.np-q-body'));
   if (document.body.classList.contains('np-lyr')) showLyrics(t);
@@ -3644,6 +3848,7 @@ async function showLyrics(t) {
 // Otherwise it sits in its corner mini-dock.
 function placeDock() {
   const dock = $('#yt-dock');
+  if (dock.classList.contains('np-leaving')) return; // sliding away with the full-screen player
   const vis = P.source === 'yt' && !!player.current();
   dock.classList.toggle('show', vis);
   if (!vis) return;
@@ -3709,31 +3914,36 @@ function renderQueue(el, force = false) {
     const from = +rowEl.dataset.qi;
     const startOrder = [...list.children].map(r => +r.dataset.qi);
     rowEl.classList.add('dragging'); qDragging = true;
-    g.setPointerCapture(e.pointerId);
     const scroller = el.closest('.np-q-body, .qp-body, #main, .np-scroll') || el;
+    const winScroll = document.body.classList.contains('np-open') && !el.closest('.np-q-body'); // (the full-screen player scrolls the page itself)
     let raf = null, lastY = e.clientY;
+    // only the neighbours are measured, so long queues stay smooth
+    const place = () => {
+      let prev = rowEl.previousElementSibling, next = rowEl.nextElementSibling;
+      while (prev && lastY < prev.getBoundingClientRect().top + prev.offsetHeight / 2) { list.insertBefore(rowEl, prev); prev = rowEl.previousElementSibling; }
+      while (next && lastY > next.getBoundingClientRect().top + next.offsetHeight / 2) { list.insertBefore(rowEl, next.nextElementSibling); next = rowEl.nextElementSibling; }
+    };
     const autoscroll = () => {
-      const r = scroller.getBoundingClientRect();
-      if (lastY < r.top + 50) scroller.scrollTop -= 10; else if (lastY > r.bottom - 50) scroller.scrollTop += 10;
+      const r = winScroll ? { top: 0, bottom: innerHeight } : scroller.getBoundingClientRect();
+      const step = lastY < r.top + 50 ? -10 : lastY > r.bottom - 50 ? 10 : 0;
+      if (step) { if (winScroll) window.scrollBy(0, step); else scroller.scrollTop += step; }
+      place();
       raf = requestAnimationFrame(autoscroll);
     };
     raf = requestAnimationFrame(autoscroll);
-    const move = ev => {
-      lastY = ev.clientY;
-      const sibs = [...list.children].filter(r => r !== rowEl);
-      const before = sibs.find(r => { const b = r.getBoundingClientRect(); return ev.clientY < b.top + b.height / 2; });
-      if (before) { if (rowEl.nextSibling !== before) list.insertBefore(rowEl, before); }
-      else if (list.lastElementChild !== rowEl) list.appendChild(rowEl);
-    };
-    const up = () => {
+    // (listened for on the window: moving the row in the list drops the grip's pointer capture, which
+    // used to stop a drag after the first step)
+    const move = ev => { if (ev.pointerId === e.pointerId) { lastY = ev.clientY; if (ev.cancelable) ev.preventDefault(); } };
+    const up = ev => {
+      if (ev && ev.pointerId !== e.pointerId) return;
       cancelAnimationFrame(raf);
-      g.removeEventListener('pointermove', move); g.removeEventListener('pointerup', up); g.removeEventListener('pointercancel', up);
+      removeEventListener('pointermove', move); removeEventListener('pointerup', up); removeEventListener('pointercancel', up);
       rowEl.classList.remove('dragging'); qDragging = false;
       const newPos = [...list.children].indexOf(rowEl);
       const to = startOrder[newPos];
       if (to !== from) { el._dragged = true; player.moveInQueue(from, to); } else emit('player', P);
     };
-    g.addEventListener('pointermove', move); g.addEventListener('pointerup', up); g.addEventListener('pointercancel', up);
+    addEventListener('pointermove', move, { passive: false }); addEventListener('pointerup', up); addEventListener('pointercancel', up);
   };
 }
 

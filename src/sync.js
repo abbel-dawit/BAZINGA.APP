@@ -253,7 +253,7 @@ async function localSnap() {
   snap.tombstones = store.tombstones();
   snap.tracks = snap.tracks.map(t => { const x = { ...t }; delete x.hadLocalFile; delete x.localFileId; return x; }).sort((a, b) => a.id < b.id ? -1 : 1);
   // YouTube matches travel as ids only (titles are just for display and get filled in again when needed)
-  snap.ytcache = (snap.ytcache || []).filter(([, v]) => v && (v.video || v.audio)).map(([k, v]) => [k, Object.fromEntries(Object.entries({ video: v.video, audio: v.audio, manual: v.manual, fromSearch: v.fromSearch, guess: v.guess }).filter(([, x]) => x))]);
+  snap.ytcache = (snap.ytcache || []).filter(([, v]) => v && (v.video || v.audio)).map(([k, v]) => [k, Object.fromEntries(Object.entries({ video: v.video, audio: v.audio, manual: v.manual, fromSearch: v.fromSearch, guess: v.guess, mv: v.mv }).filter(([, x]) => x))]);
   snap.albums.sort((a, b) => a.id < b.id ? -1 : 1); snap.playlists.sort((a, b) => a.id < b.id ? -1 : 1);
   const p = snap.profile;
   snap.profile = p ? { username: p.username || '', picture: p.picture || '', updatedAt: p.updatedAt || 0 } : null;
@@ -637,7 +637,7 @@ export function start() {
   syncNow();
   listen();
   if (started) return; started = true;
-  on('dirty', why => { if (link && why !== 'synced') schedule(); });
+  on('dirty', why => { if (link && why !== 'synced' && why !== 'enrich') schedule(); }); // (genres/covers found in the background are found again on each device; no need to re-send the library for them)
   onSyncedKvChange(() => { if (link) schedule(); });
   document.addEventListener('visibilitychange', () => {
     if (!link) return;
