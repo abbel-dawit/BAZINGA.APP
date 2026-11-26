@@ -35,6 +35,8 @@ let resumeAt = 0, resumeFor = null; // where to pick up the restored song after 
 let duckLevel = 1;         // temporary volume dip while the voice assistant talks (never saved)
 let endHook = null;        // app.js: what to play when the queue runs out
 let pausedDuring = -1;     // the listener paused while this load was still starting
+let startedFor = -1;       // the load whose song has really started playing at least once
+let ytPausedAt = 0;        // when YouTube last reported a pause while the app was on screen
 let verify = null;         // checks that an instant "play" really started
 // Read-only: does the listener want music playing right now? (drives instant Play/Pause feedback)
 Object.defineProperty(P, 'want', { get: () => wantPlay, enumerable: false });
@@ -139,15 +141,25 @@ function makeYT(elId, onReady) {
           onStateChange: e => {
             if (pl !== ytPlayer) { preState(pl, e.data); return; }
             if (P.source !== 'yt') return;
-            if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
-            if (e.data === YT.PlayerState.PLAYING) { quietStart = false; P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
+            // You paused while the song was still starting: hold it paused when it gets going — once.
+            // (A Play pressed on the YouTube video itself after that is yours, and is respected.)
+            if (e.data === YT.PlayerState.PLAYING && !wantPlay && pausedDuring === loadToken) { pausedDuring = -1; startedFor = loadToken; try { ytPlayer.pauseVideo(); } catch { } P.loading = false; changed(); return; }
+            if (e.data === YT.PlayerState.PLAYING) { startedFor = loadToken; pausedDuring = -1; clearTimeout(verify); quietStart = false; P.playing = true; P.loading = false; P.needsTap = false; wantPlay = true; resumeTries = 0; noCaptions(); if (!tick) startTick(); changed(); }
             else if (e.data === YT.PlayerState.PAUSED) {
               if (isRerouting()) return;
               // Phones pause YouTube when you leave the browser or lock the screen. If you didn't
               // ask for that, start it again straight away.
               // (Only right after leaving / a new song starting — a pause you make later from the lock screen is respected.)
               if (wantPlay && document.hidden && (Date.now() - hiddenAt < 8000 || Date.now() - startedAt < 8000) && resumeTries < 10) { resumeTries++; setTimeout(() => { try { if (wantPlay) ytPlayer.playVideo(); } catch { } }, Math.min(150 * resumeTries, 1500)); return; }
-              P.playing = false; P.loading = false; if (!document.hidden && !leavingNow()) wantPlay = false; changed();
+              P.playing = false; P.loading = false;
+              if (!document.hidden) {
+                ytPausedAt = Date.now();
+                if (!leavingNow()) wantPlay = false;
+                // (a tap on the YouTube video can look like "leaving the app" for a moment: if the app is
+                // still on screen a moment later, it was your own pause on the video — keep it paused)
+                else { const tok = loadToken; setTimeout(() => { let st = -9; try { st = ytPlayer.getPlayerState(); } catch { } if (tok === loadToken && !document.hidden && P.source === 'yt' && st === 2 && !P.playing) { wantPlay = false; changed(); } }, 1000); }
+              }
+              changed();
             }
             else if (e.data === YT.PlayerState.ENDED) ended();
             else if (e.data === YT.PlayerState.BUFFERING) { if (!P.loading) { P.loading = true; changed(); } }
@@ -223,7 +235,7 @@ function noCaptions() {
 }
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { comeBack(); return; }
-  hiddenAt = Date.now(); leftAt = Date.now(); resumeTries = 0;
+  hiddenAt = Date.now(); leftAt = Date.now(); resumeTries = 0; wasAway = true;
   saveNow(); // (the phone may close the app any moment now)
   audioMode('playback');
   // Leaving the browser / locking the phone: keep going
@@ -234,20 +246,24 @@ document.addEventListener('visibilitychange', () => {
 // ---------- Keep playing when you come back ----------
 // Leaving the app (switching apps, locking the phone, closing the tab) and coming back carries on with
 // the music if it was playing when you left. If the browser needs a tap first, one tap anywhere does it.
-let leftAt = 0, resumeOnLaunch = false, quietStart = false, autoResumeOn = true, tapArmed = false;
+let leftAt = 0, resumeOnLaunch = false, quietStart = false, autoResumeOn = true, tapArmed = false, wasAway = false;
 try { autoResumeOn = localStorage.getItem('bz_autoresume') !== '0'; } catch { }
 export const setAutoResume = on => { autoResumeOn = !!on; try { localStorage.setItem('bz_autoresume', on ? '1' : '0'); } catch { } };
 const leavingNow = () => Date.now() - leftAt < 1500;
 // (focus moving into the YouTube video itself isn't leaving)
 window.addEventListener('blur', () => setTimeout(() => { if (document.activeElement?.tagName !== 'IFRAME') leftAt = Date.now(); }, 0));
-window.addEventListener('pagehide', () => { leftAt = Date.now(); saveNow(); });
-document.addEventListener('freeze', () => { leftAt = Date.now(); saveNow(); });
+window.addEventListener('pagehide', () => { leftAt = Date.now(); wasAway = true; saveNow(); });
+document.addEventListener('freeze', () => { leftAt = Date.now(); wasAway = true; saveNow(); });
 window.addEventListener('pageshow', e => { if (e.persisted) comeBack(); });
-window.addEventListener('focus', () => { if (!document.hidden) comeBack(); });
+// (focus also comes back after a tap on the YouTube video itself — that isn't coming back to the app)
+window.addEventListener('focus', () => { if (!document.hidden && wasAway) comeBack(); });
 let backT = null;
 function comeBack() {
   resumeTries = 0;
-  if (!wantPlay || !autoResumeOn || !current()) return;
+  const away = wasAway; wasAway = false;
+  if (!away || !wantPlay || !autoResumeOn || !current()) return;
+  // paused on the YouTube video itself while the app was on screen (before leaving): that pause stands
+  if (P.source === 'yt' && ytPausedAt && ytPausedAt < hiddenAt && hiddenAt - ytPausedAt > 1500 && !P.playing) return;
   clearTimeout(backT);
   backT = setTimeout(() => {
     if (!wantPlay || document.hidden) return;
@@ -406,7 +422,7 @@ async function load(autoplay = true) {
     if (!c[P.mode] && P.mode === 'video') toast('No music video found — playing the audio version'); // (audio quietly uses the music video when there's no audio upload)
     if (preYT && preYT.tid === t.id && preYT.vid === id && ytPre) swapYT(id, at);
     else await startYT(id, at);
-    if (!autoplay) ytPlayer.pauseVideo();
+    if (!autoplay) { pausedDuring = my; ytPlayer.pauseVideo(); }
     startTick();
     prefetchNext(my);
   } catch (e) {
@@ -480,7 +496,8 @@ export function play() {
   else load(true);
 }
 export function pause() {
-  wantPlay = false; pausedDuring = loadToken; clearTimeout(verify); quietStart = false;
+  // (only a pause made while the song is still starting is held when YouTube gets going)
+  wantPlay = false; pausedDuring = startedFor === loadToken ? -1 : loadToken; clearTimeout(verify); quietStart = false;
   P.playing = false; P.loading = false; changed();
   if (P.source === 'local') audio.pause();
   else if (ytPlayer?.pauseVideo) try { ytPlayer.pauseVideo(); } catch { }

@@ -15,14 +15,15 @@ import * as player from './player.js';
 import { P } from './player.js';
 import * as backup from './backup.js';
 import { LEGAL_HTML, TERMS_VERSION } from './legal.js';
-import { qrSVG } from './qr.js';
+import { qrSVG, readQR } from './qr.js';
+import { packShare, unpackShare, findShareRef } from './share.js';
 
 const view = () => $('#view');
 const lists = new Map();      // listKey -> [trackIds] for "play from here"
 const sections = new Map();   // sectionKey -> {tracks, opts}
 const fstate = {};            // sectionKey -> filter state
 let settings = { country: 'US', ytKey: '', customInstance: '', enrich: true, geniusToken: '', googleClientId: '', autoplay: 'liked', voiceName: '', wake: false };
-export const APP_VERSION = 'v1.8.0'; // shown at the bottom of Settings — bump with each release
+export const APP_VERSION = 'v1.9.0'; // shown at the bottom of Settings — bump with each release
 const APP_TAGLINE = 'Music Made For You';
 const BMC_URL = 'https://buymeacoffee.com/bazinga.app';
 let profile = null;
@@ -39,7 +40,11 @@ async function boot() {
   applySettings();
   yt.startInstances(); // warm up the YouTube server list in the background
   ya.restoreSession();
+  const launchHref = location.href;
   const joinReq = readJoinLink();
+  const sharedIn = readShareTarget();
+  // The Home Screen app is already open and a BAZINGA! link was tapped / shared to it: open it right here
+  try { if ('launchQueue' in window) launchQueue.setConsumer(lp => { try { if (!lp.targetURL || lp.targetURL === launchHref) return; const u = new URL(lp.targetURL); const got = readShareTarget(u); if (got?.ref) location.hash = `#/${got.ref.kind}/${got.ref.data}`; else if (got?.text) { if (profile) addFromLinkDialog(got.text); } else if (u.hash && u.hash !== location.hash) location.hash = u.hash; } catch { } }); } catch { }
   try { if (await sp.handleRedirect()) { toast('Spotify connected ✓'); location.hash = '#/import'; } }
   catch (e) { toast(e.message, 'err'); }
   await store.load();
@@ -63,6 +68,19 @@ async function boot() {
   await sync.restore();
   await showApp();
   if (joinReq) joinFlow(joinReq);
+  if (sharedIn?.text) setTimeout(() => addFromLinkDialog(sharedIn.text), 600);
+}
+// Something shared TO the installed app from another app's share sheet (Android: BAZINGA! appears in the
+// share menu) arrives as ?share_url=…&share_text=…: a BAZINGA! link opens straight away; anything else
+// (e.g. a YouTube playlist) is offered in "Add from a link".
+function readShareTarget(u = location) {
+  const q = new URLSearchParams(u.search || '');
+  const text = [q.get('share_url'), q.get('share_text'), q.get('share_title')].filter(Boolean).join(' ').trim();
+  if (!text) return null;
+  if (u === location) history.replaceState(null, '', location.pathname + (location.hash || '#/home'));
+  const ref = findShareRef(text);
+  if (ref && (ref.kind === 's' || ref.kind === 'r')) { if (u === location) history.replaceState(null, '', `${location.pathname}#/${ref.kind}/${ref.data}`); return { ref }; }
+  return { text };
 }
 
 // ---------- Splash screen: fades out once the first screen is ready (shown at least ~1 s) ----------
@@ -704,10 +722,10 @@ window.addEventListener('hashchange', () => profile && profile.termsAccepted ===
 const showLegal = () => modal(`<h3>${icon('shield')} Privacy Policy & Terms</h3><div class="legal-box">${LEGAL_HTML}</div>`, { wide: true });
 // Browser tab title: "BAZINGA! - <page>"
 const setTitle = x => { document.title = 'BAZINGA! - ' + (x || APP_TAGLINE); };
-const TITLES = { new: 'New from your top artists', home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', support: 'Support' };
+const TITLES = { new: 'New from your top artists', home: APP_TAGLINE, search: 'Search', import: 'Settings', offline: 'Offline', settings: 'Settings', queue: 'Queue', legal: 'Privacy & Terms', s: 'Shared music', r: 'Shared music', support: 'Support' };
 const LIB_TABS = { liked: 'Liked Songs', songs: 'Songs', playlists: 'Playlists', albums: 'Albums', artists: 'Artists' };
 // Where "Back" goes when there's no in-app history (e.g. a shared link opened directly)
-const BACK_TO = { new: ['#/home', 'Home'], artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
+const BACK_TO = { new: ['#/home', 'Home'], artist: ['#/library/artists', 'Artists'], album: ['#/library/albums', 'Albums'], playlist: ['#/library/playlists', 'Playlists'], genre: ['#/home', 'Home'], s: ['#/home', 'Home'], r: ['#/home', 'Home'], legal: ['#/settings', 'Settings'], queue: ['#/home', 'Home'] };
 const navStack = [];
 function goBack() {
   const name = (location.hash.replace(/^#\/?/, '').split('/')[0]);
@@ -736,7 +754,7 @@ async function route({ soft = false } = {}) {
     closeQueueOnMobile();
     v.scrollTop = 0; $('#main').scrollTop = 0;
   }
-  const routes = { new: vNewReleases, home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
+  const routes = { new: vNewReleases, home: vHome, search: vSearch, library: vLibrary, playlist: vPlaylist, album: vAlbum, artist: vArtist, import: () => vSettings(['import']), offline: vOffline, settings: vSettings, s: vShared, r: vRelayShare, queue: vQueue, genre: vGenre, legal: vLegal, support: vSupport };
   const fn = routes[name] || vHome;
   // the old page's "load more" / artist-picture watchers go with it (they'd otherwise pile up over a long session)
   moreObs.disconnect(); apicObs?.disconnect();
@@ -778,11 +796,36 @@ const stale = my => my !== routeToken;
 const rerender = debounce(() => {
   // Re-render the current view softly when library changes (keeps scroll)
   const sc = $('#main').scrollTop;
+  rememberRows(); // (song lists keep every row that was loaded, so the page doesn't shrink under you)
   route({ soft: true }).then(() => { if (Math.abs($('#main').scrollTop - sc) > 1) $('#main').scrollTop = sc; });
 }, 250);
 
 // ================= TRACK LIST SECTIONS =================
 const PAGE = 150;
+// How many rows each song list had on screen before a quiet redraw (e.g. after removing a song): the redraw
+// shows at least as many again, so the list doesn't get shorter and the page stays where you were.
+const keepRows = new Map();
+function rememberRows(key) {
+  for (const el of key ? [$(`[data-tsec="${key}"]`)].filter(Boolean) : $$('[data-tsec]')) {
+    const n = el.querySelectorAll(':scope > .rows > .row').length;
+    if (n > PAGE) keepRows.set(el.dataset.tsec, n);
+  }
+}
+// Take a song's row out of a list right away (removed from Liked / a playlist), without redrawing anything
+function dropRow(key, id) {
+  const el = $(`[data-tsec="${key}"]`); if (!el) return false;
+  const rows = [...el.querySelectorAll(':scope > .rows > .row')];
+  const gone = rows.filter(r => r.dataset.id === id);
+  if (!gone.length) return false;
+  gone.forEach(r => r.remove());
+  const ids = (lists.get(key) || []).filter(x => x !== id);
+  lists.set(key, ids);
+  el.querySelectorAll(':scope > .rows > .row').forEach((r, i) => { r.dataset.i = i; });
+  const more = el.querySelector(':scope > [data-more]'); if (more) more.dataset.at = Math.max(0, +more.dataset.at - gone.length);
+  if (nowCtx.list === key) nowCtx.i = -1;
+  markNow();
+  return true;
+}
 // Filters & sort are remembered on this device, per list, so they're still set when you come back
 const FKEEP = ['sort', 'genres', 'years', 'liked', 'offline', 'q', 'from', 'to', 'open'];
 // (only lists that are always the same list: Liked Songs, Songs, Offline and each playlist — not album/artist/genre pages)
@@ -811,12 +854,14 @@ function tracksSectionInner(key) {
   lists.set(key, shown.map(t => t.id));
   const cur = player.current()?.id;
   const head = opts.noFilter ? '' : filterBar(f, tracks, { keepOrder: opts.keepOrder, likedSort: opts.likedSort });
-  const count = !opts.noFilter && shown.length !== tracks.length ? `<div class="muted tiny count">${shown.length} of ${tracks.length} songs</div>` : '';
+  const narrowed = !opts.noFilter && shown.length !== tracks.length;
+  const count = narrowed ? `<div class="count-row"><span class="muted tiny count">${shown.length} of ${tracks.length} songs</span>${shown.length ? `<button class="btn sm primary-o mk-pl" data-act="save-filtered" title="Make a new playlist from the songs shown">${icon('plus')}<span>Make a playlist<span class="hide-xs"> of these</span></span></button>` : ''}</div>` : '';
   // A playlist in its own (custom) order with nothing filtered out: drag the grips to rearrange it, like the queue
   const grip = !!opts.reorder && canReorder(f) && shown.length > 1;
   opts.grip = grip;
-  const rows = shown.slice(0, PAGE).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered, grip }, cur)).join('');
-  const more = shown.length > PAGE ? `<div class="more" data-more="${key}" data-at="${PAGE}"></div>` : '';
+  const upto = Math.max(PAGE, keepRows.get(key) || 0); keepRows.delete(key);
+  const rows = shown.slice(0, upto).map((t, i) => trackRow(t, i, { list: key, playlistId: opts.playlistId, numbered: opts.numbered, grip }, cur)).join('');
+  const more = shown.length > upto ? `<div class="more" data-more="${key}" data-at="${upto}"></div>` : '';
   return head + count + `<div class="rows${grip ? ' reorder' : ''}" ${grip ? `data-reorder="${esc(opts.playlistId)}"` : ''}>${rows || '<div class="muted pad">No songs match these filters.</div>'}</div>` + more;
 }
 // "Most popular": numbers load once from the device (fast), then missing views/likes fill in quietly in the
@@ -836,12 +881,15 @@ function popKick(key, tracks) {
   const ids = tracks.map(t => t.id);
   (window.requestIdleCallback || (f => setTimeout(f, 300)))(() => yt.wantStats(ids, popRefresh));
 }
-function refreshSection(key, keepFocus) {
+function refreshSection(key, keepFocus, keepPlace = false) {
   saveFilters(key);
   const el = $(`[data-tsec="${key}"]`); if (!el) return;
+  if (keepPlace) rememberRows(key);
+  const sc = keepPlace ? $('#main').scrollTop : 0;
   const active = document.activeElement?.dataset?.f;
   const pos = document.activeElement?.selectionStart;
   el.innerHTML = tracksSectionInner(key);
+  if (keepPlace && Math.abs($('#main').scrollTop - sc) > 1) $('#main').scrollTop = sc;
   markNow();
   if (keepFocus && active) { const i = el.querySelector(`[data-f="${active}"]`); i?.focus(); try { i.setSelectionRange(pos, pos); } catch { } }
   observeMore();
@@ -860,6 +908,28 @@ const moreObs = new IntersectionObserver(entries => {
   }
 }, { rootMargin: '600px' });
 function observeMore() { $$('[data-more]').forEach(el => moreObs.observe(el)); }
+
+// ---------- A new playlist from the songs a filter shows (e.g. Liked Songs → Hip-Hop/Rap, 2010–2019) ----------
+function filteredName(key) {
+  const f = fstate[key] || {};
+  const base = { liked: 'Liked', songs: 'Songs', offline: 'Offline' }[key] || (key === 'pl' ? lib.playlists.get(f._id)?.name : '') || (location.hash.startsWith('#/genre/') ? decodeURIComponent(location.hash.split('/')[2] || '') : '') || 'My songs';
+  const [ya, yb] = [+f.from || 0, +f.to || 0];
+  const bits = [...(f.genres || []).slice(0, 2)];
+  if (ya || yb) bits.push(ya && yb ? (ya === yb ? String(ya) : `${ya}–${yb}`) : ya ? `${ya} on` : `up to ${yb}`);
+  if (f.q) bits.push(`"${f.q.slice(0, 24)}"`);
+  if (f.offline) bits.push('offline');
+  if (f.liked && key !== 'liked') bits.push('liked');
+  return (base + (bits.length ? ' · ' + bits.join(' · ') : ' (filtered)')).slice(0, 100);
+}
+async function saveFilteredAsPlaylist(key) {
+  const ids = (lists.get(key) || []).filter(id => lib.tracks.has(id));
+  if (!key || !ids.length) return toast('No songs to put in a playlist');
+  const n = await promptText('New playlist from these songs', filteredName(key), `Name · ${ids.length} song${ids.length > 1 ? 's' : ''}`, 'Create playlist');
+  if (!n) return;
+  const p = await store.createPlaylist(n, ids, { source: key === 'liked' ? 'from Liked Songs' : 'from a filter' });
+  renderSidebarPlaylists();
+  emit('toast', { msg: `Made "${n}" (${ids.length} songs)`, kind: 'ok', action: { label: 'Open', fn: () => { location.hash = '#/playlist/' + p.id; } } });
+}
 
 // ---------- Rearranging a playlist (custom order) ----------
 const canReorder = f => !f.sort && !f.q && !f.genres?.length && !f.years?.length && !f.from && !f.to && !f.liked && !f.offline;
@@ -1025,7 +1095,7 @@ function updateJump() {
 const releaseCard = a => {
   const days = a.releaseDate ? Math.round((Date.now() - Date.parse(a.releaseDate)) / 864e5) : 999;
   const when = days < 0 ? 'Coming soon' : days < 1 ? 'Today' : days < 7 ? `${days} day${days > 1 ? 's' : ''} ago` : days < 60 ? `${Math.round(days / 7)} weeks ago` : (a.year || '');
-  return `<a class="card" href="#/album/it/${a.itunesAlbumId}"><div class="card-art">${cover(a.artwork, a.title)}${days <= 30 ? '<span class="new-badge">NEW</span>' : ''}<button class="fab-play" data-act="play-it-album" data-id="${a.itunesAlbumId}" aria-label="Play">${icon('play')}</button></div>
+  return `<a class="card" href="#/album/it/${a.itunesAlbumId}" data-itid="${a.itunesAlbumId}"><div class="card-art">${cover(a.artwork, a.title)}${days <= 30 ? '<span class="new-badge">NEW</span>' : ''}${albumSaveBtn(a)}<button class="fab-play" data-act="play-it-album" data-id="${a.itunesAlbumId}" aria-label="Play">${icon('play')}</button></div>
     <div class="card-t">${esc(a.title.replace(/ - (Single|EP)$/, ''))}</div><div class="card-s">${esc(a.artist)} · ${/ - Single$/.test(a.title) ? 'Single' : / - EP$/.test(a.title) ? 'EP' : 'Album'} · ${when}</div></a>`;
 };
 const NR_SHELF = 10, NR_PAGE = 25;
@@ -1042,14 +1112,49 @@ async function newReleases(my) {
   };
   const items = await loadNewReleases({ onUpdate: render, skeleton: () => { if (!stale(my)) box.innerHTML = `<div class="sec-h"><h2>New from your top artists</h2></div><div class="shelf">${'<div class="card skel"><div class="card-art"><div class="cover"></div></div><div class="card-t"></div><div class="card-s"></div></div>'.repeat(6)}</div>`; } });
   render(items);
+  warmReleases(items.slice(0, 3));
+}
+// Tapping play on a release should start right away: the first few releases' song lists are fetched
+// quietly once the row is on screen, and a card you touch / rest on also gets its first song looked up
+// on YouTube. (Both are remembered, so the tap itself only has to start the video.)
+const itAlbumWarm = new Map();
+function warmItAlbum(itId, firstSong = false) {
+  if (!itId || !navigator.onLine) return Promise.resolve(null);
+  let p = itAlbumWarm.get(itId);
+  if (!p) {
+    p = meta.albumTracks(itId).then(r => r.tracks.map(t => lib.tracks.get(t.id) || store.remember(t))).catch(() => { itAlbumWarm.delete(itId); return null; });
+    itAlbumWarm.set(itId, p);
+    if (itAlbumWarm.size > 60) itAlbumWarm.delete(itAlbumWarm.keys().next().value);
+  }
+  if (firstSong) p.then(ts => { if (ts?.[0]) player.prefetch(ts[0].id); });
+  return p;
+}
+function warmReleases(items) {
+  (window.requestIdleCallback || (f => setTimeout(f, 800)))(() => items.forEach((a, i) => setTimeout(() => warmItAlbum(a.itunesAlbumId, i === 0), 400 + i * 700)));
+}
+const todayKey = () => new Date().toDateString();
+// One card per release: Apple lists the clean and explicit versions (and deluxe / single editions of the
+// same title) as separate albums. The newest of them stays.
+const relTitle = t => norm(String(t || '').replace(/\s+-\s+(Single|EP)$/i, '').replace(/[\(\[][^\)\]]*(clean|explicit|deluxe|expanded|edition|version|remaster|bonus)[^\)\]]*[\)\]]/ig, ''));
+function dedupeReleases(items) {
+  const seen = new Set(), out = [];
+  for (const a of [...items].sort((x, y) => (y.releaseDate || '').localeCompare(x.releaseDate || ''))) {
+    const k = norm(mainArtist(a.artist)) + '|' + relTitle(a.title);
+    if (seen.has(k) || seen.has('id' + a.itunesAlbumId)) continue;
+    seen.add(k); seen.add('id' + a.itunesAlbumId); out.push(a);
+  }
+  // back in the original order (your #1 artist first)
+  const keep = new Set(out);
+  return items.filter(a => keep.has(a));
 }
 async function loadNewReleases({ onUpdate = () => { }, skeleton = () => { } } = {}) {
   const top = store.artists().sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 20);
-  const sig = 'v3|' + top.map(a => a.key).join('|');
+  const sig = 'v4|' + top.map(a => a.key).join('|');
   const c = await kv.get('newReleases');
   const fresh = c?.items?.length && c.sig === sig;
-  if (fresh) onUpdate(c.items);
-  if (c && c.sig === sig && Date.now() - c.ts < 12 * 36e5) return c.items || [];
+  if (fresh) onUpdate(dedupeReleases(c.items));
+  // Looked up again every day (a new calendar day, or 12 hours, whichever comes first)
+  if (c && c.sig === sig && c.day === todayKey() && Date.now() - c.ts < 12 * 36e5) return dedupeReleases(c.items || []);
   if (!navigator.onLine || !top.length) return fresh ? c.items : [];
   if (!fresh) skeleton();
   const have = new Set([...lib.albums.values()].map(a => a.itunesAlbumId));
@@ -1063,14 +1168,15 @@ async function loadNewReleases({ onUpdate = () => { }, skeleton = () => { } } = 
       const recent = rel.filter(a => (a.releaseDate || '') >= yearAgo);
       out.push(...(recent.length ? recent.slice(0, 6) : rel.slice(0, 2)));
     }
-    return out;
+    return dedupeReleases(out);
   };
   const take = async (a, rank, o) => {
     try {
       const id = a.itunesArtistId || await meta.findArtistId(a.name, o);
       if (!id) return;
       const rel = [];
-      for (const al of await meta.artistLatest(id, o)) if (!seen.has(al.itunesAlbumId)) { seen.add(al.itunesAlbumId); rel.push(al); }
+      // (fresh: a new day always asks Apple again instead of using yesterday's answer)
+      for (const al of await meta.artistLatest(id, { ...o, ttl: 6 * 36e5 })) if (!seen.has(al.itunesAlbumId)) { seen.add(al.itunesAlbumId); rel.push(al); }
       byRank.set(rank, rel);
       if (!fresh && rank === 0) { const items = pickItems(); if (items.length) onUpdate(items); }
     } catch { }
@@ -1080,7 +1186,7 @@ async function loadNewReleases({ onUpdate = () => { }, skeleton = () => { } } = 
   if (items.length) onUpdate(items);
   await Promise.all(top.slice(6).map((a, i) => take(a, i + 6, { bg: true })));
   items = pickItems();
-  await kv.set('newReleases', { ts: Date.now(), sig, items });
+  await kv.set('newReleases', { ts: Date.now(), day: todayKey(), sig, items });
   onUpdate(items);
   return items;
 }
@@ -1325,6 +1431,33 @@ function fillArtistPics(root = document) { if (apicObs) root.querySelectorAll('[
 function genreColor(g) { let h = 7; for (const c of g) h = (h * 33 + c.charCodeAt(0)) % 360; return `hsl(${h} 70% 42%)`; }
 const plCover = p => { if (p.image) return p.image; for (const id of p.trackIds) { const a = lib.tracks.get(id)?.artwork; if (a) return a; } return ''; }; // (stops at the first cover)
 const albumCard = a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: [a.year, a.artist].filter(Boolean).join(' · '), act: 'play-album', id: a.id });
+// Save an album straight from any album list (a coloured + on the cover, like the play button) — only on albums you haven't saved yet
+function albumSaved(a) {
+  if (!a) return false;
+  if (lib.albums.has(a.id || albumKey(a.artist, a.title))) return true;
+  if (!a.itunesAlbumId) return false;
+  for (const x of lib.albums.values()) if (x.itunesAlbumId && String(x.itunesAlbumId) === String(a.itunesAlbumId)) return true;
+  return false;
+}
+const albumSaveBtn = a => albumSaved(a) ? '' : `<button class="fab-save" data-act="save-card-album" ${a.itunesAlbumId ? `data-it="${esc(a.itunesAlbumId)}"` : ''} data-artist="${esc(a.artist || '')}" data-title="${esc(a.title || '')}" aria-label="Save album" title="Save album">${icon('plus')}</button>`;
+async function saveCardAlbum(btn) {
+  if (btn.classList.contains('busy') || btn.classList.contains('done')) return;
+  btn.classList.add('busy');
+  try {
+    let itId = btn.dataset.it;
+    if (!itId) itId = (await meta.findAlbum(btn.dataset.artist, btn.dataset.title).catch(() => null))?.itunesAlbumId;
+    if (!itId) throw new Error('Couldn\'t find the full album');
+    const { album, tracks } = await meta.albumTracks(itId);
+    if (!album || !tracks.length) throw new Error('Couldn\'t load that album right now');
+    if (albumSaved(album)) { btn.remove(); return toast('Already in your albums'); }
+    btn.classList.remove('busy'); btn.classList.add('done'); btn.innerHTML = icon('check'); btn.setAttribute('aria-label', 'Saved');
+    const saved = await store.saveAlbum(album, tracks.map(x => lib.tracks.get(x.id) ? { ...x, ...stripTransient(lib.tracks.get(x.id)) } : stripTransient(x)));
+    toastUndo(`Saved "${album.title}" to your albums`, async () => { await store.removeAlbum(saved.id); toast('Album removed'); });
+  } catch (err) {
+    btn.classList.remove('busy');
+    toast(err.message || 'Couldn\'t save that album', 'err');
+  }
+}
 const albumHref = a => lib.albums.has(a.id) || !a.itunesAlbumId ? `#/album/${encodeURIComponent(a.id)}` : `#/album/it/${a.itunesAlbumId}`;
 
 // ---------- GENRE ----------
@@ -1346,7 +1479,7 @@ async function vLibrary([tab = 'liked']) {
       : empty(tab === 'liked' ? 'No liked songs yet' : 'No songs yet', 'Tap the heart on any song, or import your Spotify Liked Songs.', `<a class="btn primary" href="#/import">${icon('import')}Import</a>`);
   } else if (tab === 'playlists') {
     const pls = [...lib.playlists.values()].sort((a, b) => a.name.localeCompare(b.name));
-    body = `<div class="actions"><button class="btn" data-act="new-playlist">${icon('plus')}New playlist</button>${pls.length ? `<button class="btn yt-save" data-act="yt-backup">${icon('upload')}Save playlists to YouTube</button>` : ''}</div>
+    body = `<div class="actions"><button class="btn" data-act="new-playlist">${icon('plus')}New playlist</button><button class="btn" data-act="add-link">${icon('qr')}Add from link</button>${pls.length ? `<button class="btn yt-save" data-act="yt-backup">${icon('upload')}Save playlists to YouTube</button>` : ''}</div>
       <div class="cards"><a class="card" href="#/library/liked"><div class="card-art">${likedCover()}<button class="fab-play" data-act="play-list" data-id="liked-all" aria-label="Play">${icon('play')}</button></div><div class="card-t">Liked Songs</div><div class="card-s">${all.filter(t => t.liked).length} songs</div></a>
       ${pls.map(p => card({ href: `#/playlist/${p.id}`, img: plCover(p), title: p.name, sub: `${p.trackIds.length} songs${p.source ? ' · ' + p.source : ''}`, act: 'play-playlist', id: p.id })).join('')}</div>`;
   } else if (tab === 'albums') {
@@ -1354,7 +1487,7 @@ async function vLibrary([tab = 'liked']) {
     const imp = store.implicitAlbums().sort((a, b) => b.trackIds.length - a.trackIds.length || a.title.localeCompare(b.title));
     body = `<div class="actions"><a class="btn" href="#/search/albums">${icon('search')}Find albums</a></div>
       ${saved.length ? `<h2>Saved albums</h2>${pagedGrid('alb-saved', saved.map(albumCard))}` : empty('No saved albums yet', 'Search any album, or open one from a song (⋯ → Go to album) and tap "Save album".')}
-      ${imp.length ? `<h2>From your songs</h2><p class="muted tiny">Albums you have songs from. Open one to see and save the full album.</p>${pagedGrid('alb-imp', imp.map(a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: `${a.artist} · ${a.trackIds.length} in library`, act: 'play-album', id: a.id })))}` : ''}`;
+      ${imp.length ? `<h2>From your songs</h2><p class="muted tiny">Albums you have songs from. Open one to see and save the full album.</p>${pagedGrid('alb-imp', imp.map(a => card({ href: albumHref(a), img: a.artwork, title: a.title, sub: `${a.artist} · ${a.trackIds.length} in library`, act: 'play-album', id: a.id, extra: albumSaveBtn(a) })))}` : ''}`;
   } else if (tab === 'artists') {
     const arts = store.artists();
     artistUI.limit = PAGE_N;
@@ -1526,8 +1659,8 @@ async function vArtist([name], my) {
     const songRank = a => Math.min(hit.get('id:' + a.itunesAlbumId) ?? 99, hit.get('t:' + base(a.title)) ?? 99);
     const full = albums.filter(a => (a.trackCount || 0) >= 5 || songRank(a) < 99);
     const topAlb = [...full].sort((a, b) => (songRank(a) - songRank(b)) || ((a.rank ?? 0) - (b.rank ?? 0))).slice(0, 10);
-    if (topAlb.length >= 2) $('#artist-topalb').innerHTML = `<div class="sec-h"><h2>Top 10 albums</h2></div><div class="cards top-albums">${topAlb.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: [al.year, `${al.trackCount} songs`].filter(Boolean).join(' · ') })).join('')}</div>`;
-    $alb().innerHTML = `<h2>Discography</h2>${pagedGrid('artist-alb', albums.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: `${al.year || ''} · ${al.trackCount} songs` })))}`;
+    if (topAlb.length >= 2) $('#artist-topalb').innerHTML = `<div class="sec-h"><h2>Top 10 albums</h2></div><div class="cards top-albums">${topAlb.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: [al.year, `${al.trackCount} songs`].filter(Boolean).join(' · '), act: 'play-it-album', id: al.itunesAlbumId, extra: albumSaveBtn(al) })).join('')}</div>`;
+    $alb().innerHTML = `<h2>Discography</h2>${pagedGrid('artist-alb', albums.map(al => card({ href: `#/album/it/${al.itunesAlbumId}`, img: al.artwork, title: al.title, sub: `${al.year || ''} · ${al.trackCount} songs`, act: 'play-it-album', id: al.itunesAlbumId, extra: albumSaveBtn(al) })))}`;
   });
   await Promise.race([topP, sleep(50)]);
 }
@@ -1660,7 +1793,7 @@ async function doSearch(q, tab) {
     const part = (p, fill) => meta.withTimeout(Promise.resolve(p), 9000, []).then(v => { if (alive()) { fill(v || []); settled++; shown++; paint(); } }, () => { settled++; paint(); });
     await Promise.all([
       part(artistsP.then?.(v => keepRelevant(v, q, a => [a.name])) ?? artistsP, v => { parts.artists = v.length ? `<h2>Artists</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => artistCard(a.name, a.picture || '', a.genre)).join('')}</div>` : ''; }),
-      part(albumsP.then?.(v => keepRelevant(v, q, a => [a.title, a.artist])) ?? albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId })).join('')}</div>` : ''; }),
+      part(albumsP.then?.(v => keepRelevant(v, q, a => [a.title, a.artist])) ?? albumsP, v => { parts.albums = v.length ? `<h2>Albums</h2><div class="${tab === 'all' ? 'shelf' : 'cards'}">${v.map(a => card({ href: `#/album/it/${a.itunesAlbumId}`, img: a.artwork, title: a.title, sub: `${a.artist} · ${a.year || ''}`, act: 'play-it-album', id: a.itunesAlbumId, extra: albumSaveBtn(a) })).join('')}</div>` : ''; }),
       part(songsP.then?.(v => keepRelevant(v, q, t => [t.title, t.artist, t.album])) ?? songsP, v => { const st = dedupeSongs(v, local).map(t => lib.tracks.get(t.id) || store.remember(t)); prefetchTop(st, 3); parts.songs = st.length ? `<h2>Songs</h2>${rowsFor('s-songs', st)}` : ''; })
     ]);
   } catch (e) {
@@ -1723,6 +1856,10 @@ async function importSection() {
           <li>Save, then copy the <b>Client ID</b> and paste it below.</li></ol>
         <form class="inline-form" id="sp-form"><input name="cid" placeholder="Spotify Client ID" value="${esc(clientId)}" required pattern="[A-Za-z0-9]{20,40}"><button class="btn">${icon('spotify')}Connect Spotify</button></form>`}
       </details>
+    </div>
+    <div class="panel">
+      <div class="panel-h">${icon('qr')}<div><h2>From a BAZINGA! link or QR code</h2><p class="muted tiny">Someone shared a song, playlist or album with you? Paste the link or scan the QR code, then tap <b>Save to my library</b>.</p></div></div>
+      <div class="row-btns"><button class="btn primary" data-act="add-link">${icon('qr')}Add from link or QR code</button></div>
     </div>
     <div class="panel">
       <div class="panel-h">${icon('yt', 'brand-yt')}<div><h2>From YouTube</h2><p class="muted tiny">Bring in your YouTube playlists and Liked videos — handy as a second backup of your music. Each song keeps the exact video from the playlist.</p></div></div>
@@ -2154,17 +2291,45 @@ async function vSettings([section] = []) {
 // ---------- SHARED LINK ----------
 async function vShared([data]) {
   let d;
-  try { d = await unpackString(data); } catch { view().innerHTML = empty('This share link is broken', 'Ask your friend to share it again.'); return; }
+  try { d = await unpackShare(data); } catch (e) { view().innerHTML = empty('This share link is broken', esc(/too old/.test(e?.message || '') ? e.message : 'Ask your friend to share it again — copy the whole link.')); return; }
   const tracks = (d.t || []).map(x => ({
-    id: trackKey(x[1], x[0]), title: x[0], artist: x[1], artists: x[1].split(/\s*,\s*/), album: x[2] || '', year: x[3] || null, genre: x[4] || '', durationMs: x[5] || 0, artwork: x[6] || '', _yt: [x[7], x[8]]
+    id: trackKey(x[1], x[0]), title: x[0], artist: x[1], artists: x[1].split(/\s*,\s*/), album: x[2] || '', year: x[3] || null, genre: x[4] || '', durationMs: x[5] || 0,
+    // (songs whose cover isn't in the link show their video's picture; the proper cover is found once saved)
+    artwork: x[6] || (x[7] || x[8] ? `https://i.ytimg.com/vi/${x[7] || x[8]}/hqdefault.jpg` : ''), shareThumb: !x[6] && !!(x[7] || x[8]), _yt: [x[7], x[8]]
   }));
   for (const t of tracks) { if (t._yt[0] || t._yt[1]) { const c = (await db.get('ytcache', t.id)) || {}; if (!c.video && t._yt[0]) c.video = t._yt[0]; if (!c.audio && t._yt[1]) c.audio = t._yt[1]; await db.put('ytcache', c, t.id); } delete t._yt; }
   const ts = tracks.map(t => lib.tracks.get(t.id) || store.remember(t));
   window.__shared = { d, tracks: ts };
   setTitle(d.n || 'Shared music');
   view().innerHTML = `<div class="page">${header(esc(d.n || 'Shared music'), `Shared by ${esc(d.by || 'a friend')} · ${ts.length} songs`, cover(d.a || ts[0]?.artwork, d.n), '', d.k === 'album' ? 'Album' : d.k === 'song' ? 'Song' : 'Playlist')}
-    <div class="actions">${playBtns('play-list', 'shared')}<button class="btn primary-o" data-act="save-shared">${icon('plus')}Save to my library</button></div>
+    ${appHint()}
+    <div class="actions">${playBtns('play-list', 'shared')}<button class="btn primary-o" data-act="save-shared">${icon('plus')}${d.k === 'song' ? 'Add to Liked Songs' : 'Save to my library'}</button></div>
     ${tracksSection('shared', ts, { noFilter: true })}</div>`;
+}
+
+// A short link / QR code (…#/r/<id>.<key>): fetched from the relay, then shown like any share link.
+// (The address bar switches to the full link, so the page still opens after the short link expires.)
+async function vRelayShare([ref], my) {
+  view().innerHTML = `<div class="page">${loader('Opening the shared music…')}</div>`;
+  try {
+    const packed = await sync.fetchShare(ref);
+    if (stale(my)) return;
+    location.replace('#/s/' + packed);
+  } catch (e) {
+    if (stale(my)) return;
+    view().innerHTML = `<div class="page">${empty(e.expired ? 'This link has expired' : 'Couldn\'t open this link', esc(e.message || 'Check your connection and try again.'), `<div class="row-btns center"><button class="btn" data-act="retry-route">Try again</button><button class="btn primary" data-act="add-link">Add from a link</button></div>`)}</div>`;
+  }
+}
+// On a shared page opened in the browser: how to get it into the BAZINGA! app on the Home Screen
+function appHint() {
+  if (isStandalone()) return '';
+  try { if (localStorage.getItem('bz_apphint_x')) return ''; } catch { }
+  const ua = navigator.userAgent, android = /android/i.test(ua);
+  const how = isIOS() ? 'iPhone and iPad open links in Safari. Tap <b>Copy link</b>, open BAZINGA! from your Home Screen, then <b>Library → Playlists → Add from link</b> (it pastes it in for you).'
+    : android ? 'Links you tap in other apps open in the BAZINGA! app by themselves. From here: <b>⋮ → Open in BAZINGA!</b>, or copy the link and use <b>Add from link</b> in the app.'
+    : 'In Chrome or Edge, click <b>Open in app</b> in the address bar — or copy the link and use <b>Add from link</b> in the app.';
+  return `<div class="app-hint"><span class="ah-ic">${icon('sparkle')}</span><div class="ah-txt"><b>Have the BAZINGA! app on your Home Screen?</b><small>${how}</small></div>
+    <div class="ah-btns"><button class="btn sm" data-act="copy" data-v="${esc(location.href)}">${icon('link')}Copy link</button><button class="ib sm" data-act="apphint-x" aria-label="Hide this tip">${icon('close')}</button></div></div>`;
 }
 
 // ---------- LEGAL ----------
@@ -2754,17 +2919,162 @@ async function helpSheet() {
 }
 
 // ================= SHARING =================
+// The link carries the whole song / playlist / album (compact v2 — nothing is uploaded) and works forever.
+// "Short link" puts it on the relay instead, encrypted with a key that's only in the link, for a few hours.
+// The QR code uses the full link when it's short enough to scan easily, otherwise the short link.
+const QR_FULL_MAX = 360;
+const appBase = () => location.origin + location.pathname;
 async function shareTracks(kind, name, tracks, artwork) {
   const t = [];
   for (const x of tracks.slice(0, 400)) {
     const c = await db.get('ytcache', x.id) || {};
-    t.push([x.title, x.artist, x.album || '', x.year || yearOf(x.releaseDate) || 0, x.genre || '', x.durationMs || 0, (x.artwork || '').startsWith('data:') ? '' : x.artwork || '', c.video || '', c.audio || '']);
+    t.push({ title: x.title, artist: x.artist, album: x.album, year: x.year || yearOf(x.releaseDate), genre: x.genre, durationMs: x.durationMs, artwork: (x.artwork || '').startsWith('data:') ? '' : x.artwork, video: c.video, audio: c.audio });
   }
-  const packed = await packToString({ k: kind, n: name, by: profile.username, a: (artwork || '').startsWith('data:') ? '' : artwork, t });
-  const url = location.href.split('#')[0] + '#/s/' + packed;
-  modal(`<h3>Share "${esc(name)}"</h3><p class="muted tiny">Anyone with this link can open, play and save it in their own BAZINGA! app. The whole ${kind} is packed inside the link — nothing is uploaded anywhere.</p>
-    <div class="copy-box"><input readonly value="${esc(url)}" aria-label="Share link"></div>
-    <button class="btn primary big" data-act="copy" data-v="${esc(url)}">${icon('link')}Copy link</button>`);
+  const packed = await packShare({ kind, name, by: profile.username, artwork: (artwork || '').startsWith('data:') ? '' : artwork, tracks: t });
+  const full = appBase() + '#/s/' + packed;
+  const canShort = sync.shareRelayOK() && full.length > 140;
+  let shortP = null;
+  const getShort = () => shortP || (shortP = sync.postShare(packed).then(r => ({ url: appBase() + '#/r/' + r.ref, hours: r.hours })).catch(e => { shortP = null; throw e; }));
+  let mode = 'full', cur = full;
+  const noun = kind === 'song' ? 'song' : kind;
+  await modal(`<div class="share-dlg">
+    <h3>${icon('share')} Share "${esc(name)}"</h3>
+    <p class="muted tiny">Anyone with the link can open, play and save this ${noun} in their own BAZINGA!.</p>
+    ${canShort ? `<div class="seg" role="radiogroup" aria-label="Kind of link"><button type="button" class="on" data-mode="full" role="radio" aria-checked="true">Link</button><button type="button" data-mode="short" role="radio" aria-checked="false">Short link</button></div>` : ''}
+    <div class="copy-box"><input readonly value="${esc(full)}" aria-label="Share link"></div>
+    <p class="tiny muted share-note"></p>
+    <div class="row-btns center share-btns"><button type="button" class="btn primary big" data-copy>${icon('link')}Copy link</button>${navigator.share ? `<button type="button" class="btn big" data-native>${icon('share')}Share…</button>` : ''}</div>
+    <div class="share-qr"><div class="qr-box"><div class="qr-wait">${loader('', 'sm')}</div></div><p class="tiny muted qr-note"></p></div>
+  </div>`, {
+    focus: false,
+    onMount: m => {
+      m.classList.add('share-modal');
+      const inp = m.querySelector('.copy-box input'), note = m.querySelector('.share-note'), qrBox = m.querySelector('.qr-box'), qrNote = m.querySelector('.qr-note');
+      const fullNote = () => `Works forever — the whole ${noun} is inside the link (${full.length.toLocaleString()} characters).`;
+      note.textContent = fullNote();
+      inp.addEventListener('focus', () => inp.select());
+      const setQR = (url, txt) => { try { qrBox.innerHTML = qrSVG(url); qrNote.innerHTML = txt; } catch { qrBox.innerHTML = ''; qrNote.textContent = 'Too long for a QR code — send the link instead.'; } };
+      const scanTip = 'Scan it with the phone camera, or in BAZINGA!: <b>Library → Playlists → Add from link</b>.';
+      if (full.length <= QR_FULL_MAX || !canShort) {
+        if (full.length <= 2300) setQR(full, scanTip); else { qrBox.remove(); qrNote.textContent = 'Too long for a QR code — send the link instead.'; }
+      } else getShort().then(r => setQR(r.url, `${scanTip} This code works for ${r.hours} hours.`)).catch(() => {
+        if (full.length <= 1200) setQR(full, scanTip); else { qrBox.remove(); qrNote.textContent = 'Couldn\'t make a QR code right now (no connection?) — send the link instead.'; }
+      });
+      m.querySelector('[data-copy]').onclick = async e => {
+        const b = e.currentTarget;
+        if (mode === 'short' && cur === full) return;
+        const ok = await copyText(cur);
+        toast(ok ? 'Link copied ✓' : 'Couldn\'t copy — select the link and copy it', ok ? 'ok' : 'err');
+        if (ok) { b.innerHTML = `${icon('check')}Copied!`; setTimeout(() => { if (b.isConnected) b.innerHTML = `${icon('link')}Copy link`; }, 2000); }
+      };
+      m.querySelector('[data-native]')?.addEventListener('click', () => { if (mode === 'short' && cur === full) return; navigator.share({ title: name, text: `${name} — on BAZINGA!`, url: cur }).catch(() => { }); });
+      m.querySelectorAll('[data-mode]').forEach(b => b.onclick = async () => {
+        mode = b.dataset.mode;
+        m.querySelectorAll('[data-mode]').forEach(x => { const on = x === b; x.classList.toggle('on', on); x.setAttribute('aria-checked', on); });
+        if (mode === 'full') { cur = full; inp.value = full; note.textContent = fullNote(); return; }
+        cur = full; inp.value = 'Making a short link…'; note.textContent = '';
+        try { const r = await getShort(); if (mode !== 'short') return; cur = r.url; inp.value = r.url; note.textContent = `Works for ${r.hours} hours — for a link that lasts forever, use "Link".`; }
+        catch (err) { if (mode !== 'short') return; inp.value = full; cur = full; note.textContent = err.message || 'Couldn\'t make a short link right now.'; }
+      });
+    }
+  });
+}
+
+// ---------- Add from a link or QR code ----------
+// Paste a share link (any copy of BAZINGA!), or scan its QR code with the camera / from a photo.
+// Browsers with a built-in QR reader use it; iPhone/iPad Safari and Firefox use BAZINGA!'s own (qr.js).
+let qrDetector;
+async function detectorFor() {
+  if (qrDetector !== undefined) return qrDetector;
+  qrDetector = null;
+  try { if ('BarcodeDetector' in window && (await BarcodeDetector.getSupportedFormats()).includes('qr_code')) qrDetector = new BarcodeDetector({ formats: ['qr_code'] }); } catch { }
+  return qrDetector;
+}
+// Read a QR code from a video frame / picture (drawn into a canvas, middle part, at most `max` px)
+async function scanSource(src, sw, sh, max = 900, cropFrac = 1) {
+  const det = await detectorFor();
+  if (det) { try { const r = await det.detect(src); if (r?.[0]?.rawValue) return r[0].rawValue; } catch { } if (cropFrac === 1) return null; }
+  const side = Math.min(sw, sh) * cropFrac, sx = (sw - side) / 2, sy = (sh - side) / 2;
+  const k = Math.min(1, max / side), cw = Math.round(side * k);
+  const c = scanSource.c || (scanSource.c = document.createElement('canvas'));
+  c.width = c.height = cw;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(src, sx, sy, side, side, 0, 0, cw, cw);
+  return readQR(ctx.getImageData(0, 0, cw, cw));
+}
+async function openShareRef(ref) {
+  if (!ref) return false;
+  if (ref.kind === 'link' || ref.kind === 'c') { joinFlow(ref.kind === 'link' ? { secret: ref.data } : { code: ref.data }); return true; }
+  location.hash = `#/${ref.kind}/${ref.data}`;
+  return true;
+}
+async function addFromLinkDialog(prefill = '') {
+  let stream = null, timer = 0, done = false;
+  const canCam = !!navigator.mediaDevices?.getUserMedia && (location.protocol === 'https:' || location.hostname === 'localhost');
+  const stop = () => { done = true; clearTimeout(timer); try { stream?.getTracks().forEach(t => t.stop()); } catch { } stream = null; };
+  const res = await modal(`<div class="addlink-dlg">
+    <h3>${icon('qr')} Add from a link or QR code</h3>
+    <p class="muted">Paste a BAZINGA! share link — a song, playlist or album — or scan its QR code. YouTube playlist links work too.</p>
+    <form class="addlink-form" novalidate><label class="searchbox big-in">${icon('link')}<input name="v" value="${esc(prefill)}" placeholder="Paste a link here" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" aria-label="Share link"></label>
+      <div class="addlink-btns">${navigator.clipboard?.readText ? `<button type="button" class="btn big" data-paste>${icon('file')}Paste</button>` : ''}<button class="btn primary big">Open</button></div>
+      <p class="addlink-err tiny" role="alert" hidden></p></form>
+    <div class="scan-area" hidden><video playsinline muted autoplay></video><div class="scan-frame" aria-hidden="true"><i></i><i></i><i></i><i></i></div><p class="scan-msg">Point the camera at the QR code</p></div>
+    <div class="scan-btns">${canCam ? `<button type="button" class="btn primary-o big" data-scan>${icon('qr')}Scan with the camera</button>` : ''}<button type="button" class="btn ghost" data-photo>${icon('upload')}Scan a photo or screenshot</button></div>
+  </div>`, {
+    ownForms: true, cls: 'addlink-modal', focus: !matchMedia('(pointer: coarse)').matches,
+    onMount: (m, close) => {
+      const inp = m.querySelector('input'), err = m.querySelector('.addlink-err');
+      const fail = msg => { err.textContent = msg; err.hidden = false; };
+      const take = text => {
+        const ref = findShareRef(text);
+        if (ref) { stop(); close({ ref }); return true; }
+        if (yt.parsePlaylistId(text)) { stop(); close({ yt: text.trim() }); return true; }
+        return false;
+      };
+      m.querySelector('form').addEventListener('submit', e => { e.preventDefault(); const v = inp.value.trim(); if (!v) return inp.focus(); if (!take(v)) fail('That isn\'t a BAZINGA! share link. Ask for the link again (it has "#/s/" or "#/r/" in it).'); });
+      inp.addEventListener('input', () => { err.hidden = true; if (findShareRef(inp.value)) take(inp.value); });
+      m.querySelector('[data-paste]')?.addEventListener('click', async () => {
+        try { const v = await navigator.clipboard.readText(); inp.value = v.trim(); if (!take(v)) fail(v.trim() ? 'What you copied isn\'t a BAZINGA! share link.' : 'Nothing copied yet — copy the link first.'); }
+        catch { inp.focus(); fail('Long-press the box and choose Paste.'); }
+      });
+      // photo / screenshot
+      m.querySelector('[data-photo]').addEventListener('click', () => pickFile('image/*', async f => {
+        err.hidden = true;
+        try {
+          const bmp = await (window.createImageBitmap ? createImageBitmap(f) : new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = URL.createObjectURL(f); }));
+          const w = bmp.width, h = bmp.height;
+          let txt = await scanSource(bmp, w, h, 1400, 1);
+          if (!txt) txt = await scanSource(bmp, w, h, 1100, 0.75);
+          if (!txt) return fail('No QR code found in that picture. Try one where the code is bigger and sharp.');
+          if (!take(txt)) fail('That QR code isn\'t a BAZINGA! link.');
+        } catch { fail('Couldn\'t open that picture.'); }
+      }));
+      // live camera
+      m.querySelector('[data-scan]')?.addEventListener('click', async e => {
+        const btn = e.currentTarget, area = m.querySelector('.scan-area'), video = area.querySelector('video'), msg = area.querySelector('.scan-msg');
+        err.hidden = true;
+        try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }); }
+        catch (x) { return fail(x?.name === 'NotAllowedError' ? 'BAZINGA! isn\'t allowed to use the camera. Allow it in your browser settings, or scan a photo instead.' : 'Couldn\'t start the camera — scan a photo instead.'); }
+        if (done) return stop();
+        btn.hidden = true; area.hidden = false;
+        video.srcObject = stream; try { await video.play(); } catch { }
+        let wrong = 0;
+        const tick = async () => {
+          if (done || !m.isConnected) return stop();
+          if (video.readyState >= 2 && video.videoWidth) {
+            let txt = null;
+            try { txt = await scanSource(video, video.videoWidth, video.videoHeight, 720, 0.8); } catch { }
+            if (txt && !take(txt) && ++wrong < 40) msg.textContent = 'That QR code isn\'t a BAZINGA! link';
+          }
+          timer = setTimeout(tick, 160);
+        };
+        tick();
+      });
+      if (prefill && findShareRef(prefill)) setTimeout(() => take(prefill), 0);
+    }
+  }).finally(stop);
+  if (res?.ref) openShareRef(res.ref);
+  else if (res?.yt) ytImportLink(res.yt);
 }
 
 // Copy that also works where the Clipboard API isn't available (e.g. opened from a file)
@@ -2824,7 +3134,7 @@ async function trackMenu(btn, id, plId) {
     plOrderChanged(p, true);
     toastUndo(k === 'pltop' ? 'Moved to the top' : 'Moved to the bottom', async () => { p.trackIds = before; await store.savePlaylist(p, { quiet: true }); plOrderChanged(p, true); });
   }
-  if (k === 'unpl') { const r = await store.removeFromPlaylist(plId, id); toastUndo('Removed from playlist', async () => { await store.undoRemoveFromPlaylist(r); toast('Put back ✓'); }); }
+  if (k === 'unpl') { dropRow('pl', id); const r = await store.removeFromPlaylist(plId, id); toastUndo('Removed from playlist', async () => { await store.undoRemoveFromPlaylist(r); toast('Put back ✓'); }); }
   if (k === 'del' && await confirmBox('Remove from library?', `"${esc(t.title)}" will be removed from your library and all playlists.`, 'Remove', true)) { await store.deleteTrack(id); toast('Removed'); }
 }
 
@@ -2962,7 +3272,7 @@ async function playlistMenu(btn, id) {
   if (k === 'yt-match') matchList(lists.get('pl') || p.trackIds);
   if (k === 'yt-save') ytExport(lists.get('pl') || p.trackIds, p.name, p.id);
   if (k === 'rename') { const n = await promptText('Rename playlist', p.name); if (n) { p.name = n; await store.savePlaylist(p); renderSidebarPlaylists(); } }
-  if (k === 'cover') pickFile('image/*', async f => { p.image = await imageToDataURL(f, 400); await store.savePlaylist(p); });
+  if (k === 'cover') playlistCoverPicker(p);
   if (k === 'dup') { const np = await store.createPlaylist(p.name + ' (copy)', p.trackIds); renderSidebarPlaylists(); location.hash = '#/playlist/' + np.id; }
   if (k === 'csv') {
     const rows = [['Track Name', 'Artist Name(s)', 'Album Name', 'Release Date', 'Genres', 'Duration (ms)']];
@@ -2977,6 +3287,39 @@ async function playlistMenu(btn, id) {
   if (k === 'del' && await confirmBox('Delete playlist?', `"${esc(p.name)}" will be deleted. Songs stay in your library if they're liked or in other playlists/albums.`, 'Delete', true)) {
     await store.deletePlaylist(id); renderSidebarPlaylists(); location.hash = '#/library/playlists';
   }
+}
+
+// Change a playlist's cover: any cover from its songs (one tap), your own picture, or back to automatic
+async function playlistCoverPicker(p) {
+  const seen = new Set(), arts = [];
+  for (const tid of p.trackIds) {
+    const t = lib.tracks.get(tid), u = t?.artwork;
+    if (!u || seen.has(u)) continue;
+    seen.add(u); arts.push({ u, t });
+  }
+  const cur = p.image || '';
+  const SHOW = 48;
+  const tile = ({ u, t }) => `<button type="button" class="cp ${u === cur ? 'on' : ''}" data-u="${esc(u)}" title="${esc(t.album || t.title)}" aria-label="Use the cover of ${esc(t.album || t.title)}">${cover(u, t.album || t.title)}${u === cur ? `<span class="cp-on">${icon('check')}</span>` : ''}</button>`;
+  const r = await modal(`<h3>Playlist cover</h3><p class="muted">Tap a cover from the songs in "${esc(p.name)}", or use a picture of your own.</p>
+    ${arts.length ? `<div class="cover-pick">${arts.slice(0, SHOW).map(tile).join('')}</div>${arts.length > SHOW ? `<div class="more-wrap"><button type="button" class="more-btn" data-cp-more>Show more <small>${arts.length - SHOW} more</small></button></div>` : ''}` : '<p class="muted tiny">None of these songs has a cover yet.</p>'}
+    <div class="modal-actions cp-acts">${cur ? '<button type="button" class="btn ghost" data-resolve="auto">Automatic</button>' : ''}<button type="button" class="btn" data-resolve="upload">${icon('upload')}Upload a picture</button></div>`, {
+    wide: true, focus: false,
+    onMount: (m, close) => {
+      m.classList.add('cover-modal');
+      m.addEventListener('click', e => {
+        const b = e.target.closest('.cp'); if (b) { close('pick:' + b.dataset.u); return; }
+        const more = e.target.closest('[data-cp-more]');
+        if (more) { m.querySelector('.cover-pick').insertAdjacentHTML('beforeend', arts.slice(SHOW).map(tile).join('')); more.parentElement.remove(); }
+      });
+    }
+  });
+  if (!r) return;
+  if (r === 'upload') return pickFile('image/*', async f => { p.image = await imageToDataURL(f, 400); await store.savePlaylist(p); renderSidebarPlaylists(); toast('Cover changed ✓', 'ok'); });
+  const before = p.image || '';
+  p.image = r === 'auto' ? '' : r.slice(5);
+  if (p.image === before) return;
+  await store.savePlaylist(p); renderSidebarPlaylists();
+  toastUndo(r === 'auto' ? 'Cover set to automatic' : 'Cover changed ✓', async () => { p.image = before; await store.savePlaylist(p); renderSidebarPlaylists(); });
 }
 
 // ================= LIKES =================
@@ -3014,9 +3357,17 @@ function onLikeChanged({ id, liked }) {
       likeTimers.delete(id);
       if (lib.tracks.get(id)?.liked || sections.get('liked') !== sec) return;
       $$(`[data-tsec="liked"] .row[data-id="${sel}"]`).forEach(r => r.classList.add('leaving'));
-      setTimeout(() => { if (sections.get('liked') !== sec) return; sec.tracks = sec.tracks.filter(t => t.id !== id); refreshSection('liked'); markUnliked(); likedCount(); }, 280);
+      setTimeout(() => {
+        if (sections.get('liked') !== sec) return;
+        sec.tracks = sec.tracks.filter(t => t.id !== id);
+        // (the row just goes; everything else stays exactly where it is on screen)
+        if (!dropRow('liked', id)) refreshSection('liked', false, true);
+        else if (!sec.tracks.length) refreshSection('liked');
+        else { const c = $('[data-tsec="liked"] .count'); if (c) refreshSection('liked', false, true); }
+        markUnliked(); likedCount();
+      }, 280);
     }, LIKE_GRACE));
-    else if (!sec.tracks.some(t => t.id === id) && lib.tracks.get(id)) { sec.tracks = [lib.tracks.get(id), ...sec.tracks]; refreshSection('liked'); markUnliked(); }
+    else if (!sec.tracks.some(t => t.id === id) && lib.tracks.get(id)) { sec.tracks = [lib.tracks.get(id), ...sec.tracks]; refreshSection('liked', false, true); markUnliked(); }
   }
   likedCount();
 }
@@ -3108,7 +3459,7 @@ function wireGlobal() {
       case 'album-offline': { const { tracks } = window.__album; pickFile('audio/*,.mp3,.m4a,.flac,.ogg,.opus,.wav', fs => addLocalFiles(fs, { albumHint: tracks }), { multiple: true }); break; }
       case 'save-shared': {
         const { d, tracks } = window.__shared;
-        const saved = await store.upsertTracks(tracks.map(stripTransient));
+        const saved = await store.upsertTracks(tracks.map(t => { const c = stripTransient(t); if (c.shareThumb) c.artwork = ''; delete c.shareThumb; return c; }));
         if (d.k === 'song') { await store.updateTrack(saved[0].id, { liked: true }); toast('Added to Liked Songs'); }
         else { const p = await store.createPlaylist(d.n, saved.map(t => t.id), { source: 'shared by ' + (d.by || 'friend'), image: d.a || '' }); renderSidebarPlaylists(); location.hash = '#/playlist/' + p.id; }
         break;
@@ -3136,10 +3487,17 @@ function wireGlobal() {
       case 'bz-mix': e.preventDefault(); bazingaMix(); break;
       case 'play-it-album': {
         e.preventDefault(); e.stopPropagation();
-        try { const { tracks } = await meta.albumTracks(id); player.playList(tracks.map(t => (lib.tracks.get(t.id) || store.remember(t)).id), 0, { shuffle: false }); }
-        catch { toast('Couldn\'t load that album right now', 'err'); }
+        a.classList.add('busy');
+        const ts = await warmItAlbum(id);
+        a.classList.remove('busy');
+        if (ts?.length) { nowCtx = { list: null }; player.playList(ts.map(t => t.id), 0, { shuffle: false }); }
+        else toast('Couldn\'t load that album right now', 'err');
         break;
       }
+      case 'save-card-album': e.preventDefault(); e.stopPropagation(); saveCardAlbum(a); break;
+      case 'add-link': e.preventDefault(); addFromLinkDialog(); break;
+      case 'apphint-x': try { localStorage.setItem('bz_apphint_x', '1'); } catch { } a.closest('.app-hint')?.remove(); break;
+      case 'save-filtered': saveFilteredAsPlaylist(a.closest('[data-tsec]')?.dataset.tsec); break;
       case 'copy': copyText(a.dataset.v).then(ok => {
         toast(ok ? 'Link copied ✓' : 'Couldn\'t copy — select the link and copy it', ok ? 'ok' : 'err');
         if (ok && a.classList.contains('big')) { a.innerHTML = `${icon('check')}Copied!`; setTimeout(() => { if (a.isConnected) a.innerHTML = `${icon('link')}Copy link`; }, 2000); }
@@ -3202,6 +3560,8 @@ function wireGlobal() {
   // Faster song switching: look a song up as soon as you rest on it / touch it
   let hoverT = null;
   document.addEventListener('pointerover', e => {
+    const fab = e.target.closest?.('[data-act="play-it-album"]');
+    if (fab) { clearTimeout(hoverT); hoverT = setTimeout(() => warmItAlbum(fab.dataset.id, true), e.pointerType === 'mouse' ? 120 : 0); return; }
     const r = e.target.closest?.('.row[data-id], .qrow [data-qjump]'); if (!r) return;
     clearTimeout(hoverT);
     const id = r.dataset.id || P.queue[+r.dataset.qjump]?.id;

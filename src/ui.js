@@ -165,10 +165,38 @@ export function cover(src, label, cls = '') {
   const letter = esc((label || '?')[0].toUpperCase());
   if (src) {
     const u = sized(src, px), known = seenImg.has(u);
-    return `<div class="cover ${cls} ${known ? 'ld known' : ''}" style="--c:${hashColor(label)}"><img src="${esc(u)}" alt="" ${eager || known ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" onload="__bzImg(this)" onerror="this.parentNode.classList.add('noimg');this.remove()"><span>${letter}</span></div>`;
+    return `<div class="cover ${cls} ${known ? 'ld known' : ''}" style="--c:${hashColor(label)}"><img src="${esc(u)}" alt="" ${eager || known ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" onload="__bzImg(this)" onerror="this.parentNode.classList.add('noimg');this.remove()"><span data-l="${letter}">${letter}</span></div>`;
   }
-  return `<div class="cover noimg ${cls}" style="--c:${hashColor(label)}"><span>${esc((label || '?')[0].toUpperCase())}</span></div>`;
+  return `<div class="cover noimg ${cls}" style="--c:${hashColor(label)}"><span data-l="${letter}">${letter}</span></div>`;
 }
+
+// Letter placeholders (no picture yet) sit exactly in the middle of their square / circle. Fonts put the
+// capital letters a little high or low inside their line, so the real font is measured once it has
+// loaded and the letters are nudged by that amount (whatever font the device ends up using).
+function centerLetters() {
+  try {
+    const fam = getComputedStyle(document.documentElement).getPropertyValue('--display').trim() || 'sans-serif';
+    const c = document.createElement('canvas').getContext('2d');
+    c.font = `800 100px ${fam}`;
+    const m = c.measureText('H');
+    const A = m.fontBoundingBoxAscent, D = m.fontBoundingBoxDescent, cap = m.actualBoundingBoxAscent;
+    if (!(A > 0) || !(cap > 0)) return;
+    // with line-height 1 the capital's middle sits (A - D - cap) / 2 below the box's middle
+    const dy = Math.max(-0.2, Math.min(0.2, -(A - D - cap) / 2 / 100));
+    document.documentElement.style.setProperty('--letter-dy', dy.toFixed(3) + 'em');
+    // …and sideways: each letter's ink is a little left or right of the middle of its own width
+    let css = '';
+    for (const ch of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') {
+      const g = c.measureText(ch), dx = (g.width / 2 - (g.actualBoundingBoxRight - g.actualBoundingBoxLeft) / 2) / 100;
+      if (Math.abs(dx) > 0.004) css += `.cover>span[data-l="${ch}"]{--letter-dx:${Math.max(-0.15, Math.min(0.15, dx)).toFixed(3)}em}`;
+    }
+    let st = document.getElementById('bz-letters');
+    if (!st) { st = document.createElement('style'); st.id = 'bz-letters'; document.head.appendChild(st); }
+    st.textContent = css;
+  } catch { }
+}
+centerLetters();
+try { document.fonts?.ready.then(centerLetters); document.fonts?.addEventListener?.('loadingdone', centerLetters); } catch { }
 
 // One song row. `ctx` = {list, index, playlistId}
 export function trackRow(t, i, ctx = {}, playingId) {
@@ -189,40 +217,141 @@ export function trackRow(t, i, ctx = {}, playingId) {
   </div>`;
 }
 
-export function card({ href, img, title, sub, round = false, act = '', id = '' }) {
+export function card({ href, img, title, sub, round = false, act = '', id = '', extra = '' }) {
   return `<a class="card" href="${href}">
-    <div class="card-art ${round ? 'round' : ''}">${cover(img, title)}${act ? `<button class="fab-play" data-act="${act}" data-id="${esc(id)}" aria-label="Play">${icon('play')}</button>` : ''}</div>
+    <div class="card-art ${round ? 'round' : ''}">${cover(img, title)}${extra}${act ? `<button class="fab-play" data-act="${act}" data-id="${esc(id)}" aria-label="Play">${icon('play')}</button>` : ''}</div>
     <div class="card-t">${esc(title)}</div><div class="card-s">${esc(sub || '')}</div></a>`;
 }
 
 // ---------- Toasts ----------
+// New notifications land on top of the older ones in a neat pile instead of a growing list (un-liking
+// ten songs no longer covers the page): the newest is in front, the two before it peek out behind it,
+// older ones wait out of sight. Rest the pointer on the pile (or tap it) to spread it out and reach an
+// older "Undo"; swipe any notification left or right to send it away. Timers pause while you're on it.
+const TOAST_MAX = 6;
+let toastRoot = null, spread = false, spreadT = 0, paused = false;
+const liveToasts = () => toastRoot ? [...toastRoot.children].filter(el => !el.classList.contains('out') && !el.classList.contains('gone')) : [];
+function layoutToasts() {
+  const root = toastRoot; if (!root) return;
+  let live = liveToasts();
+  // too many at once: the oldest ordinary ones go straight away (progress bars stay)
+  while (live.length > TOAST_MAX) { const old = live.find(el => !el.classList.contains('prog')); if (!old) break; dismissToast(old, 0, true); live = liveToasts(); }
+  if (live.length < 2 && spread) spread = false;
+  // measure every toast at its own size first, then pile (or spread) them
+  for (const el of live) { el.style.removeProperty('--h'); el.style.removeProperty('--w'); }
+  const hs = live.map(el => el.offsetHeight), ws = live.map(el => el.offsetWidth);
+  const n = live.length, front = n - 1;
+  let y = 0;
+  for (let k = front; k >= 0; k--) {
+    const el = live[k], i = front - k; // 0 = newest
+    el.style.zIndex = String(60 - i);
+    el.classList.toggle('behind', i > 0 && !spread);
+    el.classList.toggle('hid', i > 2 && !spread);
+    if (spread) { el.style.setProperty('--y', -y + 'px'); el.style.setProperty('--s', '1'); y += hs[k] + 8; }
+    else {
+      el.style.setProperty('--y', (-i * 9) + 'px'); el.style.setProperty('--s', String(1 - Math.min(i, 3) * 0.05));
+      if (i > 0) { el.style.setProperty('--h', hs[front] + 'px'); el.style.setProperty('--w', Math.max(ws[front], 120) + 'px'); }
+    }
+  }
+  root.classList.toggle('spread', spread);
+  root.style.setProperty('--pile', (spread ? y : (hs[front] || 0) + Math.min(n - 1, 2) * 9) + 'px');
+}
+function setSpread(on) {
+  clearTimeout(spreadT);
+  on = !!on && liveToasts().length > 1;
+  if (on === spread) return;
+  spread = on; layoutToasts(); on ? pauseToasts() : resumeToasts();
+}
+function armToast(el, ms) { el._left = ms; if (!paused) { el._t0 = Date.now(); el._timer = setTimeout(() => dismissToast(el), ms); } }
+function pauseToasts() {
+  if (paused) return; paused = true;
+  for (const el of liveToasts()) if (el._timer) { clearTimeout(el._timer); el._timer = 0; el._left = Math.max(1200, el._left - (Date.now() - el._t0)); }
+}
+function resumeToasts() {
+  if (!paused || spread) return; paused = false;
+  liveToasts().forEach((el, i, all) => { if (el._left) { el._t0 = Date.now(); el._timer = setTimeout(() => dismissToast(el), el._left + (all.length - 1 - i) * 250); } });
+}
+function dismissToast(el, dir = 0, instant = false) {
+  if (!el || el.classList.contains('out') || el.classList.contains('gone')) return;
+  clearTimeout(el._timer); el._timer = 0; el._left = 0;
+  if (dir) { el.classList.add('gone'); el.style.setProperty('--dx', (dir * Math.max(innerWidth, 500)) + 'px'); el.style.opacity = '0'; }
+  else el.classList.add('out');
+  setTimeout(() => { el.remove(); layoutToasts(); }, instant ? 0 : 300);
+  layoutToasts();
+}
+// Swipe left / right to dismiss (the pile itself scrolls nothing, so horizontal moves are ours)
+function swipeToast(el) {
+  let x0 = 0, y0 = 0, t0 = 0, dx = 0, drag = false, down = false, id = null;
+  el.addEventListener('pointerdown', e => {
+    if (e.button > 0 || e.target.closest('button')) return;
+    down = true; drag = false; dx = 0; x0 = e.clientX; y0 = e.clientY; t0 = Date.now(); id = e.pointerId;
+    pauseToasts();
+  });
+  el.addEventListener('pointermove', e => {
+    if (!down || e.pointerId !== id) return;
+    const mx = e.clientX - x0, my = e.clientY - y0;
+    if (!drag) { if (Math.abs(mx) > 6 && Math.abs(mx) > Math.abs(my)) { drag = true; el.classList.add('drag'); try { el.setPointerCapture(id); } catch { } } else if (Math.abs(my) > 10) { down = false; return; } else return; }
+    dx = mx;
+    el.style.setProperty('--dx', dx + 'px');
+    el.style.opacity = String(Math.max(0.15, 1 - Math.abs(dx) / 260));
+  });
+  const up = e => {
+    if (!down || (e && e.pointerId !== id)) return;
+    down = false;
+    if (drag) {
+      el.classList.remove('drag');
+      const v = Math.abs(dx) / Math.max(1, Date.now() - t0);
+      if (Math.abs(dx) > 70 || (Math.abs(dx) > 24 && v > 0.55)) dismissToast(el, Math.sign(dx));
+      else { el.style.setProperty('--dx', '0px'); el.style.opacity = ''; }
+      setTimeout(() => { if (!el.matches(':hover')) resumeToasts(); }, 50);
+    } else if (e?.type === 'pointerup') { // a tap: spread the pile / gather it again
+      if (liveToasts().length > 1) setSpread(!spread); else resumeToasts();
+    } else resumeToasts();
+  };
+  el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+  el.addEventListener('lostpointercapture', e => { if (down && drag) up(e); });
+}
+function wireToastRoot() {
+  if (toastRoot) return toastRoot;
+  toastRoot = $('#toasts'); if (!toastRoot) return null;
+  // progress bars (and anything else) added straight into the pile get placed too
+  new MutationObserver(() => layoutToasts()).observe(toastRoot, { childList: true });
+  // computers: rest the pointer on the pile to spread it out
+  toastRoot.addEventListener('pointerover', e => { if (e.pointerType === 'mouse') { clearTimeout(spreadT); pauseToasts(); if (!spread) spreadT = setTimeout(() => setSpread(true), 120); } });
+  toastRoot.addEventListener('pointerout', e => { if (e.pointerType === 'mouse' && !toastRoot.contains(e.relatedTarget)) { clearTimeout(spreadT); spreadT = setTimeout(() => { setSpread(false); resumeToasts(); }, 280); } });
+  // a tap anywhere else gathers a spread pile again
+  document.addEventListener('pointerdown', e => { if (spread && !toastRoot.contains(e.target)) setSpread(false); }, true);
+  addEventListener('resize', () => layoutToasts(), { passive: true });
+  return toastRoot;
+}
 on('toast', ({ msg, kind, action, ms }) => {
-  const root = $('#toasts'); if (!root) return;
+  const root = wireToastRoot(); if (!root) return;
   const el = document.createElement('div');
   el.className = 'toast ' + kind + (action ? ' has-act' : '');
-  const txt = document.createElement('span'); txt.textContent = msg; el.appendChild(txt);
+  el.setAttribute('role', 'status');
+  const txt = document.createElement('span'); txt.className = 'toast-msg'; txt.textContent = msg; el.appendChild(txt);
   const life = ms || (action ? 6500 : 3200);
-  let t1, t2;
-  const bye = () => { el.classList.add('out'); setTimeout(() => el.remove(), 350); };
   if (action) {
     const b = document.createElement('button');
     b.className = 'toast-act'; b.type = 'button'; b.textContent = action.label || 'Undo';
-    b.onclick = () => { clearTimeout(t1); clearTimeout(t2); bye(); try { action.fn(); } catch (e) { console.warn(e); } };
+    b.onclick = () => { dismissToast(el); try { action.fn(); } catch (e) { console.warn(e); } };
     el.appendChild(b);
   }
+  swipeToast(el);
   root.appendChild(el);
-  t1 = setTimeout(bye, life);
+  layoutToasts();
+  armToast(el, life);
 });
 // A toast with an "Undo" (or other) button
 export const toastUndo = (msg, fn, label = 'Undo') => emit('toast', { msg, kind: 'info', action: { label, fn } });
 
 // ---------- Modal ----------
-export function modal(html, { wide = false, onMount, locked = false, ownForms = false, focus = true } = {}) {
+export function modal(html, { wide = false, onMount, locked = false, ownForms = false, focus = true, cls = '' } = {}) {
   return new Promise(resolve => {
     const root = $('#modal-root');
     const wrap = document.createElement('div');
     wrap.className = 'modal-wrap';
-    wrap.innerHTML = `<div class="modal ${wide ? 'wide' : ''}" role="dialog" aria-modal="true">${locked ? '' : `<button class="ib modal-x" data-close aria-label="Close">${icon('close')}</button>`}${html}</div>`;
+    wrap.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${cls}" role="dialog" aria-modal="true">${locked ? '' : `<button class="ib modal-x" data-close aria-label="Close">${icon('close')}</button>`}${html}</div>`;
     root.appendChild(wrap);
     const close = v => { wrap.classList.add('out'); setTimeout(() => wrap.remove(), 180); document.removeEventListener('keydown', key); resolve(v); };
     const key = e => { if (e.key === 'Escape' && !locked) close(null); };
@@ -242,9 +371,13 @@ export function modal(html, { wide = false, onMount, locked = false, ownForms = 
     if (focus) setTimeout(() => wrap.querySelector('input:not([type=file]),button.primary')?.focus(), 50);
   });
 }
+// A name box (New playlist, Rename…): big text, big buttons, easy to hit on a phone
 export async function promptText(title, value = '', label = 'Name', okText = 'Save') {
-  const r = await modal(`<h3>${esc(title)}</h3><form><label class="fld"><span>${esc(label)}</span><input name="v" value="${esc(value)}" required maxlength="100"></label>
-    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">${esc(okText)}</button></div></form>`);
+  const r = await modal(`<h3>${esc(title)}</h3><form><label class="fld big-fld"><span>${esc(label)}</span><input name="v" value="${esc(value)}" required maxlength="100" autocomplete="off" enterkeyhint="done"></label>
+    <div class="modal-actions big-acts"><button type="button" class="btn ghost" data-close>Cancel</button><button class="btn primary">${esc(okText)}</button></div></form>`, {
+    cls: 'prompt-modal',
+    onMount: m => { const i = m.querySelector('input'); setTimeout(() => { try { i.focus(); i.select(); } catch { } }, 60); }
+  });
   return r ? r.v.trim() : null;
 }
 export async function confirmBox(title, body, okText = 'Confirm', danger = false) {
@@ -369,7 +502,8 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
     ${showSort && f.sortOpen ? `<div class="filter-panel sort-panel"><div class="fp-sec"><div class="fp-h">Sort by</div><div class="chips">
       ${sortOpts.map(([v, l]) => `<button class="chip ${curSort[0] === v ? 'on' : ''}" data-act="f-sort" data-v="${v}" aria-pressed="${curSort[0] === v}">${curSort[0] === v ? icon('check') : ''}${esc(l)}</button>`).join('')}
     </div></div></div>` : ''}
-    ${f.open ? `<div class="filter-panel">
+    ${f.open ? `<div class="filter-panel has-clear">
+      <button class="fp-clear" data-act="f-clear" ${active || f.q ? '' : 'disabled'} aria-label="Clear all filters">${icon('close')}Clear all</button>
       <div class="fp-sec"><div class="fp-h">Top genres</div><div class="chips">
         ${genres.length ? genres.map(([g, n]) => `<button class="chip ${f.genres?.includes(g) ? 'on' : ''}" data-act="f-genre" data-g="${esc(g)}">${esc(g)} <small>${n}</small></button>`).join('') : '<span class="muted">Genres appear as songs get matched.</span>'}
       </div></div>
@@ -383,7 +517,6 @@ export function filterBar(f, tracks, { showSort = true, keepOrder = false, liked
       <div class="fp-sec"><div class="chips">
         <button class="chip ${f.liked ? 'on' : ''}" data-act="f-flag" data-k="liked">${icon('heart')}Liked only</button>
         <button class="chip ${f.offline ? 'on' : ''}" data-act="f-flag" data-k="offline">${icon('offline')}Offline only</button>
-        ${active ? '<button class="chip ghost" data-act="f-clear">Clear all</button>' : ''}
       </div></div>
     </div>` : ''}
   </div>`;

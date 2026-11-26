@@ -17,7 +17,7 @@ You can also just double-click `index.html` to try it on your computer — your 
 
 The readable source is in `src/`. After changing it, run `python3 build.py` to regenerate `js/bazinga.js` (the single file the app loads).
 
-To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v48`) so phones fetch the new version.
+To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazinga-v49`) so phones fetch the new version.
 
 ## Features
 
@@ -30,10 +30,27 @@ To ship an update, edit the files and bump `VERSION` in `sw.js` (currently `bazi
 - **Filters**: by genre, release decade or exact year range, liked-only, offline-only, plus sorting by date added / title / artist / album / release date.
 - **Albums**: search any album, open the album of any song, **save full albums** to your library.
 - **Artists**: "Go to artist" from any song → popular songs, full discography, and your songs by them.
-- **Sharing**: share a song, playlist or album as a link. The whole list is packed inside the link — nothing is uploaded. The receiver can play it and save it into their own library.
+- **Sharing**: share a song, playlist or album as a link or QR code. The whole list is packed inside the link and nothing is uploaded (or use a short link that works for 12 hours). The receiver can play it and save it into their own library: tap the link, or use *Add from link* to paste it or scan the QR code.
 - **Offline**: add music files you own; they're matched to your songs automatically, grouped into albums, and play without internet. The app itself also opens offline.
 - **Backups (auto-updating, on device)**: rolling snapshots after every change (last 5), plus on Chrome/Edge desktop a linked backup **file** that rewrites itself automatically. On every browser: one-tap download and restore of a backup file.
 
+
+### New in v1.9.0
+- **Shorter share links**: links use a new compact format, about 25–50% shorter (a 25-song playlist went from ~3,000 to ~1,600 characters). Same songs, music video and audio matches, names and years. A playlist link carries full covers for its first 6 songs; the rest show the song's video picture until the playlist is saved, and the saving device then finds the proper covers itself. Old links still open.
+- **Short link** (Share → *Short link*): a ~60-character link that works for 12 hours (3 hours for very big playlists). The playlist is put on the free relay **encrypted** with a key that exists only in the link itself, so the relay can't read it.
+- **QR codes**: every Share window shows a QR code (the full link when it's short enough to scan easily, otherwise the short link).
+- **Add from a link or QR code**: Library → Playlists → *Add from link*, the QR button next to + in the sidebar, or Settings → Import music. Paste a link (it's found even inside a whole message), tap **Paste**, **scan with the camera**, or **scan a photo / screenshot**. Uses the browser's own QR reader where there is one, and BAZINGA!'s own (built in, no download) on iPhone/iPad Safari and Firefox. YouTube playlist links work there too, and so do device-sync links.
+- **Opens in the Home Screen app**: on Android and computers (Chrome/Edge), BAZINGA! links tapped in other apps open in the installed app, and an app that's already open is reused instead of a second window. Android's share menu now lists BAZINGA!: share a link to it and it opens. iPhone/iPad always open links in Safari (an Apple rule), so a shared page opened in a browser shows how to get it into the app in one step (*Copy link* → *Add from link*, which pastes it for you).
+- **Make a playlist from a filter**: filter Liked Songs (or Songs, a playlist, a genre…) and tap **Make a playlist of these**. It suggests a name like "Liked · Hip-Hop/Rap · 2010–2019".
+- **Save albums straight from any album list**: a coloured **+** on the cover (next to the play button) saves the album without opening it: New from your top artists, search results, artist pages (Top 10 albums and Discography) and *From your songs*. Only shown on albums you haven't saved; each save can be undone.
+- **Playlist cover from its songs**: playlist ⋯ → *Change cover* shows every cover in the playlist. Tap one, upload your own picture, or go back to *Automatic*.
+- **Clear all** button in the top-right corner of the Filters panel.
+- **Bigger pop-ups**: *Add to playlist* (bigger rows, covers, text and checkmarks) and the name box for *New playlist* / *Rename* (large text box and buttons; on phones it sits higher so the keyboard doesn't cover it).
+- **Notifications pile up instead of stacking**: un-liking ten songs no longer covers the page. The newest is in front and the two before it peek out behind. Rest the pointer on the pile (or tap it) to spread it out and reach an older *Undo*. **Swipe any notification left or right** to dismiss it. Timers pause while you're on them.
+- **YouTube's own play/pause buttons always register**: after pausing with BAZINGA!'s button, YouTube's play button on the video was paused again straight away (the app thought you'd paused while the song was still starting). A pause made on the video could also undo itself when you tapped back into the app. Both are fixed.
+- **New from your top artists** is looked up again every day (a new day, or 12 hours, whichever comes first). The same release no longer shows twice (clean/explicit versions, deluxe/standard editions, a release by two of your artists). Play starts faster: the first few releases' song lists load quietly in the background, and touching or hovering a card looks up its first song on YouTube before you tap.
+- **Removing a song keeps your place**: un-liking a song on Liked Songs or removing one from a playlist no longer jumps the list; the row just goes. (A quiet redraw used to drop everything after the first 150 rows.)
+- **Letters on covers are exactly centred**: the letter shown on artists / songs / playlists without a picture is measured against the real font once it loads and centred both ways.
 
 ### New in v1.8.0
 - **Add to playlist is bigger** and shows a ✓ on every playlist that already has the song. Tap a checked playlist to take the song out, or tap others to add it there too — the sheet stays open until *Done*. A search box appears when you have more than 6 playlists.

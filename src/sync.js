@@ -558,6 +558,39 @@ function listen() {
   }).catch(() => { });
 }
 
+// ---------- Short share links & QR codes ----------
+// A share that's too long for an easy QR code (or when you pick "Short link") is put on the relay ENCRYPTED
+// with a random key that exists only in the link itself (…#/r/<id>.<key>), so the relay can't read it.
+// ntfy.sh keeps a small one (a plain message) for 12 hours and a bigger one (a file) for 3 hours.
+const unb64url = s => fromB64(String(s).replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((String(s).length + 3) % 4));
+export const shareRelayOK = () => !!window.crypto?.subtle && location.protocol.startsWith('http');
+export async function postShare(text) {
+  if (!shareRelayOK()) throw new Error('Short links need the online (GitHub Pages) version of BAZINGA!.');
+  const id = b64url(crypto.getRandomValues(new Uint8Array(9))), raw = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const sealed = await sealWith(key, { v: 1, s: text, at: Date.now() });
+  const b64 = toB64(sealed), small = b64.length <= 3900;
+  const r = await fetch(`${RELAY()}/bzs${id}?${new URLSearchParams(small ? { firebase: 'no' } : { firebase: 'no', filename: 'share.bz' })}`, { method: 'POST', body: small ? b64 : new Blob([sealed]) });
+  if (!r.ok) throw new Error(r.status === 429 ? 'The free relay is busy — try again in a minute.' : r.status === 413 ? 'Too big for a short link — use the full link.' : `Couldn't make a short link (${r.status})`);
+  return { ref: id + '.' + b64url(raw), hours: small ? 12 : 3 };
+}
+export async function fetchShare(ref) {
+  const [id, k] = String(ref || '').split('.');
+  if (!/^[\w-]{8,}$/.test(id || '') || !/^[\w-]{16,}$/.test(k || '')) throw new Error('That link isn\'t complete — copy the whole link and try again.');
+  const key = await crypto.subtle.importKey('raw', unb64url(k), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const r = await fetch(`${RELAY()}/bzs${id}/json?poll=1&since=all`, { cache: 'no-store' });
+  if (!r.ok) throw new Error(r.status === 429 ? 'The free relay is busy — try again in a minute.' : `Couldn't open the link (${r.status})`);
+  const msgs = (await r.text()).split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(m => m?.event === 'message').reverse();
+  for (const m of msgs) {
+    try {
+      const bytes = m.attachment?.url ? new Uint8Array(await (await fetch(m.attachment.url, { cache: 'no-store' })).arrayBuffer()) : fromB64(m.message);
+      const d = await open(bytes, key);
+      if (d?.s) return d.s;
+    } catch { }
+  }
+  const e = new Error('This short link or QR code has expired (they work for a few hours). Ask for the link again.'); e.expired = true; throw e;
+}
+
 // ---------- start / join / leave ----------
 // Turn sync on for the first time on this device (makes a new sync key and posts the library)
 export async function create() {
